@@ -1,0 +1,15 @@
+# --------------------------------------------------
+# AstroSASF — Python Dependencies
+# --------------------------------------------------
+# Usage:  pip install -r requirements.txt
+# Python: >= 3.10
+# --------------------------------------------------
+
+# ── LangChain / LangGraph (V3 认知层) ──
+langchain-ollama>=0.3.0
+langgraph>=0.2.0
+langchain-core>=0.3.0
+
+# ── Runtime ──
+# 以下为标准库，无需额外安装：
+# asyncio, struct, json, logging, dataclasses, enum, typing, abc, re, copy

@@ -1,0 +1,15 @@
+[project]
+name = "AstroSASF"
+version = "3.0.0"
+description = "Astro Scientific Agent Scheduling Framework — 面向太空实验室的科学智能体调度框架"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+dependencies = [
+    "langchain-ollama>=0.3.0",
+    "langgraph>=0.2.0",
+    "langchain-core>=0.3.0",
+]
+
+[project.scripts]
+astrosasf = "main:main"
