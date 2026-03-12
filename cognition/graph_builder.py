@@ -3,8 +3,10 @@ AstroSASF · Cognition · GraphBuilder
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 基于 LangGraph 的状态图工作流构建器。
 
-将 Planner / Operator / Executor 三个职责抽象为状态图节点，
-通过条件边实现带循环的闭环执行流。
+V3.1 改进：
+- 修复 operator_node 状态传递 Bug（Case 2 成功后未提取下一步骤）
+- 引入 MemorySaver + ``interrupt_before=["execute_node"]``
+  实现 Human-in-the-loop 审核机制
 
 状态图拓扑
 ~~~~~~~~~~
@@ -20,14 +22,11 @@ AstroSASF · Cognition · GraphBuilder
                               ┌──────────┐   ┌───────┐         │
                               │ execute  │   │  END  │         │
                               │ _node    │   └───────┘         │
+                              │ ⏸ HITL   │                     │
                               └────┬─────┘                     │
                                    │                           │
                                    └───────────────────────────┘
                                    (回到 operator_node)
-
-每个 LaboratoryEnvironment 实例调用 ``build_lab_graph`` 时，
-通过闭包将该环境独有的 ``SpaceMCPGateway`` 和 ``LLM`` 绑定到
-节点函数中，实现多系统并发隔离。
 """
 
 from __future__ import annotations
@@ -38,9 +37,10 @@ import re
 from typing import Any
 
 from langchain_ollama import ChatOllama
+from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, StateGraph
 
-from cognition.state import LabGraphState, SkillStep
+from cognition.state import LabGraphState
 from middleware.gateway import SpaceMCPGateway
 
 logger = logging.getLogger(__name__)
@@ -49,16 +49,14 @@ logger = logging.getLogger(__name__)
 #  Constants                                                                   #
 # --------------------------------------------------------------------------- #
 
-_MAX_RETRIES_PER_STEP: int = 2  # 单步最大重试次数
+_MAX_RETRIES_PER_STEP: int = 2
 
-# 可用 Skills 的描述（注入 Planner prompt）
 _SKILLS_DESCRIPTION = """
 可用的 Skills（工具）清单：
 1. set_temperature  — 设置舱内温度，参数: {"target": <float, ℃>}
 2. move_robotic_arm — 移动机械臂，参数: {"target_angle": <float, °>}
 3. toggle_vacuum_pump — 切换真空泵，参数: {"activate": <bool>}
 """.strip()
-
 
 # --------------------------------------------------------------------------- #
 #  Prompt Templates                                                            #
@@ -92,23 +90,18 @@ _CORRECTION_PROMPT = """你是太空实验柜的操作智能体 (Operator)。
 
 
 # --------------------------------------------------------------------------- #
-#  JSON 提取工具                                                                #
+#  JSON 提取                                                                    #
 # --------------------------------------------------------------------------- #
 
 def _extract_json(text: str) -> Any:
     """从 LLM 输出中提取 JSON —— 容忍 markdown 代码块包裹。"""
-    # 尝试 ```json ... ``` 代码块
     match = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
     if match:
         text = match.group(1).strip()
-
-    # 尝试直接解析
     try:
         return json.loads(text)
     except json.JSONDecodeError:
         pass
-
-    # 尝试提取第一个 [ ... ] 或 { ... }
     for pattern in [r"\[[\s\S]*\]", r"\{[\s\S]*\}"]:
         match = re.search(pattern, text)
         if match:
@@ -116,8 +109,14 @@ def _extract_json(text: str) -> Any:
                 return json.loads(match.group())
             except json.JSONDecodeError:
                 continue
-
     raise ValueError(f"无法从 LLM 输出中提取 JSON:\n{text[:200]}")
+
+
+def _safe_get(d: Any, key: str, default: Any = None) -> Any:
+    """安全地从可能为 None 的对象中取值。"""
+    if d is None or not isinstance(d, dict):
+        return default
+    return d.get(key, default)
 
 
 # --------------------------------------------------------------------------- #
@@ -128,22 +127,13 @@ def build_lab_graph(
     gateway: SpaceMCPGateway,
     llm: ChatOllama,
     lab_id: str,
-) -> Any:
+) -> tuple[Any, MemorySaver]:
     """构建并编译实验柜的 LangGraph 状态图。
-
-    Parameters
-    ----------
-    gateway : SpaceMCPGateway
-        该实验柜独有的 Space-MCP 网关实例。
-    llm : ChatOllama
-        LLM 实例（ChatOllama）。
-    lab_id : str
-        实验柜标识（用于日志前缀）。
 
     Returns
     -------
-    CompiledGraph
-        编译后的状态图，支持 ``ainvoke(state)`` 调用。
+    tuple[CompiledGraph, MemorySaver]
+        编译后的状态图 + checkpointer（用于 HITL interrupt/resume）。
     """
 
     # ================================================================== #
@@ -152,7 +142,7 @@ def build_lab_graph(
 
     async def planner_node(state: LabGraphState) -> dict[str, Any]:
         """调用 LLM 将原始任务拆解为分步 Skill 计划。"""
-        task = state["original_task"]
+        task = state.get("original_task", "")
         logger.info("[%s] 🧠 Planner: 正在规划任务「%s」...", lab_id, task)
 
         prompt = _PLANNER_PROMPT.format(
@@ -160,8 +150,12 @@ def build_lab_graph(
             task=task,
         )
 
-        response = await llm.ainvoke(prompt)
-        raw_text = response.content if hasattr(response, "content") else str(response)
+        try:
+            response = await llm.ainvoke(prompt)
+            raw_text = response.content if hasattr(response, "content") else str(response)
+        except Exception as exc:
+            logger.error("[%s] Planner LLM 调用失败: %s", lab_id, exc)
+            raw_text = "[]"
 
         logger.info("[%s] 🧠 Planner LLM 原始输出:\n%s", lab_id, raw_text)
 
@@ -184,6 +178,7 @@ def build_lab_graph(
             "fsm_feedback": None,
             "execution_log": [],
             "error_count": 0,
+            "final_result": None,
         }
 
     # ================================================================== #
@@ -191,127 +186,153 @@ def build_lab_graph(
     # ================================================================== #
 
     async def operator_node(state: LabGraphState) -> dict[str, Any]:
-        """判断下一步动作：提取步骤 / 处理错误 / 标记完成。"""
-        plan = state.get("plan", [])
+        """判断下一步动作：处理反馈 → 提取步骤或标记完成。
+
+        修复 V3 Bug：在处理完反馈后，**立即** 判断是否有下一步骤，
+        而非返回空 current_step 导致 should_continue 误判。
+        """
+        plan = state.get("plan") or []
         index = state.get("current_step_index", 0)
         feedback = state.get("fsm_feedback")
         error_count = state.get("error_count", 0)
-        log = list(state.get("execution_log", []))
+        log = list(state.get("execution_log") or [])
 
-        # ── Case 1: 上一步执行失败，尝试 LLM 修正 ── #
-        if feedback and feedback.get("status") == "error":
-            if error_count >= _MAX_RETRIES_PER_STEP:
+        # ── Phase 1: 处理上一步反馈 ── #
+
+        if feedback is not None and isinstance(feedback, dict):
+            status = _safe_get(feedback, "status", "")
+
+            if status == "error":
+                # ── 错误处理 ── #
+                if error_count >= _MAX_RETRIES_PER_STEP:
+                    # 超过重试次数 → 记录并跳过
+                    logger.warning(
+                        "[%s] ⚠️ Operator: 步骤 %d 连续失败 %d 次，跳过",
+                        lab_id, index + 1, error_count,
+                    )
+                    log.append({
+                        "step_index": index,
+                        "skill": _safe_get(feedback, "skill", "unknown"),
+                        "params": {},
+                        "result": feedback,
+                        "status": "error",
+                        "correction": None,
+                    })
+                    index += 1  # 推进到下一步
+                else:
+                    # 调用 LLM 修正
+                    logger.info(
+                        "[%s] 🔄 Operator: 步骤 %d 失败，调用 LLM 修正 (第 %d 次)",
+                        lab_id, index + 1, error_count + 1,
+                    )
+                    current = plan[index] if index < len(plan) else {}
+                    correction_prompt = _CORRECTION_PROMPT.format(
+                        skill_name=_safe_get(current, "skill", "unknown"),
+                        original_params=json.dumps(
+                            _safe_get(current, "params", {}), ensure_ascii=False,
+                        ),
+                        error_detail=_safe_get(feedback, "detail", "未知错误"),
+                    )
+
+                    try:
+                        response = await llm.ainvoke(correction_prompt)
+                        raw_text = (
+                            response.content
+                            if hasattr(response, "content")
+                            else str(response)
+                        )
+                        logger.info(
+                            "[%s] 🔄 Operator LLM 修正输出:\n%s", lab_id, raw_text,
+                        )
+                        corrected = _extract_json(raw_text)
+
+                        if _safe_get(corrected, "skill") == "skip":
+                            logger.info(
+                                "[%s] 🔄 LLM 建议跳过: %s",
+                                lab_id, _safe_get(corrected, "reason"),
+                            )
+                            log.append({
+                                "step_index": index,
+                                "skill": _safe_get(current, "skill", "unknown"),
+                                "params": _safe_get(current, "params", {}),
+                                "result": feedback,
+                                "status": "error",
+                                "correction": _safe_get(corrected, "reason"),
+                            })
+                            index += 1
+                        else:
+                            # 修正后立即返回新 step，让 execute_node 执行
+                            return {
+                                "current_step": corrected,
+                                "fsm_feedback": None,
+                                "error_count": error_count + 1,
+                                "execution_log": log,
+                            }
+                    except (ValueError, Exception) as exc:
+                        logger.warning(
+                            "[%s] 修正失败 (%s)，跳过此步", lab_id, exc,
+                        )
+                        log.append({
+                            "step_index": index,
+                            "skill": _safe_get(current, "skill", "unknown"),
+                            "params": _safe_get(current, "params", {}),
+                            "result": feedback,
+                            "status": "error",
+                            "correction": f"修正失败: {exc}",
+                        })
+                        index += 1
+
+            elif status == "success":
+                # ── 成功 → 记录并推进 ── #
+                log.append({
+                    "step_index": index,
+                    "skill": _safe_get(feedback, "skill", "unknown"),
+                    "params": {},
+                    "result": feedback,
+                    "status": "success",
+                    "correction": None,
+                })
+                index += 1
+
+            else:
+                # 未知状态 → 视为错误，跳过
                 logger.warning(
-                    "[%s] ⚠️ Operator: 步骤 %d 连续失败 %d 次，跳过",
-                    lab_id, index + 1, error_count,
+                    "[%s] ⚠️ 未知反馈状态: %s，跳过", lab_id, status,
                 )
                 log.append({
                     "step_index": index,
-                    "skill": feedback.get("skill", "unknown"),
+                    "skill": _safe_get(feedback, "skill", "unknown"),
                     "params": {},
                     "result": feedback,
                     "status": "error",
-                    "correction": None,
+                    "correction": f"未知反馈状态: {status}",
                 })
-                return {
-                    "current_step_index": index + 1,
-                    "current_step": None,
-                    "fsm_feedback": None,
-                    "execution_log": log,
-                    "error_count": 0,
-                }
+                index += 1
 
-            # 调用 LLM 尝试修正
-            logger.info(
-                "[%s] 🔄 Operator: 步骤 %d 失败，调用 LLM 修正 (第 %d 次)",
-                lab_id, index + 1, error_count + 1,
-            )
+        # ── Phase 2: 提取下一步骤 或 标记完成 ── #
 
-            current = plan[index] if index < len(plan) else {}
-            correction_prompt = _CORRECTION_PROMPT.format(
-                skill_name=current.get("skill", "unknown"),
-                original_params=json.dumps(current.get("params", {}), ensure_ascii=False),
-                error_detail=feedback.get("detail", "未知错误"),
-            )
-
-            response = await llm.ainvoke(correction_prompt)
-            raw_text = response.content if hasattr(response, "content") else str(response)
-            logger.info("[%s] 🔄 Operator LLM 修正输出:\n%s", lab_id, raw_text)
-
-            try:
-                corrected = _extract_json(raw_text)
-                if corrected.get("skill") == "skip":
-                    logger.info("[%s] 🔄 LLM 建议跳过: %s", lab_id, corrected.get("reason"))
-                    log.append({
-                        "step_index": index,
-                        "skill": current.get("skill", "unknown"),
-                        "params": current.get("params", {}),
-                        "result": feedback,
-                        "status": "error",
-                        "correction": corrected.get("reason"),
-                    })
-                    return {
-                        "current_step_index": index + 1,
-                        "current_step": None,
-                        "fsm_feedback": None,
-                        "execution_log": log,
-                        "error_count": 0,
-                    }
-                else:
-                    return {
-                        "current_step": corrected,
-                        "fsm_feedback": None,
-                        "error_count": error_count + 1,
-                    }
-            except ValueError:
-                logger.warning("[%s] 修正 JSON 解析失败，跳过此步", lab_id)
-                log.append({
-                    "step_index": index,
-                    "skill": current.get("skill", "unknown"),
-                    "params": current.get("params", {}),
-                    "result": feedback,
-                    "status": "error",
-                    "correction": "LLM 修正 JSON 解析失败",
-                })
-                return {
-                    "current_step_index": index + 1,
-                    "current_step": None,
-                    "fsm_feedback": None,
-                    "execution_log": log,
-                    "error_count": 0,
-                }
-
-        # ── Case 2: 上一步成功，记录并推进 ── #
-        if feedback and feedback.get("status") == "success":
-            log.append({
-                "step_index": index,
-                "skill": feedback.get("skill", "unknown"),
-                "params": {},
-                "result": feedback,
-                "status": "success",
-                "correction": None,
-            })
-            return {
-                "current_step_index": index + 1,
-                "current_step": None,
-                "fsm_feedback": None,
-                "execution_log": log,
-                "error_count": 0,
-            }
-
-        # ── Case 3: 提取当前步骤 ── #
         if index < len(plan):
             step = plan[index]
             logger.info(
                 "[%s] 📋 Operator: 提取步骤 %d/%d → %s",
                 lab_id, index + 1, len(plan), step,
             )
-            return {"current_step": step}
+            return {
+                "current_step_index": index,
+                "current_step": step,
+                "fsm_feedback": None,
+                "execution_log": log,
+                "error_count": 0 if feedback is None or _safe_get(feedback, "status") != "error" else error_count,
+            }
 
-        # ── Case 4: 全部完成 ── #
-        logger.info("[%s] ✅ Operator: 所有步骤执行完毕", lab_id)
+        # 全部完成
+        logger.info("[%s] ✅ Operator: 所有 %d 个步骤执行完毕", lab_id, len(plan))
         return {
+            "current_step_index": index,
             "current_step": None,
+            "fsm_feedback": None,
+            "execution_log": log,
+            "error_count": 0,
             "final_result": {
                 "status": "completed",
                 "total_steps": len(plan),
@@ -326,26 +347,50 @@ def build_lab_graph(
     async def execute_node(state: LabGraphState) -> dict[str, Any]:
         """通过 SpaceMCPGateway 调用当前步骤的 Skill。"""
         step = state.get("current_step")
-        if not step:
-            return {"fsm_feedback": {"status": "error", "detail": "无有效步骤"}}
+        if step is None or not isinstance(step, dict):
+            logger.warning("[%s] ⚙️ Execute: 无有效步骤，返回错误", lab_id)
+            return {
+                "fsm_feedback": {
+                    "skill": "unknown",
+                    "status": "error",
+                    "detail": "无有效步骤",
+                },
+            }
 
-        skill_name = step.get("skill", "")
-        params = step.get("params", {})
+        skill_name = _safe_get(step, "skill", "")
+        params = _safe_get(step, "params", {})
 
         logger.info(
             "[%s] ⚙️ Execute: 调用 Skill '%s' params=%s",
             lab_id, skill_name, params,
         )
 
-        result = await gateway.invoke_skill(skill_name, params)
-        logger.info(
-            "[%s] ⚙️ Execute: 结果 → %s", lab_id, result.get("status"),
-        )
+        try:
+            result = await gateway.invoke_skill(skill_name, params)
+        except Exception as exc:
+            logger.exception("[%s] ⚙️ Execute: 网关异常", lab_id)
+            result = {
+                "skill": skill_name,
+                "status": "error",
+                "detail": f"网关异常: {exc!r}",
+            }
 
+        # 确保 result 永远是 dict
+        if result is None or not isinstance(result, dict):
+            result = {
+                "skill": skill_name,
+                "status": "error",
+                "detail": "网关返回无效响应",
+            }
+
+        logger.info(
+            "[%s] ⚙️ Execute: 结果 → %s",
+            lab_id, _safe_get(result, "status", "unknown"),
+        )
         return {"fsm_feedback": result}
 
     # ================================================================== #
-    #  Conditional Edge: operator → execute or END                        #
+    #  Conditional Edge                                                    #
     # ================================================================== #
 
     def should_continue(state: LabGraphState) -> str:
@@ -354,37 +399,32 @@ def build_lab_graph(
             return "done"
         if state.get("current_step") is not None:
             return "has_step"
-        # 安全兜底：如果既没有步骤也没有结果，结束
         return "done"
 
     # ================================================================== #
-    #  Build the StateGraph                                               #
+    #  Build & Compile with MemorySaver + HITL                             #
     # ================================================================== #
 
     graph = StateGraph(LabGraphState)
 
-    # 注册节点
     graph.add_node("planner_node", planner_node)
     graph.add_node("operator_node", operator_node)
     graph.add_node("execute_node", execute_node)
 
-    # 设置入口
     graph.set_entry_point("planner_node")
-
-    # planner → operator
     graph.add_edge("planner_node", "operator_node")
-
-    # operator → conditional (execute or END)
     graph.add_conditional_edges(
         "operator_node",
         should_continue,
-        {
-            "has_step": "execute_node",
-            "done": END,
-        },
+        {"has_step": "execute_node", "done": END},
     )
-
-    # execute → operator（循环回去处理结果）
     graph.add_edge("execute_node", "operator_node")
 
-    return graph.compile()
+    # MemorySaver + interrupt_before execute_node → Human-in-the-loop
+    checkpointer = MemorySaver()
+    compiled = graph.compile(
+        checkpointer=checkpointer,
+        interrupt_before=["execute_node"],
+    )
+
+    return compiled, checkpointer
