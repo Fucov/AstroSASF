@@ -1,0 +1,30 @@
+# ============================================================================ #
+#  AstroSASF — 全局配置文件                                                      #
+#  Astro Scientific Agent Scheduling Framework                                 #
+# ============================================================================ #
+
+# ---------------------------------------------------------------------------- #
+#  LLM 配置                                                                     #
+# ---------------------------------------------------------------------------- #
+llm:
+  # 可选 provider: "ollama" | "openai_compatible"
+  #   ollama            → 使用 langchain_ollama.ChatOllama (本地推理)
+  #   openai_compatible → 使用 langchain_openai.ChatOpenAI  (兼容 DeepSeek / 阿里云百炼 Qwen 等)
+  provider: "ollama"
+  base_url: "http://localhost:11434"    # Ollama 默认地址
+  api_key: ""                           # Ollama 不需要; 远端 API 必填
+  model_name: "qwen2.5:7b"
+  temperature: 0.1
+
+# ---------------------------------------------------------------------------- #
+#  中间件配置                                                                    #
+# ---------------------------------------------------------------------------- #
+middleware:
+  spacewire_bandwidth_kbps: 200         # SpaceWire 模拟带宽 (Kbps)
+  enable_space_mcp_compression: true    # 是否启用 Space-MCP 二进制压缩
+
+# ---------------------------------------------------------------------------- #
+#  编排器配置                                                                    #
+# ---------------------------------------------------------------------------- #
+orchestrator:
+  max_concurrent_labs: 3                # 最大并发实验柜数量
