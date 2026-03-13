@@ -36,6 +36,10 @@ from sasf.physics.telemetry_bus import TelemetryBus
 
 logger = logging.getLogger(__name__)
 
+# 项目根目录 (sasf/core/environment.py -> sasf/core/ -> sasf/ -> root/)
+_ROOT = Path(__file__).resolve().parent.parent.parent
+
+
 
 @dataclass
 class LaboratoryEnvironment:
@@ -96,8 +100,12 @@ class LaboratoryEnvironment:
         )
 
         # 5) Cognition Layer — Load Skills + Build Graph
+        catalog_path = Path(self.skills_catalog_dir)
+        if not catalog_path.is_absolute():
+            catalog_path = _ROOT / catalog_path
+
         self._skill_catalog = OpenAISkillCatalog(
-            catalog_dir=self.skills_catalog_dir,
+            catalog_dir=catalog_path,
         )
 
         llm = create_llm(self.config.llm)
