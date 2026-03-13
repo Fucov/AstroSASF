@@ -1,14 +1,12 @@
 """
-AstroSASF · Middleware · A2A Protocol
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Agent-to-Agent 通信协议标准 —— 中间件定义的消息信封与路由器。
+AstroSASF · Middleware · A2A Protocol (V4.3)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Agent-to-Agent 通信协议标准 —— 消息信封、路由器与发布/订阅接口。
 
-即使上层使用 LangGraph 管理工作流，智能体间的每一条消息都必须封装为
-中间件定义的 ``A2AMessage`` 标准结构。这确保了：
-
-1. **可观测性**：中间件统一记录所有 A2A 通信日志。
-2. **可审计性**：每条消息携带递增序列号和时间戳。
-3. **可扩展性**：未来可在此层注入鉴权、限流、路由规则等。
+V4.3 变化：
+- 新增 ``subscribe(intent, callback)`` / ``unsubscribe()`` 接口
+- ``route()`` 时自动通知所有订阅者
+- ``A2ASubscriber`` Protocol 抽象，未来可对接 Redis / MQTT
 """
 
 from __future__ import annotations
@@ -17,7 +15,8 @@ import logging
 import time
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Any
+from typing import Any, Callable, Protocol
+
 
 logger = logging.getLogger(__name__)
 
@@ -42,25 +41,7 @@ class A2AIntent(Enum):
 
 @dataclass(frozen=True)
 class A2AMessage:
-    """A2A 标准消息信封。
-
-    所有智能体间通信必须封装为此结构，由 ``A2ARouter`` 统一路由和记录。
-
-    Attributes
-    ----------
-    sender : str
-        发送方标识（如 ``"Lab-Alpha::Planner"``）。
-    receiver : str
-        接收方标识（如 ``"Lab-Alpha::Operator"``）。
-    intent : A2AIntent
-        消息意图类型。
-    payload : Any
-        消息正文（JSON 兼容结构）。
-    timestamp : float
-        UNIX 时间戳。
-    sequence : int
-        消息序列号（由 Router 分配）。
-    """
+    """A2A 标准消息信封。"""
     sender: str
     receiver: str
     intent: A2AIntent
@@ -70,27 +51,92 @@ class A2AMessage:
 
 
 # --------------------------------------------------------------------------- #
-#  A2ARouter — 消息路由器                                                       #
+#  A2ASubscriber — 订阅者协议 (抽象接口)                                        #
+# --------------------------------------------------------------------------- #
+
+class A2ASubscriber(Protocol):
+    """A2A 消息订阅者协议。
+
+    实现此接口即可接入 A2ARouter 的 Pub/Sub 机制。
+    未来可实现 Redis / MQTT 版本的 Subscriber。
+    """
+
+    def on_message(self, message: A2AMessage) -> None:
+        """收到匹配消息时的回调。"""
+        ...
+
+
+# 简单回调函数也可以作为订阅者
+A2ACallback = Callable[[A2AMessage], None]
+
+
+# --------------------------------------------------------------------------- #
+#  A2ARouter — 消息路由器 + Pub/Sub                                            #
 # --------------------------------------------------------------------------- #
 
 @dataclass
 class A2ARouter:
-    """A2A 消息路由器 —— 中间件级别的通信记录与路由。
+    """A2A 消息路由器 —— 通信记录 + 发布/订阅。
 
-    每个 LaboratoryEnvironment 持有独立实例，负责：
-    - 分配递增消息序列号
-    - 记录完整的通信日志
-    - 提供消息审计能力
+    Pub/Sub 接口:
+        - ``subscribe(intent, callback)`` — 订阅指定意图的消息
+        - ``subscribe_all(callback)``     — 订阅所有消息
+        - ``unsubscribe(intent, callback)`` — 取消订阅
+        - ``clear_subscriptions()``       — 清空所有订阅
 
-    Parameters
-    ----------
-    lab_id : str
-        所属实验柜标识。
+    ``route()`` 在记录日志后，自动通知所有匹配的订阅者。
     """
 
     lab_id: str
     _sequence_counter: int = field(default=0, init=False)
     _message_log: list[A2AMessage] = field(default_factory=list, init=False)
+
+    # Pub/Sub: intent → list of callbacks
+    _subscribers: dict[A2AIntent | None, list[A2ACallback]] = field(
+        default_factory=dict, init=False,
+    )
+
+    # ---- Pub/Sub ---------------------------------------------------------- #
+
+    def subscribe(self, intent: A2AIntent, callback: A2ACallback) -> None:
+        """订阅指定意图类型的消息。"""
+        self._subscribers.setdefault(intent, []).append(callback)
+        logger.debug(
+            "[%s] A2A: 订阅 %s → %s", self.lab_id, intent.name, callback,
+        )
+
+    def subscribe_all(self, callback: A2ACallback) -> None:
+        """订阅所有意图类型的消息（使用 None 作为通配键）。"""
+        self._subscribers.setdefault(None, []).append(callback)
+
+    def unsubscribe(self, intent: A2AIntent, callback: A2ACallback) -> None:
+        """取消订阅。"""
+        subs = self._subscribers.get(intent, [])
+        if callback in subs:
+            subs.remove(callback)
+
+    def clear_subscriptions(self) -> None:
+        """清空所有订阅。"""
+        self._subscribers.clear()
+
+    def _notify_subscribers(self, msg: A2AMessage) -> None:
+        """通知所有匹配的订阅者。"""
+        # 精确匹配
+        for cb in self._subscribers.get(msg.intent, []):
+            try:
+                cb(msg)
+            except Exception as exc:
+                logger.warning(
+                    "[%s] A2A 订阅者回调异常: %s", self.lab_id, exc,
+                )
+        # 通配订阅
+        for cb in self._subscribers.get(None, []):
+            try:
+                cb(msg)
+            except Exception as exc:
+                logger.warning(
+                    "[%s] A2A 通配订阅者回调异常: %s", self.lab_id, exc,
+                )
 
     # ---- 路由 ------------------------------------------------------------- #
 
@@ -101,24 +147,7 @@ class A2ARouter:
         intent: A2AIntent,
         payload: Any,
     ) -> A2AMessage:
-        """创建、记录并返回一条 A2A 消息。
-
-        Parameters
-        ----------
-        sender : str
-            发送方标识（如 ``"Planner"``，会自动添加 lab_id 前缀）。
-        receiver : str
-            接收方标识。
-        intent : A2AIntent
-            消息意图。
-        payload : Any
-            消息正文。
-
-        Returns
-        -------
-        A2AMessage
-            带有序列号的标准消息。
-        """
+        """创建、记录、通知订阅者并返回 A2A 消息。"""
         self._sequence_counter += 1
 
         full_sender = f"{self.lab_id}::{sender}"
@@ -143,27 +172,26 @@ class A2ARouter:
             intent.name,
         )
 
+        # 通知订阅者
+        self._notify_subscribers(msg)
+
         return msg
 
     # ---- 审计 ------------------------------------------------------------- #
 
     @property
     def message_count(self) -> int:
-        """已路由的消息总数。"""
         return len(self._message_log)
 
     @property
     def message_log(self) -> list[A2AMessage]:
-        """完整的消息日志（只读副本）。"""
         return list(self._message_log)
 
     def get_messages_by_intent(self, intent: A2AIntent) -> list[A2AMessage]:
-        """按意图类型筛选消息。"""
         return [m for m in self._message_log if m.intent == intent]
 
     @property
     def stats(self) -> dict[str, Any]:
-        """路由器统计信息。"""
         intent_counts: dict[str, int] = {}
         for msg in self._message_log:
             key = msg.intent.name
@@ -172,4 +200,7 @@ class A2ARouter:
         return {
             "total_messages": self._sequence_counter,
             "intent_distribution": intent_counts,
+            "active_subscriptions": sum(
+                len(cbs) for cbs in self._subscribers.values()
+            ),
         }

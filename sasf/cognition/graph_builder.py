@@ -1,11 +1,12 @@
 """
-AstroSASF · Cognition · GraphBuilder (V4.3)
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+AstroSASF · Cognition · GraphBuilder (V4.3 — Headless)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 LangGraph 状态图工作流构建器。
 
-V4.3 修复：
-- operator_node 合并 "成功记录 + 下一步提取" 为单次执行，
-  避免 should_continue 在两步之间误判 current_step=None → END
+V4.3 变化：
+- 返回 **未编译的 StateGraph**（不含 MemorySaver / interrupt）
+- 调用方自行决定编译选项（Headless 或 HITL）
+- 保留 V4.3 修复的三段式 operator_node 逻辑
 """
 
 from __future__ import annotations
@@ -15,7 +16,6 @@ import logging
 import re
 from typing import Any
 
-from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, StateGraph
 
 from sasf.cognition.skill_loader import OpenAISkillCatalog
@@ -94,15 +94,26 @@ def build_lab_graph(
     lab_id: str,
     a2a_router: A2ARouter,
     skill_catalog: OpenAISkillCatalog | None = None,
-) -> tuple[Any, MemorySaver]:
-    """构建并编译实验柜的 LangGraph 状态图。
+) -> StateGraph:
+    """构建实验柜的 LangGraph 状态图（**未编译**）。
+
+    调用方自行编译，可选注入 checkpointer / interrupt::
+
+        # Headless（默认）
+        compiled = graph.compile()
+
+        # HITL
+        from langgraph.checkpoint.memory import MemorySaver
+        memory = MemorySaver()
+        compiled = graph.compile(checkpointer=memory, interrupt_before=["execute_node"])
 
     Returns
     -------
-    tuple[CompiledGraph, MemorySaver]
+    StateGraph
+        未编译的状态图。
     """
 
-    # ── MCP Tools 描述（自动反射的 Schema） ── #
+    # ── MCP Tools 描述 ── #
     tools_desc = "\n".join(
         f"- `{t['name']}`: {t['description']}  "
         f"Schema: {json.dumps(t['json_schema']['function']['parameters'], ensure_ascii=False)}"
@@ -171,15 +182,7 @@ def build_lab_graph(
         }
 
     # ================================================================== #
-    #  Node: operator_node                                                #
-    #                                                                      #
-    #  V4.3 核心修复：合并 "成功记录" 和 "下一步提取" 为单次执行。          #
-    #  流程：                                                              #
-    #    1) 有 error feedback  → LLM 修正或跳过                            #
-    #    2) 有 success feedback → 记录日志 + 递增 index                    #
-    #    3) 提取 plan[index] 作为 current_step（或标记完成）               #
-    #  步骤 2 和 3 合并在一次调用中完成，不会出现                          #
-    #  "index 已递增但 current_step=None" 的中间态。                       #
+    #  Node: operator_node (V4.3 三段式流水线)                             #
     # ================================================================== #
 
     async def operator_node(state: LabGraphState) -> dict[str, Any]:
@@ -189,7 +192,7 @@ def build_lab_graph(
         error_count = state.get("error_count", 0)
         log = list(state.get("execution_log") or [])
 
-        # ── Phase A: 处理上一步 Error Feedback → LLM 修正 ── #
+        # ── Phase A: Error → LLM 修正 ── #
         if isinstance(feedback, dict) and feedback.get("status") == "error":
             if error_count >= _MAX_RETRIES_PER_STEP:
                 logger.warning(
@@ -204,12 +207,9 @@ def build_lab_graph(
                     "status": "error",
                     "correction": None,
                 })
-                # 跳过此步 → 递增 index，fall through 到 Phase C
                 index += 1
                 error_count = 0
-
             else:
-                # 请求 LLM 修正
                 logger.info(
                     "[%s] 🔄 步骤 %d 失败，LLM 修正 (第 %d 次)",
                     lab_id, index + 1, error_count + 1,
@@ -252,9 +252,7 @@ def build_lab_graph(
                         })
                         index += 1
                         error_count = 0
-                        # fall through 到 Phase C
                     else:
-                        # 给出修正后的 step → 直接作为 current_step 返回
                         return {
                             "current_step": corrected,
                             "current_step_index": index,
@@ -274,9 +272,8 @@ def build_lab_graph(
                     })
                     index += 1
                     error_count = 0
-                    # fall through 到 Phase C
 
-        # ── Phase B: 处理上一步 Success Feedback → 记录 + 递增 index ── #
+        # ── Phase B: Success → 记录 + 递增 ── #
         elif isinstance(feedback, dict) and feedback.get("status") == "success":
             log.append({
                 "step_index": index,
@@ -293,7 +290,7 @@ def build_lab_graph(
                 lab_id, index, index + 1,
             )
 
-        # ── Phase C: 提取下一步 or 标记完成 ── #
+        # ── Phase C: 提取下一步 or 完成 ── #
         if index < len(plan):
             step = plan[index]
             logger.info(
@@ -309,7 +306,6 @@ def build_lab_graph(
                 "final_result": None,
             }
 
-        # ── 所有步骤执行完毕 ── #
         logger.info("[%s] ✅ Operator: 所有 %d 步执行完毕", lab_id, len(plan))
         a2a_router.route(
             sender="Operator", receiver="System",
@@ -370,12 +366,6 @@ def build_lab_graph(
     # ================================================================== #
 
     def should_continue(state: LabGraphState) -> str:
-        """判断 operator_node 的出口：
-
-        - final_result 不为 None → 所有步骤已完成 → END
-        - current_step 存在      → 有待执行步骤 → execute_node (HITL)
-        - 其他                    → END (安全兜底)
-        """
         final = state.get("final_result")
         if final is not None:
             return "done"
@@ -385,7 +375,7 @@ def build_lab_graph(
         return "done"
 
     # ================================================================== #
-    #  Build & Compile (HITL)                                             #
+    #  Build (未编译 — 调用方自行 compile)                                  #
     # ================================================================== #
 
     graph = StateGraph(LabGraphState)
@@ -401,10 +391,4 @@ def build_lab_graph(
     )
     graph.add_edge("execute_node", "operator_node")
 
-    memory = MemorySaver()
-    compiled = graph.compile(
-        checkpointer=memory,
-        interrupt_before=["execute_node"],
-    )
-
-    return compiled, memory
+    return graph

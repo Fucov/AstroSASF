@@ -1,0 +1,87 @@
+# ============================================================================ #
+#  AstroSASF — FSM 规则定义 (业务层配置)                                         #
+#  此文件由应用开发者编写，框架 ShadowFSM 引擎只负责加载和校验。                    #
+# ============================================================================ #
+
+# 所有合法状态（字符串标识）
+states:
+  - IDLE
+  - HEATING
+  - COOLING
+  - ROBOTIC_ARM_MOVING
+  - VACUUM_ACTIVE
+  - EMERGENCY_STOP
+
+# 初始状态
+initial_state: IDLE
+
+# 状态转移规则：[当前状态, 动作] → 目标状态
+transitions:
+  - from: IDLE
+    action: START_HEATING
+    to: HEATING
+
+  - from: IDLE
+    action: START_COOLING
+    to: COOLING
+
+  - from: IDLE
+    action: MOVE_ROBOTIC_ARM
+    to: ROBOTIC_ARM_MOVING
+
+  - from: IDLE
+    action: ACTIVATE_VACUUM
+    to: VACUUM_ACTIVE
+
+  - from: IDLE
+    action: EMERGENCY_STOP
+    to: EMERGENCY_STOP
+
+  - from: HEATING
+    action: STOP_HEATING
+    to: IDLE
+
+  - from: HEATING
+    action: EMERGENCY_STOP
+    to: EMERGENCY_STOP
+
+  - from: COOLING
+    action: STOP_COOLING
+    to: IDLE
+
+  - from: COOLING
+    action: EMERGENCY_STOP
+    to: EMERGENCY_STOP
+
+  - from: ROBOTIC_ARM_MOVING
+    action: STOP_ROBOTIC_ARM
+    to: IDLE
+
+  - from: ROBOTIC_ARM_MOVING
+    action: EMERGENCY_STOP
+    to: EMERGENCY_STOP
+
+  - from: VACUUM_ACTIVE
+    action: DEACTIVATE_VACUUM
+    to: IDLE
+
+  - from: VACUUM_ACTIVE
+    action: EMERGENCY_STOP
+    to: EMERGENCY_STOP
+
+  - from: EMERGENCY_STOP
+    action: RESET
+    to: IDLE
+
+# 安全约束：执行某动作前，遥测值必须满足条件，否则拦截
+# 格式: { action, metric, operator, threshold }
+safety_constraints:
+  - action: START_HEATING
+    metric: temperature
+    operator: ">="
+    threshold: 80.0
+
+  - action: MOVE_ROBOTIC_ARM
+    metric: pressure
+    operator: "<"
+    threshold: 50.0

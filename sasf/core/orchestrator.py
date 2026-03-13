@@ -32,8 +32,24 @@ class Orchestrator:
     def spawn_laboratory(
         self,
         lab_id: str,
+        fsm: Any,
         tasks: list[str] | None = None,
+        tool_registrar: Any = None,
+        initial_telemetry: dict[str, Any] | None = None,
     ) -> LaboratoryEnvironment:
+        """创建并注册实验柜。
+
+        Parameters
+        ----------
+        lab_id : str
+        fsm : ShadowFSM
+            外部构造的通用 FSM 实例。
+        tasks : list[str], optional
+        tool_registrar : callable, optional
+            业务 MCP Tool 注册函数。
+        initial_telemetry : dict, optional
+            初始遥测数据。
+        """
         if lab_id in self._labs:
             raise ValueError(f"实验柜 '{lab_id}' 已存在")
 
@@ -43,7 +59,13 @@ class Orchestrator:
                 f"已达最大并发数 {max_labs}，无法创建 '{lab_id}'"
             )
 
-        env = LaboratoryEnvironment(lab_id=lab_id, config=self.config)
+        env = LaboratoryEnvironment(
+            lab_id=lab_id,
+            config=self.config,
+            fsm=fsm,
+            tool_registrar=tool_registrar,
+            initial_telemetry=initial_telemetry or {},
+        )
         self._labs[lab_id] = (env, tasks or [])
         logger.info("Orchestrator: 注册 '%s', 任务数=%d", lab_id, len(tasks or []))
         return env

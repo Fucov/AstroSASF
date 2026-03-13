@@ -87,11 +87,11 @@ class MCPToolRegistry:
 
     Example
     -------
-    >>> registry = MCPToolRegistry(lab_id="Lab-Alpha")
+    >>> registry = MCPToolRegistry(lab_id="Lab-01")
     >>>
     >>> @registry.mcp_tool
-    ... async def set_temperature(ctx: MCPToolContext, target: float) -> dict:
-    ...     \"\"\"设置舱内温度目标值（℃）\"\"\"
+    ... async def measure_sensor(ctx: MCPToolContext, channel: int) -> dict:
+    ...     \"\"\"读取传感器通道值\"\"\"
     ...     ...
     """
 
