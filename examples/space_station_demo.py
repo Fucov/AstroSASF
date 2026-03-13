@@ -22,6 +22,10 @@ import sys
 from pathlib import Path
 from typing import Any
 
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 # ── 框架导入 ── #
 from sasf.core.config_loader import load_config
 from sasf.core.environment import LaboratoryEnvironment
@@ -34,7 +38,6 @@ from sasf.physics.telemetry_bus import TelemetryBus
 from langgraph.checkpoint.memory import MemorySaver
 import uuid
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
 logger = logging.getLogger(__name__)
 
 
@@ -341,7 +344,7 @@ async def main() -> None:
     logger.info("💡 HITL: 每个 MCP Tool 执行前会暂停等待人类审批")
     logger.info("   y/回车 = 批准 | n = 中止 | JSON = 修正参数")
 
-    tasks = ["请将实验柜温度升高到50℃，然后将机械臂移动到45度位置"]
+    tasks = ["进行流体实验"]
 
     # 应用层注入 HITL (MemorySaver + interrupt_before)
     memory = MemorySaver()
