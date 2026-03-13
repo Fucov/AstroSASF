@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Any
 
 # ── 框架导入 ── #
-from sasf.core.config_loader import SASFConfig
+from sasf.core.config_loader import load_config
 from sasf.core.environment import LaboratoryEnvironment
 from sasf.middleware.a2a_protocol import A2AIntent
 from sasf.middleware.mcp_registry import MCPToolContext, MCPToolRegistry
@@ -55,6 +55,7 @@ INITIAL_TELEMETRY: dict[str, Any] = {
 # ============================================================================ #
 #  业务层: MCP Tools 注册函数                                                    #
 # ============================================================================ #
+
 
 def register_space_station_tools(
     registry: MCPToolRegistry,
@@ -97,7 +98,9 @@ def register_space_station_tools(
         }
 
     @registry.mcp_tool
-    async def move_robotic_arm(ctx: MCPToolContext, target_angle: float) -> dict[str, Any]:
+    async def move_robotic_arm(
+        ctx: MCPToolContext, target_angle: float
+    ) -> dict[str, Any]:
         """移动机械臂至指定角度（°）"""
         target_angle = float(target_angle)
         snapshot = await ctx.bus.snapshot()
@@ -147,13 +150,15 @@ def register_space_station_tools(
 
     logger.info(
         "[%s] 物理设备层: 已注册 %d 个 MCP Tools (自动 Schema)",
-        registry.lab_id, len(registry.all_tool_names()),
+        registry.lab_id,
+        len(registry.all_tool_names()),
     )
 
 
 # ============================================================================ #
 #  HITL 循环 (应用层实现)                                                        #
 # ============================================================================ #
+
 
 async def hitl_loop(
     compiled_graph: Any,
@@ -205,7 +210,8 @@ async def hitl_loop(
                         new_step["params"] = new_params
 
                     compiled_graph.update_state(
-                        config, {"current_step": new_step},
+                        config,
+                        {"current_step": new_step},
                     )
                     logger.info("[%s] ✏️  用户修正: %s", lab_id, new_step)
             except (json.JSONDecodeError, TypeError):
@@ -254,6 +260,7 @@ async def _get_human_approval(step: dict[str, Any] | None, lab_id: str) -> str:
 #  主函数                                                                        #
 # ============================================================================ #
 
+
 async def main() -> None:
     # ── 日志 ── #
     logging.basicConfig(
@@ -274,16 +281,16 @@ async def main() -> None:
 ║    ███████║███████╗   ██║   ██████╔╝██║   ██║                ║
 ║    ██╔══██║╚════██║   ██║   ██╔══██╗██║   ██║                ║
 ║    ██║  ██║███████║   ██║   ██║  ██║╚██████╔╝                ║
-║    ╚═╝  ╚═╝╚══════╝   ╚═╝   ╚═╝  ╚═╝ ╚═════╝                ║
+║    ╚═╝  ╚═╝╚══════╝   ╚═╝   ╚═╝  ╚═╝ ╚═════╝                 ║
 ║                                                              ║
-║    S A S F  v4.3  ·  Generic Engine + External HITL          ║
+║    S A S F  v4.4  ·  Generic Engine + Strict Planner         ║
 ║    Astro Scientific Agent Scheduling Framework               ║
 ║                                                              ║
 ╚══════════════════════════════════════════════════════════════╝
 """)
 
     # ── 1) 加载配置 ── #
-    config = SASFConfig.from_yaml(PROJECT_ROOT / "config.yaml")
+    config = load_config(PROJECT_ROOT / "config.yaml")
 
     # ── 2) 从 fsm_rules.yaml 加载 FSM 规则 ── #
     fsm = ShadowFSM.from_yaml(
@@ -304,7 +311,10 @@ async def main() -> None:
     def on_skill_result(msg):
         logger.info(
             "📬 [订阅者] 收到 SKILL_RESULT: %s → %s",
-            msg.sender, msg.payload.get("status", "N/A") if isinstance(msg.payload, dict) else msg.payload,
+            msg.sender,
+            msg.payload.get("status", "N/A")
+            if isinstance(msg.payload, dict)
+            else msg.payload,
         )
 
     env.a2a_router.subscribe(A2AIntent.SKILL_RESULT, on_skill_result)
@@ -374,7 +384,8 @@ async def main() -> None:
         all_results.append(result)
 
         logger.info(
-            "[Lab-Alpha] 📤 任务完成: %s", result.get("status", "N/A"),
+            "[Lab-Alpha] 📤 任务完成: %s",
+            result.get("status", "N/A"),
         )
 
     # ── 8) 结果汇总 ── #
@@ -404,23 +415,36 @@ async def main() -> None:
     codec_stats = env.codec_stats
     logger.info("  │  🗜️  编解码器统计:")
     logger.info("  │     编码次数           : %s", codec_stats.get("encode_count", 0))
-    logger.info("  │     JSON 总字节        : %s B", codec_stats.get("total_json_bytes", 0))
-    logger.info("  │     Binary 总字节      : %s B", codec_stats.get("total_binary_bytes", 0))
-    logger.info("  │     综合压缩率         : %s", codec_stats.get("overall_compression_ratio", "N/A"))
-    logger.info("  │     动态字典词条数     : %s", codec_stats.get("dictionary_size", 0))
+    logger.info(
+        "  │     JSON 总字节        : %s B", codec_stats.get("total_json_bytes", 0)
+    )
+    logger.info(
+        "  │     Binary 总字节      : %s B", codec_stats.get("total_binary_bytes", 0)
+    )
+    logger.info(
+        "  │     综合压缩率         : %s",
+        codec_stats.get("overall_compression_ratio", "N/A"),
+    )
+    logger.info(
+        "  │     动态字典词条数     : %s", codec_stats.get("dictionary_size", 0)
+    )
     logger.info("  │")
 
     bus_stats = env.bus_stats
     logger.info("  │  🛰️  SpaceWire 总线统计:")
     logger.info("  │     传输帧数           : %s", bus_stats.get("total_frames", 0))
     logger.info("  │     传输总字节         : %s B", bus_stats.get("total_bytes", 0))
-    logger.info("  │     累计传输延迟       : %s ms", bus_stats.get("total_latency_ms", 0))
+    logger.info(
+        "  │     累计传输延迟       : %s ms", bus_stats.get("total_latency_ms", 0)
+    )
     logger.info("  │")
 
     a2a_stats = env.a2a_stats
     logger.info("  │  📨 A2A 路由器统计:")
     logger.info("  │     总消息数           : %s", a2a_stats.get("total_messages", 0))
-    logger.info("  │     活跃订阅           : %s", a2a_stats.get("active_subscriptions", 0))
+    logger.info(
+        "  │     活跃订阅           : %s", a2a_stats.get("active_subscriptions", 0)
+    )
     for intent_name, count in a2a_stats.get("intent_distribution", {}).items():
         logger.info("  │     %-20s : %s", intent_name, count)
     logger.info("  │")
@@ -429,7 +453,9 @@ async def main() -> None:
     for i, r in enumerate(all_results, 1):
         logger.info(
             "  │     任务 %d: %s (%d 步)",
-            i, r.get("status", "N/A"), r.get("total_steps", 0),
+            i,
+            r.get("status", "N/A"),
+            r.get("total_steps", 0),
         )
     logger.info("  │")
     logger.info("  └──────────────────────────────────────────────────")

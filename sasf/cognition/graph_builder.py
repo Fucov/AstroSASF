@@ -33,20 +33,35 @@ _MAX_RETRIES_PER_STEP: int = 2
 # --------------------------------------------------------------------------- #
 
 _PLANNER_PROMPT = """你是太空实验柜的规划智能体 (Planner)。
-你的任务是将用户的自然语言指令拆解为一系列可执行的 MCP Tool 调用步骤。
+你的唯一任务：将用户指令拆解为 **底层 MCP Tool 原子调用序列**。
 
-## 可用 MCP Tools (底层原子操作)
+## ⚠️ 严格规则 (违反将导致系统崩溃)
+
+1. **只允许使用以下 MCP Tools** —— 这是完整的白名单，不存在其他工具：
+{tools_whitelist}
+
+2. **绝对禁止**创造不在上述列表中的工具名！
+   - ❌ 禁止输出 SOP/Skill 的名称作为 tool_name（如 fluid_experiment）
+   - ❌ 禁止编造任何不在白名单中的工具
+   - ✅ 每个步骤的 "skill" 字段必须精确匹配白名单中的名称
+
+3. 如果用户提到某个 SOP（标准操作程序），你必须**阅读下方 SOP 文档**，
+   然后将其中的每一步操作**翻译**为白名单中的底层 MCP Tool 调用。
+   SOP 只是操作指南，不是可执行工具！
+
+## 可用 MCP Tools 详细说明
 {tools_description}
 
 {skills_context}
 
-请严格按以下 JSON 格式输出计划（不要添加任何其他文字解释）：
+## 输出格式 (严格 JSON，不允许任何其他文字)
 [
-  {{"skill": "<tool_name>", "params": {{...}} }},
+  {{"skill": "<白名单中的tool名>", "params": {{...}} }},
   ...
 ]
 
 用户指令: {task}"""
+
 
 _CORRECTION_PROMPT = """你是太空实验柜的操作智能体 (Operator)。
 上一步 MCP Tool 执行失败，FSM 安全护栏返回了错误。
@@ -114,11 +129,14 @@ def build_lab_graph(
     """
 
     # ── MCP Tools 描述 ── #
+    tool_names = [t['name'] for t in gateway.list_tools()]
+    tools_whitelist = "\n".join(f"   - `{name}`" for name in tool_names)
     tools_desc = "\n".join(
         f"- `{t['name']}`: {t['description']}  "
         f"Schema: {json.dumps(t['json_schema']['function']['parameters'], ensure_ascii=False)}"
         for t in gateway.list_tools()
     )
+    tool_name_set = set(tool_names)
 
     # ── OpenAI Skills SOP 上下文 ── #
     skills_context = ""
@@ -144,6 +162,7 @@ def build_lab_graph(
         )
 
         prompt = _PLANNER_PROMPT.format(
+            tools_whitelist=tools_whitelist,
             tools_description=tools_desc,
             skills_context=skills_context,
             task=task,
@@ -160,6 +179,17 @@ def build_lab_graph(
         except ValueError as exc:
             logger.warning("[%s] Planner JSON 解析失败: %s", lab_id, exc)
             plan = []
+
+        # ── 后置校验：过滤不在白名单中的虚構工具 ── #
+        validated_plan = []
+        for step in plan:
+            if isinstance(step, dict) and step.get("skill") in tool_name_set:
+                validated_plan.append(step)
+            else:
+                logger.warning(
+                    "[%s] ⚠️ Planner 输出了未注册的工具，已过滤: %s", lab_id, step,
+                )
+        plan = validated_plan
 
         a2a_router.route(
             sender="Planner", receiver="Operator",
