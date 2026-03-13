@@ -1,7 +1,10 @@
 """
-AstroSASF · Core · Orchestrator
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-实验系统管理器 —— 管理 N 个完全隔离的 LaboratoryEnvironment。
+AstroSASF · Core · Orchestrator (V4.1)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+实验系统管理器 —— 崩溃安全的统计保全机制。
+
+V4.1 修复:
+- 环境崩溃时，从 env.collect_stats() 安全提取已产生的统计数据。
 """
 
 from __future__ import annotations
@@ -19,7 +22,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class Orchestrator:
-    """多实验柜编排器。"""
+    """多实验柜编排器 (V4.1 崩溃安全)。"""
 
     config: SASFConfig
     _labs: dict[str, tuple[LaboratoryEnvironment, list[str]]] = field(
@@ -46,6 +49,7 @@ class Orchestrator:
         return env
 
     async def run_all(self) -> list[dict[str, Any]]:
+        """并发运行所有实验柜。崩溃时保全已产生的统计数据。"""
         if not self._labs:
             logger.warning("Orchestrator: 没有实验柜")
             return []
@@ -58,10 +62,31 @@ class Orchestrator:
         results = await asyncio.gather(*coroutines, return_exceptions=True)
 
         processed: list[dict[str, Any]] = []
-        for (lab_id, _), result in zip(self._labs.items(), results):
+        for (lab_id, (env, _tasks)), result in zip(self._labs.items(), results):
             if isinstance(result, Exception):
-                logger.error("Orchestrator: '%s' 异常: %s", lab_id, result)
-                processed.append({"lab_id": lab_id, "status": "error", "detail": str(result)})
+                logger.error(
+                    "Orchestrator: '%s' 运行异常: %s", lab_id, result,
+                )
+                # ── 崩溃安全：从环境实例中抢救统计数据 ── #
+                salvaged = env.collect_stats()
+                salvaged["status"] = "error"
+                salvaged["detail"] = str(result)
+                salvaged["task_results"] = []
+
+                # 尝试获取遥测快照
+                try:
+                    import asyncio as _aio
+                    loop = _aio.get_event_loop()
+                    if loop.is_running():
+                        salvaged["final_telemetry"] = {}
+                    else:
+                        salvaged["final_telemetry"] = loop.run_until_complete(
+                            env.get_telemetry()
+                        )
+                except Exception:
+                    salvaged["final_telemetry"] = {}
+
+                processed.append(salvaged)
             else:
                 processed.append(result)
 

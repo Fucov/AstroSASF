@@ -1,12 +1,12 @@
 """
-AstroSASF · Cognition · GraphBuilder (V4)
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+AstroSASF · Cognition · GraphBuilder (V4.1)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 LangGraph 状态图工作流构建器。
 
-V4 变化:
-- 接受外部注入的 LLM（由 config_loader 工厂创建）
-- 使用 A2ARouter 记录节点间通信
-- Skill 描述从 SkillRegistry 动态获取（而非硬编码）
+V4.1 修复:
+- 加回 MemorySaver + interrupt_before=["execute_node"] (HITL)
+- 修复 operator_node 所有分支确保返回非 None dict
+- should_continue 边增加防御性判断
 """
 
 from __future__ import annotations
@@ -16,6 +16,7 @@ import logging
 import re
 from typing import Any
 
+from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, StateGraph
 
 from sasf.cognition.state import LabGraphState
@@ -63,6 +64,7 @@ _CORRECTION_PROMPT = """你是太空实验柜的操作智能体 (Operator)。
 # --------------------------------------------------------------------------- #
 
 def _extract_json(text: str) -> Any:
+    """从 LLM 输出中提取 JSON —— 容忍 markdown 代码块包裹。"""
     match = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
     if match:
         text = match.group(1).strip()
@@ -89,19 +91,13 @@ def build_lab_graph(
     llm: Any,
     lab_id: str,
     a2a_router: A2ARouter,
-) -> Any:
+) -> tuple[Any, MemorySaver]:
     """构建并编译实验柜的 LangGraph 状态图。
 
-    Parameters
-    ----------
-    gateway : SpaceMCPGateway
-        该实验柜的 Space-MCP 网关。
-    llm : BaseChatModel
-        LLM 实例（由 config_loader.create_llm 创建）。
-    lab_id : str
-        实验柜标识。
-    a2a_router : A2ARouter
-        A2A 消息路由器。
+    Returns
+    -------
+    tuple[CompiledGraph, MemorySaver]
+        编译后的图 和 MemorySaver（HITL 检查点后端）。
     """
 
     # 从 Registry 动态获取 Skill 描述
@@ -115,10 +111,10 @@ def build_lab_graph(
     # ================================================================== #
 
     async def planner_node(state: LabGraphState) -> dict[str, Any]:
+        """调用 LLM 将原始任务拆解为分步 Skill 计划。"""
         task = state["original_task"]
         logger.info("[%s] 🧠 Planner: 正在规划「%s」...", lab_id, task)
 
-        # A2A: 记录任务请求
         a2a_router.route(
             sender="System", receiver="Planner",
             intent=A2AIntent.TASK_REQUEST,
@@ -139,7 +135,6 @@ def build_lab_graph(
             logger.warning("[%s] Planner JSON 解析失败: %s", lab_id, exc)
             plan = []
 
-        # A2A: 记录计划生成
         a2a_router.route(
             sender="Planner", receiver="Operator",
             intent=A2AIntent.PLAN_GENERATED,
@@ -147,9 +142,17 @@ def build_lab_graph(
         )
 
         logger.info("[%s] 🧠 Planner: 生成 %d 步计划", lab_id, len(plan))
+        for i, step in enumerate(plan):
+            logger.info("[%s]    步骤 %d: %s", lab_id, i + 1, step)
+
         return {
-            "plan": plan, "current_step_index": 0, "current_step": None,
-            "fsm_feedback": None, "execution_log": [], "error_count": 0,
+            "plan": plan,
+            "current_step_index": 0,
+            "current_step": None,
+            "fsm_feedback": None,
+            "execution_log": [],
+            "error_count": 0,
+            "final_result": None,
         }
 
     # ================================================================== #
@@ -157,28 +160,41 @@ def build_lab_graph(
     # ================================================================== #
 
     async def operator_node(state: LabGraphState) -> dict[str, Any]:
-        plan = state.get("plan", [])
+        """判断下一步动作。**所有分支必须返回 dict，禁止返回 None**。"""
+        plan = state.get("plan") or []
         index = state.get("current_step_index", 0)
         feedback = state.get("fsm_feedback")
         error_count = state.get("error_count", 0)
-        log = list(state.get("execution_log", []))
+        log = list(state.get("execution_log") or [])
 
-        # ── Case 1: FSM 拦截，LLM 修正 ── #
-        if feedback and feedback.get("status") == "error":
+        # ── Case 1: 上一步执行失败，尝试 LLM 修正 ── #
+        if isinstance(feedback, dict) and feedback.get("status") == "error":
             if error_count >= _MAX_RETRIES_PER_STEP:
-                logger.warning("[%s] ⚠️ 步骤 %d 连续失败 %d 次，跳过", lab_id, index + 1, error_count)
+                logger.warning(
+                    "[%s] ⚠️ 步骤 %d 连续失败 %d 次，跳过",
+                    lab_id, index + 1, error_count,
+                )
                 log.append({
-                    "step_index": index, "skill": feedback.get("skill", "unknown"),
-                    "params": {}, "result": feedback, "status": "error", "correction": None,
+                    "step_index": index,
+                    "skill": feedback.get("skill", "unknown"),
+                    "params": {},
+                    "result": feedback,
+                    "status": "error",
+                    "correction": None,
                 })
                 return {
-                    "current_step_index": index + 1, "current_step": None,
-                    "fsm_feedback": None, "execution_log": log, "error_count": 0,
+                    "current_step_index": index + 1,
+                    "current_step": None,
+                    "fsm_feedback": None,
+                    "execution_log": log,
+                    "error_count": 0,
                 }
 
-            logger.info("[%s] 🔄 步骤 %d 失败，LLM 修正 (第 %d 次)", lab_id, index + 1, error_count + 1)
+            logger.info(
+                "[%s] 🔄 步骤 %d 失败，LLM 修正 (第 %d 次)",
+                lab_id, index + 1, error_count + 1,
+            )
 
-            # A2A: 错误修正请求
             a2a_router.route(
                 sender="Operator", receiver="LLM",
                 intent=A2AIntent.ERROR_CORRECTION,
@@ -188,56 +204,90 @@ def build_lab_graph(
             current = plan[index] if index < len(plan) else {}
             prompt = _CORRECTION_PROMPT.format(
                 skill_name=current.get("skill", "unknown"),
-                original_params=json.dumps(current.get("params", {}), ensure_ascii=False),
+                original_params=json.dumps(
+                    current.get("params", {}), ensure_ascii=False,
+                ),
                 error_detail=feedback.get("detail", "未知错误"),
             )
             response = await llm.ainvoke(prompt)
-            raw_text = response.content if hasattr(response, "content") else str(response)
+            raw_text = (
+                response.content if hasattr(response, "content") else str(response)
+            )
             logger.info("[%s] 🔄 LLM 修正输出:\n%s", lab_id, raw_text)
 
             try:
                 corrected = _extract_json(raw_text)
                 if corrected.get("skill") == "skip":
-                    logger.info("[%s] 🔄 LLM 建议跳过: %s", lab_id, corrected.get("reason"))
+                    logger.info(
+                        "[%s] 🔄 LLM 建议跳过: %s", lab_id, corrected.get("reason"),
+                    )
                     log.append({
-                        "step_index": index, "skill": current.get("skill", "unknown"),
-                        "params": current.get("params", {}), "result": feedback,
-                        "status": "error", "correction": corrected.get("reason"),
+                        "step_index": index,
+                        "skill": current.get("skill", "unknown"),
+                        "params": current.get("params", {}),
+                        "result": feedback,
+                        "status": "error",
+                        "correction": corrected.get("reason"),
                     })
                     return {
-                        "current_step_index": index + 1, "current_step": None,
-                        "fsm_feedback": None, "execution_log": log, "error_count": 0,
+                        "current_step_index": index + 1,
+                        "current_step": None,
+                        "fsm_feedback": None,
+                        "execution_log": log,
+                        "error_count": 0,
                     }
-                else:
-                    return {"current_step": corrected, "fsm_feedback": None, "error_count": error_count + 1}
+                return {
+                    "current_step": corrected,
+                    "fsm_feedback": None,
+                    "error_count": error_count + 1,
+                }
             except ValueError:
                 logger.warning("[%s] 修正 JSON 解析失败，跳过", lab_id)
                 log.append({
-                    "step_index": index, "skill": current.get("skill", "unknown"),
-                    "params": current.get("params", {}), "result": feedback,
-                    "status": "error", "correction": "LLM 修正 JSON 解析失败",
+                    "step_index": index,
+                    "skill": current.get("skill", "unknown"),
+                    "params": current.get("params", {}),
+                    "result": feedback,
+                    "status": "error",
+                    "correction": "LLM 修正 JSON 解析失败",
                 })
                 return {
-                    "current_step_index": index + 1, "current_step": None,
-                    "fsm_feedback": None, "execution_log": log, "error_count": 0,
+                    "current_step_index": index + 1,
+                    "current_step": None,
+                    "fsm_feedback": None,
+                    "execution_log": log,
+                    "error_count": 0,
                 }
 
-        # ── Case 2: 上一步成功 ── #
-        if feedback and feedback.get("status") == "success":
+        # ── Case 2: 上一步成功，记录并推进索引 ── #
+        if isinstance(feedback, dict) and feedback.get("status") == "success":
             log.append({
-                "step_index": index, "skill": feedback.get("skill", "unknown"),
-                "params": {}, "result": feedback, "status": "success", "correction": None,
+                "step_index": index,
+                "skill": feedback.get("skill", "unknown"),
+                "params": {},
+                "result": feedback,
+                "status": "success",
+                "correction": None,
             })
             return {
-                "current_step_index": index + 1, "current_step": None,
-                "fsm_feedback": None, "execution_log": log, "error_count": 0,
+                "current_step_index": index + 1,
+                "current_step": None,
+                "fsm_feedback": None,
+                "execution_log": log,
+                "error_count": 0,
             }
 
-        # ── Case 3: 提取当前步骤 ── #
+        # ── Case 3: 提取下一步执行 ── #
         if index < len(plan):
             step = plan[index]
-            logger.info("[%s] 📋 Operator: 步骤 %d/%d → %s", lab_id, index + 1, len(plan), step)
-            return {"current_step": step}
+            logger.info(
+                "[%s] 📋 Operator: 提取步骤 %d/%d → %s",
+                lab_id, index + 1, len(plan), step,
+            )
+            return {
+                "current_step": step,
+                "fsm_feedback": None,
+            }
 
         # ── Case 4: 全部完成 ── #
         logger.info("[%s] ✅ Operator: 所有步骤执行完毕", lab_id)
@@ -245,13 +295,16 @@ def build_lab_graph(
         a2a_router.route(
             sender="Operator", receiver="System",
             intent=A2AIntent.EXECUTION_COMPLETE,
-            payload={"total_steps": len(plan)},
+            payload={"total_steps": len(plan), "executed": len(log)},
         )
 
         return {
             "current_step": None,
+            "fsm_feedback": None,
             "final_result": {
-                "status": "completed", "total_steps": len(plan), "execution_log": log,
+                "status": "completed",
+                "total_steps": len(plan),
+                "execution_log": log,
             },
         }
 
@@ -260,40 +313,85 @@ def build_lab_graph(
     # ================================================================== #
 
     async def execute_node(state: LabGraphState) -> dict[str, Any]:
+        """通过 SpaceMCPGateway 调用当前步骤的 Skill。"""
         step = state.get("current_step")
-        if not step:
-            return {"fsm_feedback": {"status": "error", "detail": "无有效步骤"}}
+        if not step or not isinstance(step, dict):
+            return {
+                "fsm_feedback": {
+                    "status": "error",
+                    "skill": "unknown",
+                    "detail": "execute_node 收到无效步骤",
+                },
+            }
 
         skill_name = step.get("skill", "")
         params = step.get("params", {})
-        logger.info("[%s] ⚙️ Execute: '%s' params=%s", lab_id, skill_name, params)
 
-        result = await gateway.invoke_skill(skill_name, params)
-        logger.info("[%s] ⚙️ Execute: 结果 → %s", lab_id, result.get("status"))
+        logger.info(
+            "[%s] ⚙️ Execute: '%s' params=%s", lab_id, skill_name, params,
+        )
+
+        try:
+            result = await gateway.invoke_skill(skill_name, params)
+        except Exception as exc:
+            logger.exception("[%s] ⚙️ Execute 异常", lab_id)
+            result = {
+                "skill": skill_name,
+                "status": "error",
+                "detail": f"Gateway 调用异常: {exc!r}",
+            }
+
+        logger.info(
+            "[%s] ⚙️ Execute: 结果 → %s", lab_id, result.get("status"),
+        )
         return {"fsm_feedback": result}
 
     # ================================================================== #
-    #  Conditional Edge                                                   #
+    #  Conditional Edge: operator_node → execute_node 或 END              #
     # ================================================================== #
 
     def should_continue(state: LabGraphState) -> str:
-        if state.get("final_result") is not None:
+        """条件边判断：继续执行 or 结束。
+
+        三条严格规则（防御 NoneType）：
+        1. final_result 非 None → 结束
+        2. current_step 是有效 dict → 继续执行
+        3. 兜底 → 结束（不会返回 None）
+        """
+        final = state.get("final_result")
+        if final is not None:
             return "done"
-        if state.get("current_step") is not None:
+
+        step = state.get("current_step")
+        if isinstance(step, dict) and step.get("skill"):
             return "has_step"
+
         return "done"
 
     # ================================================================== #
-    #  Build Graph                                                        #
+    #  Build & Compile (with MemorySaver for HITL)                        #
     # ================================================================== #
 
     graph = StateGraph(LabGraphState)
+
     graph.add_node("planner_node", planner_node)
     graph.add_node("operator_node", operator_node)
     graph.add_node("execute_node", execute_node)
+
     graph.set_entry_point("planner_node")
     graph.add_edge("planner_node", "operator_node")
-    graph.add_conditional_edges("operator_node", should_continue, {"has_step": "execute_node", "done": END})
+    graph.add_conditional_edges(
+        "operator_node",
+        should_continue,
+        {"has_step": "execute_node", "done": END},
+    )
     graph.add_edge("execute_node", "operator_node")
 
-    return graph.compile()
+    # HITL: MemorySaver 检查点 + execute_node 前中断
+    memory = MemorySaver()
+    compiled = graph.compile(
+        checkpointer=memory,
+        interrupt_before=["execute_node"],
+    )
+
+    return compiled, memory
