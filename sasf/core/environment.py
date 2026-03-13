@@ -1,12 +1,14 @@
 """
-AstroSASF · Core · LaboratoryEnvironment (V4.1)
+AstroSASF · Core · LaboratoryEnvironment (V4.2)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-单个实验舱的上下文环境 —— Middleware-First Architecture。
+单个实验舱的上下文环境 —— MCP Tools + OpenAI Skills 解耦架构。
 
-V4.1 修复:
-- build_lab_graph 现在返回 (compiled_graph, memory_saver) 元组
-- run() 使用 HITL 中断循环方式调用图，支持 Human-in-the-Loop
-- 提供 collect_stats() 方法，即使崩溃也能提取已产生的统计数据
+V4.2 装配流程:
+1. Physics Layer — 创建 FSM + TelemetryBus
+2. Middleware Layer — 创建 MCPToolRegistry + A2ARouter
+3. Physics → Middleware — 物理设备通过 @mcp_tool 注册 MCP Tools
+4. 动态 Codec 协商 — 从 Registry 获取词汇表 → 构建 SpaceMCPCodec
+5. Cognition Layer — 加载 SKILL.md 知识 + config_loader 创建 LLM → 构建 LangGraph
 """
 
 from __future__ import annotations
@@ -15,19 +17,21 @@ import json
 import logging
 import uuid
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from langgraph.checkpoint.memory import MemorySaver
 
 from sasf.cognition.graph_builder import build_lab_graph
+from sasf.cognition.skill_loader import OpenAISkillCatalog
 from sasf.cognition.state import LabGraphState
 from sasf.core.config_loader import SASFConfig, create_llm
 from sasf.middleware.a2a_protocol import A2ARouter
 from sasf.middleware.codec import SpaceMCPCodec
 from sasf.middleware.gateway import SpaceMCPGateway
-from sasf.middleware.skill_registry import SkillRegistry
+from sasf.middleware.mcp_registry import MCPToolRegistry
 from sasf.middleware.virtual_bus import VirtualSpaceWire
-from sasf.physics.shadow_fsm import ShadowFSM, register_default_skills
+from sasf.physics.shadow_fsm import ShadowFSM, register_default_tools
 from sasf.physics.telemetry_bus import TelemetryBus
 
 logger = logging.getLogger(__name__)
@@ -35,19 +39,21 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class LaboratoryEnvironment:
-    """单个实验柜的完整运行时环境 (V4.1 HITL + Crash-safe stats)。"""
+    """单个实验柜运行时环境 (V4.2 MCP Tools + OpenAI Skills)。"""
 
     lab_id: str
     config: SASFConfig
+    skills_catalog_dir: str | Path = "skills_catalog"
 
     # ---- 内部组件 --------------------------------------------------------- #
     _bus: TelemetryBus = field(init=False, repr=False)
     _fsm: ShadowFSM = field(init=False, repr=False)
-    _registry: SkillRegistry = field(init=False, repr=False)
+    _registry: MCPToolRegistry = field(init=False, repr=False)
     _a2a_router: A2ARouter = field(init=False, repr=False)
     _codec: SpaceMCPCodec = field(init=False, repr=False)
     _space_wire: VirtualSpaceWire = field(init=False, repr=False)
     _gateway: SpaceMCPGateway = field(init=False, repr=False)
+    _skill_catalog: OpenAISkillCatalog = field(init=False, repr=False)
     _graph: Any = field(init=False, repr=False)
     _memory: MemorySaver = field(init=False, repr=False)
 
@@ -58,10 +64,23 @@ class LaboratoryEnvironment:
         self._bus = TelemetryBus(lab_id=self.lab_id)
         self._fsm = ShadowFSM(lab_id=self.lab_id)
 
-        # 2) Middleware Layer
-        self._registry = SkillRegistry(lab_id=self.lab_id)
+        # 2) Middleware Layer — MCPToolRegistry
+        self._registry = MCPToolRegistry(lab_id=self.lab_id)
         self._a2a_router = A2ARouter(lab_id=self.lab_id)
-        self._codec = SpaceMCPCodec(lab_id=self.lab_id)
+
+        # 3) Physics → Middleware: 通过 @mcp_tool 注册 MCP Tools
+        register_default_tools(
+            registry=self._registry,
+            fsm=self._fsm,
+            bus=self._bus,
+        )
+
+        # 4) 动态 Codec 协商 — 从 Registry 自动获取词汇表
+        vocabulary = self._registry.all_vocabulary()
+        self._codec = SpaceMCPCodec(
+            lab_id=self.lab_id,
+            vocabulary=vocabulary,
+        )
         self._space_wire = VirtualSpaceWire(
             lab_id=self.lab_id,
             bandwidth_kbps=mw_cfg.spacewire_bandwidth_kbps,
@@ -76,20 +95,18 @@ class LaboratoryEnvironment:
             a2a_router=self._a2a_router,
         )
 
-        # 3) Physics → Middleware 注册
-        register_default_skills(
-            registry=self._registry,
-            fsm=self._fsm,
-            bus=self._bus,
+        # 5) Cognition Layer — Load Skills + Build Graph
+        self._skill_catalog = OpenAISkillCatalog(
+            catalog_dir=self.skills_catalog_dir,
         )
 
-        # 4) Cognition Layer (返回 graph + memory)
         llm = create_llm(self.config.llm)
         self._graph, self._memory = build_lab_graph(
             gateway=self._gateway,
             llm=llm,
             lab_id=self.lab_id,
             a2a_router=self._a2a_router,
+            skill_catalog=self._skill_catalog,
         )
 
     # ---- 状态查询 --------------------------------------------------------- #
@@ -102,12 +119,16 @@ class LaboratoryEnvironment:
         return self._fsm.current_state.name
 
     @property
-    def available_skills(self) -> list[dict[str, Any]]:
-        return self._gateway.list_skills()
+    def available_tools(self) -> list[dict[str, Any]]:
+        return self._gateway.list_tools()
 
     @property
     def codec_stats(self) -> dict[str, Any]:
         return self._codec.stats
+
+    @property
+    def codec_dictionary(self) -> dict[str, int]:
+        return self._codec.dictionary_table
 
     @property
     def bus_stats(self) -> dict[str, Any]:
@@ -117,8 +138,12 @@ class LaboratoryEnvironment:
     def a2a_stats(self) -> dict[str, Any]:
         return self._a2a_router.stats
 
+    @property
+    def loaded_skills(self) -> list[dict[str, str]]:
+        return self._skill_catalog.list_skills()
+
     def collect_stats(self) -> dict[str, Any]:
-        """安全地收集当前所有统计信息 —— 即使环境崩溃也可调用。"""
+        """安全地收集所有统计信息 —— 即使环境崩溃也可调用。"""
         stats: dict[str, Any] = {"lab_id": self.lab_id}
         try:
             stats["fsm_state"] = self._fsm.current_state.name
@@ -138,16 +163,20 @@ class LaboratoryEnvironment:
             stats["a2a_stats"] = {}
         return stats
 
-    # ---- 任务运行 (HITL 中断循环) ----------------------------------------- #
+    # ---- 任务运行 (HITL) ------------------------------------------------- #
 
     async def run(self, tasks: list[str]) -> dict[str, Any]:
-        """启动 LangGraph 工作流 —— 带 HITL 中断的执行循环。"""
         logger.info("=" * 64)
-        logger.info("[%s] 🚀 实验柜环境启动 (V4.1 HITL)", self.lab_id)
+        logger.info("[%s] 🚀 实验柜启动 (V4.2 MCP Tools + OpenAI Skills)", self.lab_id)
         logger.info(
-            "[%s] 📋 已注册 Skills: %s",
+            "[%s] 🔧 已注册 MCP Tools: %s",
             self.lab_id,
-            [s["name"] for s in self.available_skills],
+            [t["name"] for t in self.available_tools],
+        )
+        logger.info(
+            "[%s] 📚 已加载 OpenAI Skills: %s",
+            self.lab_id,
+            [s["name"] for s in self.loaded_skills],
         )
         logger.info("=" * 64)
 
@@ -168,10 +197,7 @@ class LaboratoryEnvironment:
                 "final_result": None,
             }
 
-            # 每个任务一个独立的 thread_id
             thread_config = {"configurable": {"thread_id": uuid.uuid4().hex}}
-
-            # ── HITL 中断循环 ── #
             result = await self._hitl_loop(initial_state, thread_config)
             all_results.append(result)
 
@@ -181,7 +207,6 @@ class LaboratoryEnvironment:
                 result.get("status", "N/A"),
             )
 
-        # 收集环境结果
         final_telemetry = await self._bus.snapshot()
         env_result = {
             "lab_id": self.lab_id,
@@ -207,26 +232,18 @@ class LaboratoryEnvironment:
         initial_state: LabGraphState,
         config: dict[str, Any],
     ) -> dict[str, Any]:
-        """HITL (Human-in-the-loop) 执行循环。
-
-        图在 execute_node 前中断。每次中断时打印待执行的 Skill，
-        等待外部回调决定是否继续（由 demo 脚本通过 stdin 输入控制）。
-        """
-        # 首次运行（planner → operator → 中断于 execute_node 前）
         state = await self._graph.ainvoke(initial_state, config)
         snapshot = self._graph.get_state(config)
 
         while snapshot.next:
-            # 此时图中断在 execute_node 前
             step = state.get("current_step")
             if step and isinstance(step, dict):
                 logger.info("")
                 logger.info(
-                    "[%s] ⏸️  HITL 中断 — 即将执行:",
-                    self.lab_id,
+                    "[%s] ⏸️  HITL 中断 — 即将执行:", self.lab_id,
                 )
                 logger.info(
-                    "[%s]    Skill : %s", self.lab_id, step.get("skill"),
+                    "[%s]    Tool  : %s", self.lab_id, step.get("skill"),
                 )
                 logger.info(
                     "[%s]    Params: %s",
@@ -234,7 +251,6 @@ class LaboratoryEnvironment:
                     json.dumps(step.get("params", {}), ensure_ascii=False),
                 )
 
-            # 人类审批：从 stdin 读取
             user_input = await self._get_human_approval(step)
 
             if user_input == "abort":
@@ -246,16 +262,13 @@ class LaboratoryEnvironment:
                 }
 
             if user_input == "approve":
-                # 继续执行（不修改 state）
                 state = await self._graph.ainvoke(None, config)
             else:
-                # 用户提供了修正后的 JSON 参数
                 try:
                     corrected = json.loads(user_input)
                     if isinstance(corrected, dict):
                         self._graph.update_state(
-                            config,
-                            {"current_step": corrected},
+                            config, {"current_step": corrected},
                         )
                         logger.info(
                             "[%s] ✏️  用户修正参数: %s", self.lab_id, corrected,
@@ -268,7 +281,6 @@ class LaboratoryEnvironment:
 
             snapshot = self._graph.get_state(config)
 
-        # 图运行结束
         final = state.get("final_result")
         if final and isinstance(final, dict):
             return final
@@ -280,22 +292,14 @@ class LaboratoryEnvironment:
 
     @staticmethod
     async def _get_human_approval(step: dict[str, Any] | None) -> str:
-        """从 stdin 获取人类审批。
-
-        输入约定:
-        - ``y`` / 回车 → approve（继续执行）
-        - ``n``       → abort（中止）
-        - JSON 字符串  → 修正参数
-        """
         import asyncio
-        import sys
 
         if step:
             skill = step.get("skill", "unknown")
             params = json.dumps(step.get("params", {}), ensure_ascii=False)
             prompt = (
                 f"\n{'─' * 60}\n"
-                f"🛡️ HITL | 即将执行: {skill}({params})\n"
+                f"🛡️ HITL | 即将执行 MCP Tool: {skill}({params})\n"
                 f"  [y/回车] 批准  |  [n] 中止  |  [JSON] 修正参数\n"
                 f"{'─' * 60}\n"
                 f">>> "
@@ -303,7 +307,6 @@ class LaboratoryEnvironment:
         else:
             prompt = "\n>>> 继续? [y/n]: "
 
-        # 在事件循环中安全读取 stdin
         loop = asyncio.get_event_loop()
         raw = await loop.run_in_executor(None, lambda: input(prompt))
 
@@ -312,4 +315,4 @@ class LaboratoryEnvironment:
             return "approve"
         if raw.lower() in ("n", "no"):
             return "abort"
-        return raw  # 尝试作为 JSON 解析
+        return raw

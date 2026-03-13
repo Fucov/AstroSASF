@@ -1,12 +1,11 @@
 """
-AstroSASF · Cognition · GraphBuilder (V4.1)
+AstroSASF · Cognition · GraphBuilder (V4.2)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 LangGraph 状态图工作流构建器。
 
-V4.1 修复:
-- 加回 MemorySaver + interrupt_before=["execute_node"] (HITL)
-- 修复 operator_node 所有分支确保返回非 None dict
-- should_continue 边增加防御性判断
+V4.2 变化:
+- Planner Prompt 注入 **MCP Tools Schema** 和 **OpenAI Skills SOP** 双重上下文
+- 使用 gateway.invoke_tool() 替代 invoke_skill()
 """
 
 from __future__ import annotations
@@ -19,6 +18,7 @@ from typing import Any
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, StateGraph
 
+from sasf.cognition.skill_loader import OpenAISkillCatalog
 from sasf.cognition.state import LabGraphState
 from sasf.middleware.a2a_protocol import A2AIntent, A2ARouter
 from sasf.middleware.gateway import SpaceMCPGateway
@@ -33,27 +33,30 @@ _MAX_RETRIES_PER_STEP: int = 2
 # --------------------------------------------------------------------------- #
 
 _PLANNER_PROMPT = """你是太空实验柜的规划智能体 (Planner)。
-你的任务是将用户的自然语言指令拆解为一系列可执行的 Skill 调用步骤。
+你的任务是将用户的自然语言指令拆解为一系列可执行的 MCP Tool 调用步骤。
 
-{skills_description}
+## 可用 MCP Tools (底层原子操作)
+{tools_description}
+
+{skills_context}
 
 请严格按以下 JSON 格式输出计划（不要添加任何其他文字解释）：
 [
-  {{"skill": "<skill_name>", "params": {{...}} }},
+  {{"skill": "<tool_name>", "params": {{...}} }},
   ...
 ]
 
 用户指令: {task}"""
 
 _CORRECTION_PROMPT = """你是太空实验柜的操作智能体 (Operator)。
-上一步 Skill 执行失败，FSM 安全护栏返回了错误。
+上一步 MCP Tool 执行失败，FSM 安全护栏返回了错误。
 
-失败的 Skill: {skill_name}
+失败的 Tool: {skill_name}
 原始参数: {original_params}
 错误信息: {error_detail}
 
 请分析错误原因，给出修正后的参数。严格仅输出修正后的 JSON 对象（不要添加任何其他解释）：
-{{"skill": "<skill_name>", "params": {{...}} }}
+{{"skill": "<tool_name>", "params": {{...}} }}
 
 如果该步骤无法修正（例如物理约束无法绕过），请输出：
 {{"skill": "skip", "params": {{}}, "reason": "<原因>"}}"""
@@ -64,7 +67,6 @@ _CORRECTION_PROMPT = """你是太空实验柜的操作智能体 (Operator)。
 # --------------------------------------------------------------------------- #
 
 def _extract_json(text: str) -> Any:
-    """从 LLM 输出中提取 JSON —— 容忍 markdown 代码块包裹。"""
     match = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
     if match:
         text = match.group(1).strip()
@@ -91,27 +93,45 @@ def build_lab_graph(
     llm: Any,
     lab_id: str,
     a2a_router: A2ARouter,
+    skill_catalog: OpenAISkillCatalog | None = None,
 ) -> tuple[Any, MemorySaver]:
     """构建并编译实验柜的 LangGraph 状态图。
+
+    Parameters
+    ----------
+    gateway : SpaceMCPGateway
+    llm : BaseChatModel
+    lab_id : str
+    a2a_router : A2ARouter
+    skill_catalog : OpenAISkillCatalog, optional
+        已加载的 OpenAI Skills 知识目录。
 
     Returns
     -------
     tuple[CompiledGraph, MemorySaver]
-        编译后的图 和 MemorySaver（HITL 检查点后端）。
     """
 
-    # 从 Registry 动态获取 Skill 描述
-    skills_desc = "\n".join(
-        f"- {s['name']}: {s['description']}  参数: {s.get('param_schema', {})}"
-        for s in gateway.list_skills()
+    # ── MCP Tools 描述（自动反射的 Schema） ── #
+    tools_desc = "\n".join(
+        f"- `{t['name']}`: {t['description']}  "
+        f"Schema: {json.dumps(t['json_schema']['function']['parameters'], ensure_ascii=False)}"
+        for t in gateway.list_tools()
     )
+
+    # ── OpenAI Skills SOP 上下文 ── #
+    skills_context = ""
+    if skill_catalog and skill_catalog.count > 0:
+        skills_context = (
+            "## 已加载的 OpenAI Skills (标准操作程序 SOP)\n"
+            "以下 Skill 告诉你**如何**组合调用 MCP Tools 完成复杂任务，请参考它们规划步骤：\n\n"
+            + skill_catalog.get_all_skills_context()
+        )
 
     # ================================================================== #
     #  Node: planner_node                                                 #
     # ================================================================== #
 
     async def planner_node(state: LabGraphState) -> dict[str, Any]:
-        """调用 LLM 将原始任务拆解为分步 Skill 计划。"""
         task = state["original_task"]
         logger.info("[%s] 🧠 Planner: 正在规划「%s」...", lab_id, task)
 
@@ -121,7 +141,11 @@ def build_lab_graph(
             payload={"task": task},
         )
 
-        prompt = _PLANNER_PROMPT.format(skills_description=skills_desc, task=task)
+        prompt = _PLANNER_PROMPT.format(
+            tools_description=tools_desc,
+            skills_context=skills_context,
+            task=task,
+        )
         response = await llm.ainvoke(prompt)
         raw_text = response.content if hasattr(response, "content") else str(response)
 
@@ -160,14 +184,13 @@ def build_lab_graph(
     # ================================================================== #
 
     async def operator_node(state: LabGraphState) -> dict[str, Any]:
-        """判断下一步动作。**所有分支必须返回 dict，禁止返回 None**。"""
         plan = state.get("plan") or []
         index = state.get("current_step_index", 0)
         feedback = state.get("fsm_feedback")
         error_count = state.get("error_count", 0)
         log = list(state.get("execution_log") or [])
 
-        # ── Case 1: 上一步执行失败，尝试 LLM 修正 ── #
+        # ── Case 1: 失败 → LLM 修正 ── #
         if isinstance(feedback, dict) and feedback.get("status") == "error":
             if error_count >= _MAX_RETRIES_PER_STEP:
                 logger.warning(
@@ -194,7 +217,6 @@ def build_lab_graph(
                 "[%s] 🔄 步骤 %d 失败，LLM 修正 (第 %d 次)",
                 lab_id, index + 1, error_count + 1,
             )
-
             a2a_router.route(
                 sender="Operator", receiver="LLM",
                 intent=A2AIntent.ERROR_CORRECTION,
@@ -219,7 +241,8 @@ def build_lab_graph(
                 corrected = _extract_json(raw_text)
                 if corrected.get("skill") == "skip":
                     logger.info(
-                        "[%s] 🔄 LLM 建议跳过: %s", lab_id, corrected.get("reason"),
+                        "[%s] 🔄 LLM 建议跳过: %s",
+                        lab_id, corrected.get("reason"),
                     )
                     log.append({
                         "step_index": index,
@@ -259,7 +282,7 @@ def build_lab_graph(
                     "error_count": 0,
                 }
 
-        # ── Case 2: 上一步成功，记录并推进索引 ── #
+        # ── Case 2: 成功 ── #
         if isinstance(feedback, dict) and feedback.get("status") == "success":
             log.append({
                 "step_index": index,
@@ -277,7 +300,7 @@ def build_lab_graph(
                 "error_count": 0,
             }
 
-        # ── Case 3: 提取下一步执行 ── #
+        # ── Case 3: 提取下一步 ── #
         if index < len(plan):
             step = plan[index]
             logger.info(
@@ -289,15 +312,13 @@ def build_lab_graph(
                 "fsm_feedback": None,
             }
 
-        # ── Case 4: 全部完成 ── #
+        # ── Case 4: 完成 ── #
         logger.info("[%s] ✅ Operator: 所有步骤执行完毕", lab_id)
-
         a2a_router.route(
             sender="Operator", receiver="System",
             intent=A2AIntent.EXECUTION_COMPLETE,
             payload={"total_steps": len(plan), "executed": len(log)},
         )
-
         return {
             "current_step": None,
             "fsm_feedback": None,
@@ -313,7 +334,6 @@ def build_lab_graph(
     # ================================================================== #
 
     async def execute_node(state: LabGraphState) -> dict[str, Any]:
-        """通过 SpaceMCPGateway 调用当前步骤的 Skill。"""
         step = state.get("current_step")
         if not step or not isinstance(step, dict):
             return {
@@ -326,13 +346,12 @@ def build_lab_graph(
 
         skill_name = step.get("skill", "")
         params = step.get("params", {})
-
         logger.info(
             "[%s] ⚙️ Execute: '%s' params=%s", lab_id, skill_name, params,
         )
 
         try:
-            result = await gateway.invoke_skill(skill_name, params)
+            result = await gateway.invoke_tool(skill_name, params)
         except Exception as exc:
             logger.exception("[%s] ⚙️ Execute 异常", lab_id)
             result = {
@@ -347,37 +366,26 @@ def build_lab_graph(
         return {"fsm_feedback": result}
 
     # ================================================================== #
-    #  Conditional Edge: operator_node → execute_node 或 END              #
+    #  Conditional Edge                                                   #
     # ================================================================== #
 
     def should_continue(state: LabGraphState) -> str:
-        """条件边判断：继续执行 or 结束。
-
-        三条严格规则（防御 NoneType）：
-        1. final_result 非 None → 结束
-        2. current_step 是有效 dict → 继续执行
-        3. 兜底 → 结束（不会返回 None）
-        """
         final = state.get("final_result")
         if final is not None:
             return "done"
-
         step = state.get("current_step")
         if isinstance(step, dict) and step.get("skill"):
             return "has_step"
-
         return "done"
 
     # ================================================================== #
-    #  Build & Compile (with MemorySaver for HITL)                        #
+    #  Build & Compile (HITL)                                             #
     # ================================================================== #
 
     graph = StateGraph(LabGraphState)
-
     graph.add_node("planner_node", planner_node)
     graph.add_node("operator_node", operator_node)
     graph.add_node("execute_node", execute_node)
-
     graph.set_entry_point("planner_node")
     graph.add_edge("planner_node", "operator_node")
     graph.add_conditional_edges(
@@ -387,7 +395,6 @@ def build_lab_graph(
     )
     graph.add_edge("execute_node", "operator_node")
 
-    # HITL: MemorySaver 检查点 + execute_node 前中断
     memory = MemorySaver()
     compiled = graph.compile(
         checkpointer=memory,

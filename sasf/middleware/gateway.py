@@ -1,36 +1,23 @@
 """
-AstroSASF · Middleware · SpaceMCPGateway (V4)
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+AstroSASF · Middleware · SpaceMCPGateway (V4.2)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Space-MCP 协议转换网关 —— Agent 与底层物理世界的**唯一通信桥梁**。
 
-V4 核心变化：网关**不再硬编码任何 Skill**。所有 Skill 由物理设备层
-通过 ``SkillRegistry`` 注册，网关仅做纯粹的协议透传。
-
-全链路数据流
-~~~~~~~~~~~~~~~
-::
-
-  Agent ──JSON──▶ Gateway.invoke_skill()
-       │           │
-       │  1. A2A 消息记录
-       │  2. Codec.encode() → 二进制帧
-       │  3. VirtualSpaceWire.transmit()
-       │  4. Codec.decode() → 还原 JSON
-       │  5. SkillRegistry.invoke() → FSM 校验 + Bus 写入
-       │  6. 响应 encode → SpaceWire → decode
-       ◀──JSON──────┘
+V4.2 变化:
+- 使用 ``MCPToolRegistry`` 替代旧 ``SkillRegistry``
+- 使用 ``MCPToolContext`` 替代旧 ``SkillContext``
 """
 
 from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 from sasf.middleware.a2a_protocol import A2AIntent, A2ARouter
 from sasf.middleware.codec import SpaceMCPCodec
-from sasf.middleware.skill_registry import SkillContext, SkillRegistry
+from sasf.middleware.mcp_registry import MCPToolContext, MCPToolRegistry
 from sasf.middleware.virtual_bus import VirtualSpaceWire
 from sasf.physics.shadow_fsm import SecurityGuardrailException, ShadowFSM
 from sasf.physics.telemetry_bus import TelemetryBus
@@ -44,9 +31,9 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class SpaceMCPGateway:
-    """Space-MCP 协议转换网关 (V4)。
+    """Space-MCP 协议转换网关 (V4.2)。
 
-    不包含任何业务逻辑 —— 通过 ``SkillRegistry`` 查找并委托执行。
+    不包含任何业务逻辑 —— 通过 ``MCPToolRegistry`` 查找并委托执行。
     """
 
     lab_id: str
@@ -54,25 +41,25 @@ class SpaceMCPGateway:
     bus: TelemetryBus
     codec: SpaceMCPCodec
     space_wire: VirtualSpaceWire
-    registry: SkillRegistry
+    registry: MCPToolRegistry
     a2a_router: A2ARouter
 
-    def list_skills(self) -> list[dict[str, Any]]:
-        """返回可用 Skills 清单（委托给 Registry）。"""
-        return self.registry.list_skills()
+    def list_tools(self) -> list[dict[str, Any]]:
+        """返回可用 MCP Tools 清单（委托给 Registry）。"""
+        return self.registry.list_tools()
 
-    async def invoke_skill(
+    async def invoke_tool(
         self,
-        skill_name: str,
+        tool_name: str,
         params: dict[str, Any],
     ) -> dict[str, Any]:
-        """调用指定 Skill —— 经过完整的 Space-MCP 协议转换链路。"""
+        """调用指定 MCP Tool —— 经过完整的 Space-MCP 协议转换链路。"""
 
-        if not self.registry.has_skill(skill_name):
+        if not self.registry.has_tool(tool_name):
             return {
-                "skill": skill_name,
+                "skill": tool_name,
                 "status": "error",
-                "detail": f"SkillRegistry 中未注册: {skill_name}",
+                "detail": f"MCPToolRegistry 中未注册: {tool_name}",
             }
 
         # ── A2A: 记录调用请求 ── #
@@ -80,14 +67,14 @@ class SpaceMCPGateway:
             sender="Operator",
             receiver="Gateway",
             intent=A2AIntent.SKILL_INVOCATION,
-            payload={"skill": skill_name, "params": params},
+            payload={"skill": tool_name, "params": params},
         )
 
         # ============================================================ #
         #  Phase 1 · 下行链路：Agent JSON → Binary → SpaceWire         #
         # ============================================================ #
 
-        request_json = {"skill": skill_name, "params": params}
+        request_json = {"skill": tool_name, "params": params}
         json_text = json.dumps(request_json, ensure_ascii=False)
         json_bytes = len(json_text.encode("utf-8"))
 
@@ -112,22 +99,22 @@ class SpaceMCPGateway:
         logger.info("[%s] │ ✅ FSM 端解码: %s", self.lab_id, decoded_request)
 
         # ============================================================ #
-        #  Phase 2 · 执行：SkillRegistry.invoke()                      #
+        #  Phase 2 · 执行：MCPToolRegistry.invoke()                    #
         # ============================================================ #
 
-        context = SkillContext(fsm=self.fsm, bus=self.bus, lab_id=self.lab_id)
+        context = MCPToolContext(fsm=self.fsm, bus=self.bus, lab_id=self.lab_id)
         try:
             result = await self.registry.invoke(
-                name=skill_name,
+                name=tool_name,
                 params=decoded_request["params"],
                 context=context,
             )
         except SecurityGuardrailException as exc:
             logger.warning("[%s] │ 🛡️  FSM 安全拦截: %s", self.lab_id, exc)
-            result = {"skill": skill_name, "status": "error", "detail": str(exc)}
+            result = {"skill": tool_name, "status": "error", "detail": str(exc)}
         except Exception as exc:
-            logger.exception("[%s] │ ❌ Skill '%s' 异常", self.lab_id, skill_name)
-            result = {"skill": skill_name, "status": "error", "detail": f"内部异常: {exc!r}"}
+            logger.exception("[%s] │ ❌ Tool '%s' 异常", self.lab_id, tool_name)
+            result = {"skill": tool_name, "status": "error", "detail": f"内部异常: {exc!r}"}
 
         # ── A2A: 记录执行结果 ── #
         self.a2a_router.route(
