@@ -249,7 +249,7 @@ class MCPToolRegistry:
     ) -> dict[str, Any]:
         """查找并调用已注册的 MCP Tool。
 
-        自动根据 Handler 的 JSON Schema 进行类型转换，增强对 LLM 输出（如字符串化数字）的鲁棒性。
+        Handler 签名为 ``(ctx, **params)`` — 参数以关键字方式传入。
         """
         descriptor = self._tools.get(name)
         if descriptor is None:
@@ -259,38 +259,8 @@ class MCPToolRegistry:
                 "detail": f"MCPToolRegistry: 未注册的 Tool '{name}'",
             }
 
-        # ---- 自动类型转换 (Casting via JSON Schema) ----
-        try:
-            properties = descriptor.json_schema["function"]["parameters"]["properties"]
-            casted = {}
-            for k, v in params.items():
-                if k in properties:
-                    json_type = properties[k]["type"]
-                    # 处理 LLM 常见的字符串化数字/布尔值
-                    if isinstance(v, str):
-                        if json_type == "number":
-                            try:
-                                casted[k] = float(v)
-                            except ValueError:
-                                casted[k] = v
-                        elif json_type == "integer":
-                            try:
-                                casted[k] = int(v)
-                            except ValueError:
-                                casted[k] = v
-                        elif json_type == "boolean":
-                            casted[k] = v.lower() in ("true", "1", "yes")
-                        else:
-                            casted[k] = v
-                    else:
-                        casted[k] = v
-                else:
-                    casted[k] = v
-            params = casted
-        except Exception as e:
-            logger.debug("[%s] MCPToolRegistry: 自动类型转换跳过 (%s)", self.lab_id, e)
-
         return await descriptor.handler(context, **params)
+
 
     # ---- 统计 ------------------------------------------------------------- #
 

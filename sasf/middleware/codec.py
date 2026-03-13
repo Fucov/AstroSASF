@@ -169,7 +169,7 @@ class SpaceMCPCodec:
                 key_name = self._token_to_str.get(
                     key_byte, f"unknown_0x{key_byte:02X}",
                 )
-            value, offset = self._decode_value(data, offset)
+            value, offset = self._decode_value_with_dict(data, offset)
             params[key_name] = value
 
         self._decode_count += 1
@@ -193,7 +193,7 @@ class SpaceMCPCodec:
                 key_name = self._token_to_str.get(
                     key_byte, f"unknown_0x{key_byte:02X}",
                 )
-            value, offset = self._decode_value(data, offset)
+            value, offset = self._decode_value_with_dict(data, offset)
             result[key_name] = value
         return result
 
@@ -255,24 +255,6 @@ class SpaceMCPCodec:
             raw = str(value).encode("utf-8")
             buf.extend(struct.pack(">H", len(raw)))
             buf.extend(raw)
-
-    @staticmethod
-    def _decode_value(data: bytes | bytearray, offset: int) -> tuple[Any, int]:
-        type_tag = data[offset]; offset += 1
-        if type_tag == _TYPE_FLOAT:
-            return round(struct.unpack_from(">f", data, offset)[0], 4), offset + 4
-        if type_tag == _TYPE_INT:
-            return struct.unpack_from(">b", data, offset)[0], offset + 1
-        if type_tag == _TYPE_BOOL:
-            return data[offset] != 0x00, offset + 1
-        if type_tag == _TYPE_STR:
-            # _decode_value 无法直接查表（静态方法），需要实例方法
-            # 但这里用不到反向映射，仅返回 token int
-            return data[offset], offset + 1
-        if type_tag == _TYPE_RAW:
-            str_len = struct.unpack_from(">H", data, offset)[0]; offset += 2
-            return data[offset:offset + str_len].decode("utf-8"), offset + str_len
-        raise ValueError(f"未知类型标签: 0x{type_tag:02X}")
 
     def _decode_value_with_dict(
         self, data: bytes | bytearray, offset: int,
