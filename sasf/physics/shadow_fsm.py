@@ -164,6 +164,7 @@ def register_default_tools(
     @registry.mcp_tool
     async def set_temperature(ctx: MCPToolContext, target: float) -> dict[str, Any]:
         """设置舱内温度目标值（℃）"""
+        target = float(target)
         current_temp = await ctx.bus.read("temperature")
         action = Action.START_HEATING if target > current_temp else Action.START_COOLING
 
@@ -186,6 +187,7 @@ def register_default_tools(
     @registry.mcp_tool
     async def move_robotic_arm(ctx: MCPToolContext, target_angle: float) -> dict[str, Any]:
         """移动机械臂至指定角度（°）"""
+        target_angle = float(target_angle)
         snapshot = await ctx.bus.snapshot()
         new_state = await ctx.fsm.validate_and_transition(
             action=Action.MOVE_ROBOTIC_ARM,
@@ -205,6 +207,9 @@ def register_default_tools(
     @registry.mcp_tool
     async def toggle_vacuum_pump(ctx: MCPToolContext, activate: bool) -> dict[str, Any]:
         """切换真空泵开关"""
+        if isinstance(activate, str):
+            activate = activate.lower() in ("true", "1", "yes")
+        
         action = Action.ACTIVATE_VACUUM if activate else Action.DEACTIVATE_VACUUM
         snapshot = await ctx.bus.snapshot()
         new_state = await ctx.fsm.validate_and_transition(

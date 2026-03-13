@@ -275,11 +275,24 @@ class LaboratoryEnvironment:
                 try:
                     corrected = json.loads(user_input)
                     if isinstance(corrected, dict):
+                        # 判断用户输入的是完整的 step 字典，还是仅仅是对 params 的修正
+                        if "skill" in corrected and "params" in corrected:
+                            new_step = corrected
+                        else:
+                            # 仅针对 params 的修正
+                            new_step = dict(step) if step else {}
+                            new_params = new_step.get("params", {})
+                            if isinstance(new_params, dict):
+                                new_params.update(corrected)
+                            else:
+                                new_params = corrected
+                            new_step["params"] = new_params
+
                         self._graph.update_state(
-                            config, {"current_step": corrected},
+                            config, {"current_step": new_step},
                         )
                         logger.info(
-                            "[%s] ✏️  用户修正参数: %s", self.lab_id, corrected,
+                            "[%s] ✏️  用户修正步: %s", self.lab_id, new_step,
                         )
                 except (json.JSONDecodeError, TypeError):
                     logger.warning(

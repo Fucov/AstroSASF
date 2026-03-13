@@ -17,7 +17,7 @@ from __future__ import annotations
 import inspect
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Callable, Awaitable, get_type_hints
+from typing import Any, Callable, Awaitable
 
 logger = logging.getLogger(__name__)
 
@@ -121,12 +121,6 @@ class MCPToolRegistry:
         name = func.__name__
         description = (inspect.getdoc(func) or "").strip()
 
-        # 反射 type hints（排除 ctx 和 return）
-        try:
-            hints = get_type_hints(func)
-        except Exception:
-            hints = {}
-
         sig = inspect.signature(func)
         properties: dict[str, Any] = {}
         required: list[str] = []
@@ -134,17 +128,26 @@ class MCPToolRegistry:
 
         for param_name, param in sig.parameters.items():
             # 跳过 ctx (第一个参数) 和 self
-            if param_name in ("ctx", "self"):
+            if param_name in ("ctx", "self", "return"):
                 continue
 
-            param_type = hints.get(param_name, str)
-            # 如果是 return 类型标注则跳过
-            if param_name == "return":
-                continue
+            # 使用相对简单的启发式方法解析注解，避免 get_type_hints() 因为局部 import 引发 NameError
+            # (由于 from __future__ import annotations，annotation 可能是字符串)
+            ann = param.annotation
+            json_type = "string"
+            if ann is not inspect.Parameter.empty:
+                if isinstance(ann, str):
+                    ann_lower = ann.lower()
+                    if "float" in ann_lower:
+                        json_type = "number"
+                    elif "int" in ann_lower:
+                        json_type = "integer"
+                    elif "bool" in ann_lower:
+                        json_type = "boolean"
+                else:
+                    json_type = _type_to_json_schema(ann)
 
-            json_type = _type_to_json_schema(param_type)
             param_keys.append(param_name)
-
             prop: dict[str, str] = {"type": json_type}
             properties[param_name] = prop
 
@@ -246,7 +249,7 @@ class MCPToolRegistry:
     ) -> dict[str, Any]:
         """查找并调用已注册的 MCP Tool。
 
-        自动根据 Handler 的 Type Hints 进行类型转换，增强对 LLM 输出（如字符串化数字）的鲁棒性。
+        自动根据 Handler 的 JSON Schema 进行类型转换，增强对 LLM 输出（如字符串化数字）的鲁棒性。
         """
         descriptor = self._tools.get(name)
         if descriptor is None:
@@ -256,26 +259,26 @@ class MCPToolRegistry:
                 "detail": f"MCPToolRegistry: 未注册的 Tool '{name}'",
             }
 
-        # ---- 自动类型转换 (Casting) ----
+        # ---- 自动类型转换 (Casting via JSON Schema) ----
         try:
-            hints = get_type_hints(descriptor.handler)
+            properties = descriptor.json_schema["function"]["parameters"]["properties"]
             casted = {}
             for k, v in params.items():
-                if k in hints:
-                    target_type = hints[k]
+                if k in properties:
+                    json_type = properties[k]["type"]
                     # 处理 LLM 常见的字符串化数字/布尔值
                     if isinstance(v, str):
-                        if target_type is float:
+                        if json_type == "number":
                             try:
                                 casted[k] = float(v)
                             except ValueError:
                                 casted[k] = v
-                        elif target_type is int:
+                        elif json_type == "integer":
                             try:
                                 casted[k] = int(v)
                             except ValueError:
                                 casted[k] = v
-                        elif target_type is bool:
+                        elif json_type == "boolean":
                             casted[k] = v.lower() in ("true", "1", "yes")
                         else:
                             casted[k] = v
