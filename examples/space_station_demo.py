@@ -22,6 +22,13 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+# --- 新增代码：手动挂载根目录到 sys.path ---
+# 获取当前文件 (examples/space_station_demo.py) 的父目录的父目录 (AstroSASF)
+root_dir = Path(__file__).resolve().parent.parent
+if str(root_dir) not in sys.path:
+    sys.path.insert(0, str(root_dir))
+# ---------------------------------------
+
 from sasf.core.config_loader import load_config
 from sasf.core.environment import LaboratoryEnvironment
 from sasf.middleware.a2a_protocol import A2AIntent
@@ -52,6 +59,7 @@ INITIAL_TELEMETRY: dict[str, Any] = {
 # ============================================================================ #
 #  业务层: MCP Tools 注册 (含 Guard)                                              #
 # ============================================================================ #
+
 
 def register_tools(
     registry: MCPToolRegistry,
@@ -85,7 +93,9 @@ def register_tools(
         forbid_states={"vacuum": "ACTIVE"},
         telemetry_rules=["pressure >= 50"],
     )
-    async def move_robotic_arm(ctx: MCPToolContext, target_angle: float) -> dict[str, Any]:
+    async def move_robotic_arm(
+        ctx: MCPToolContext, target_angle: float
+    ) -> dict[str, Any]:
         """移动机械臂至指定角度（°）"""
         target_angle = float(target_angle)
 
@@ -119,13 +129,15 @@ def register_tools(
 
     logger.info(
         "[%s] 物理设备层: 已注册 %d 个 MCP Tools",
-        registry.lab_id, registry.count,
+        registry.lab_id,
+        registry.count,
     )
 
 
 # ============================================================================ #
 #  业务层: Macro 绑定                                                            #
 # ============================================================================ #
+
 
 def register_macros(registry: MCPToolRegistry) -> None:
     """注册参数预绑定的 Macro。"""
@@ -171,6 +183,7 @@ def register_macros(registry: MCPToolRegistry) -> None:
 #  HITL 循环                                                                    #
 # ============================================================================ #
 
+
 async def hitl_loop(compiled, initial_state, config, lab_id):
     state = await compiled.ainvoke(initial_state, config)
     snapshot = compiled.get_state(config)
@@ -182,12 +195,14 @@ async def hitl_loop(compiled, initial_state, config, lab_id):
             logger.info("[%s] ⏸️  HITL — 即将执行:", lab_id)
             logger.info("[%s]    Tool  : %s", lab_id, step.get("skill"))
             logger.info(
-                "[%s]    Params: %s", lab_id,
+                "[%s]    Params: %s",
+                lab_id,
                 json.dumps(step.get("params", {}), ensure_ascii=False),
             )
 
         raw = await asyncio.get_event_loop().run_in_executor(
-            None, lambda: input(
+            None,
+            lambda: input(
                 f"\n{'─' * 60}\n"
                 f"🛡️ HITL | {step.get('skill', '?')}({step.get('params', {})})\n"
                 f"  [y/回车] 批准  |  [n] 中止  |  [JSON] 修正\n"
@@ -197,34 +212,53 @@ async def hitl_loop(compiled, initial_state, config, lab_id):
         raw = raw.strip()
 
         if raw.lower() in ("n", "no"):
-            return {"status": "aborted_by_user", "execution_log": list(state.get("execution_log") or [])}
+            return {
+                "status": "aborted_by_user",
+                "execution_log": list(state.get("execution_log") or []),
+            }
 
         if raw and raw not in ("", "y", "yes"):
+            corrected = None
+            # 尝试 JSON 解析
             try:
                 corrected = json.loads(raw)
-                if isinstance(corrected, dict):
-                    if "skill" in corrected and "params" in corrected:
-                        new_step = corrected
-                    else:
-                        new_step = dict(step) if step else {}
-                        new_step.setdefault("params", {}).update(corrected)
-                    compiled.update_state(config, {"current_step": new_step})
             except json.JSONDecodeError:
-                logger.warning("[%s] JSON 解析失败，按原计划继续", lab_id)
+                pass
+            # 退级：ast.literal_eval（容忍单引号 Python 字典）
+            if corrected is None:
+                try:
+                    import ast as _ast
+                    corrected = _ast.literal_eval(raw)
+                except (ValueError, SyntaxError):
+                    logger.warning("[%s] 无法解析输入，按原计划继续", lab_id)
+
+            if isinstance(corrected, dict):
+                if "skill" in corrected and "params" in corrected:
+                    new_step = corrected
+                else:
+                    new_step = dict(step) if step else {}
+                    new_step.setdefault("params", {}).update(corrected)
+                compiled.update_state(config, {"current_step": new_step})
+                logger.info("[%s] ✏️  参数修正: %s", lab_id, new_step)
 
         state = await compiled.ainvoke(None, config)
         snapshot = compiled.get_state(config)
 
     final = state.get("final_result")
-    return final if isinstance(final, dict) else {
-        "status": "completed",
-        "execution_log": list(state.get("execution_log") or []),
-    }
+    return (
+        final
+        if isinstance(final, dict)
+        else {
+            "status": "completed",
+            "execution_log": list(state.get("execution_log") or []),
+        }
+    )
 
 
 # ============================================================================ #
 #  主函数                                                                        #
 # ============================================================================ #
+
 
 async def main() -> None:
     logging.basicConfig(
@@ -271,10 +305,13 @@ async def main() -> None:
     )
 
     # ── 4) A2A 订阅 ── #
-    env.a2a_router.subscribe(A2AIntent.SKILL_RESULT, lambda msg: logger.info(
-        "📬 [订阅] SKILL_RESULT: %s",
-        msg.payload.get("status") if isinstance(msg.payload, dict) else msg.payload,
-    ))
+    env.a2a_router.subscribe(
+        A2AIntent.SKILL_RESULT,
+        lambda msg: logger.info(
+            "📬 [订阅] SKILL_RESULT: %s",
+            msg.payload.get("status") if isinstance(msg.payload, dict) else msg.payload,
+        ),
+    )
 
     # ── 5) 展示信息 ── #
     logger.info("")
@@ -366,7 +403,9 @@ async def main() -> None:
     cs = env.codec_stats
     logger.info("  │  🗜️  编解码器:")
     logger.info("  │     编码次数      : %s", cs.get("encode_count", 0))
-    logger.info("  │     综合压缩率    : %s", cs.get("overall_compression_ratio", "N/A"))
+    logger.info(
+        "  │     综合压缩率    : %s", cs.get("overall_compression_ratio", "N/A")
+    )
     logger.info("  │     词条数        : %s (含 Macro)", cs.get("dictionary_size", 0))
     logger.info("  │")
 

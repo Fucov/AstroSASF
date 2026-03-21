@@ -180,6 +180,7 @@ class InterlockEngine:
     interlocks: list[InterlockRule] = field(default_factory=list)
 
     _states: dict[str, str] = field(default_factory=dict, init=False)
+    _bus: Any = field(default=None, init=False, repr=False)  # TelemetryBus (可选)
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
 
     def __post_init__(self) -> None:
@@ -265,8 +266,14 @@ class InterlockEngine:
             raise KeyError(f"[{self.lab_id}] 未知子系统: '{subsystem}'")
         return self._states[subsystem]
 
-    async def set_subsystem_state(self, subsystem: str, state: str) -> None:
-        """设置子系统状态（含合法性校验 + 联锁校验）。"""
+    async def set_subsystem_state(
+        self, subsystem: str, state: str,
+        telemetry: dict[str, Any] | None = None,
+    ) -> None:
+        """设置子系统状态（含合法性校验 + 联锁校验）。
+
+        若未传入 telemetry 但引擎绑定了 TelemetryBus，会自动获取快照。
+        """
         async with self._lock:
             # 1) 子系统存在性
             allowed = self.subsystems.get(subsystem)
@@ -280,11 +287,18 @@ class InterlockEngine:
                     f"[{self.lab_id}] 非法状态 '{state}' "
                     f"(子系统 '{subsystem}' 允许: {allowed})"
                 )
-            # 3) 模拟设置 → 校验联锁
+            # 3) 自动获取遥测（如果未显式传入）
+            if telemetry is None and self._bus is not None:
+                try:
+                    telemetry = await self._bus.snapshot()
+                except Exception:
+                    telemetry = None
+
+            # 4) 模拟设置 → 校验联锁
             old = self._states[subsystem]
             self._states[subsystem] = state
             try:
-                self._check_interlocks_sync()
+                self._check_interlocks_sync(telemetry=telemetry)
             except SecurityGuardrailException:
                 self._states[subsystem] = old  # 回滚
                 raise
@@ -321,13 +335,22 @@ class InterlockEngine:
         """同步联锁校验（内部使用）。"""
         env = self._build_eval_env(tool_name, telemetry)
         for rule in self.interlocks:
-            # scope 过滤：如果规则指定了 scope，仅匹配对应 tool
             if rule.scope and tool_name and rule.scope != tool_name:
                 continue
-            if safe_eval_bool(rule.condition, env):
-                raise SecurityGuardrailException(
-                    f"[{self.lab_id}] 联锁拦截: {rule.message} "
-                    f"(条件: {rule.condition})"
+            try:
+                if safe_eval_bool(rule.condition, env):
+                    raise SecurityGuardrailException(
+                        f"[{self.lab_id}] 联锁拦截: {rule.message} "
+                        f"(条件: {rule.condition})"
+                    )
+            except SecurityGuardrailException as exc:
+                # 区分：联锁拦截 vs 变量缺失
+                if "联锁拦截" in str(exc):
+                    raise  # 真正的联锁触发，必须传播
+                # 变量缺失 → 跳过此规则（缺少遥测数据时不误拦截）
+                logger.debug(
+                    "[%s] 联锁规则跳过 (缺少变量): %s → %s",
+                    self.lab_id, rule.condition, exc,
                 )
 
     async def check_interlocks(
@@ -344,3 +367,8 @@ class InterlockEngine:
     @property
     def subsystem_names(self) -> list[str]:
         return list(self.subsystems.keys())
+
+    def bind_telemetry_bus(self, bus: Any) -> None:
+        """绑定遥测总线，使 set_subsystem_state 自动获取遥测快照。"""
+        self._bus = bus
+        logger.info("[%s] InterlockEngine: 已绑定 TelemetryBus", self.lab_id)

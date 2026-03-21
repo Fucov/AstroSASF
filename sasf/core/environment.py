@@ -77,6 +77,8 @@ class LaboratoryEnvironment:
             lab_id=self.lab_id,
             initial_state=self.initial_telemetry,
         )
+        # 绑定遥测总线到联锁引擎（使 set_subsystem_state 自动获取遥测）
+        self.engine.bind_telemetry_bus(self._bus)
 
         # 2) Middleware Layer
         self._registry = MCPToolRegistry(lab_id=self.lab_id)
