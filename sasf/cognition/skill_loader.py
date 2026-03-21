@@ -67,8 +67,10 @@ def _parse_frontmatter(text: str) -> tuple[dict[str, str], str]:
 #  BM25-Lite: 零依赖轻量级文本相关性评分                                          #
 # --------------------------------------------------------------------------- #
 
-# 中文 / 英文分词正则（按非字母数字汉字拆分）
-_TOKENIZE_RE = re.compile(r"[\w\u4e00-\u9fff]+", re.UNICODE)
+# CJK 字符范围正则
+_CJK_RE = re.compile(r"[\u4e00-\u9fff]")
+# 英文/数字连续词正则
+_WORD_RE = re.compile(r"[a-zA-Z0-9_]+")
 
 # BM25 超参数
 _BM25_K1 = 1.5
@@ -76,8 +78,30 @@ _BM25_B = 0.75
 
 
 def _tokenize(text: str) -> list[str]:
-    """简易分词：按词边界拆分，统一小写。"""
-    return [t.lower() for t in _TOKENIZE_RE.findall(text)]
+    """中文感知分词：CJK 字符按单字切分，英文按词切分。
+
+    零第三方依赖，适配太空站边缘计算。
+    """
+    tokens: list[str] = []
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        # CJK 字符 → 单字 token
+        if _CJK_RE.match(ch):
+            tokens.append(ch)
+            i += 1
+        # 英文/数字 → 连续词 token
+        elif ch.isascii() and (ch.isalnum() or ch == '_'):
+            m = _WORD_RE.match(text, i)
+            if m:
+                tokens.append(m.group().lower())
+                i = m.end()
+            else:
+                i += 1
+        else:
+            # 标点、空白 → 跳过
+            i += 1
+    return tokens
 
 
 @dataclass

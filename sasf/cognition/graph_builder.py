@@ -82,21 +82,37 @@ _CORRECTION_PROMPT = """你是太空实验柜的操作智能体 (Operator)。
 # --------------------------------------------------------------------------- #
 
 def _extract_json(text: str) -> Any:
-    match = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
-    if match:
-        text = match.group(1).strip()
+    """从 LLM 输出中鲁棒地提取 JSON（容忍代码块、多余文字）。"""
+    # 1) 去除 ```json ... ``` 代码块包裹
+    fence_match = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
+    if fence_match:
+        text = fence_match.group(1).strip()
+
+    # 2) 直接尝试解析
     try:
         return json.loads(text)
     except json.JSONDecodeError:
         pass
+
+    # 3) 正则提取 JSON 数组或对象（DOTALL 跨行匹配）
     for pattern in [r"\[[\s\S]*\]", r"\{[\s\S]*\}"]:
-        m = re.search(pattern, text)
+        m = re.search(pattern, text, re.DOTALL)
         if m:
             try:
                 return json.loads(m.group())
             except json.JSONDecodeError:
                 continue
-    raise ValueError(f"无法从 LLM 输出中提取 JSON:\n{text[:200]}")
+
+    # 4) 最后一搏：ast.literal_eval（容忍单引号等 Python 格式）
+    import ast as _ast
+    try:
+        result = _ast.literal_eval(text.strip())
+        if isinstance(result, (list, dict)):
+            return result
+    except (ValueError, SyntaxError):
+        pass
+
+    raise ValueError(f"无法从 LLM 输出中提取 JSON:\n{text[:300]}")
 
 
 # --------------------------------------------------------------------------- #
