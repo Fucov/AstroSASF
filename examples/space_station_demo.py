@@ -1,15 +1,13 @@
 #!/usr/bin/env python3
 """
-AstroSASF · Space Station Demo (V5)
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-全逻辑验证演示：
+AstroSASF · Space Station Demo (V5.1)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+全逻辑验证演示 — 优先级调度 + 抢占式调度内核。
 
-1. 正交子系统状态 + InterlockEngine
-2. Guard 装饰器 (require_states / forbid_states / telemetry_rules)
-3. Macro 参数预绑定
-4. Codec 词表自动握手（含 Macro 名）
-5. Skill Loader Macro 感知
-6. HITL 外部注入
+场景设计：
+1. 提交 NORMAL 任务（常规流体实验）
+2. 延迟 2 秒后提交 CRITICAL 任务（紧急安全复位）
+3. 终端日志展示：挂起 → 抢占 → 恢复 完整过程
 """
 
 from __future__ import annotations
@@ -18,7 +16,6 @@ import asyncio
 import json
 import logging
 import sys
-import uuid
 from pathlib import Path
 from typing import Any
 
@@ -30,13 +27,10 @@ if str(root_dir) not in sys.path:
 # ---------------------------------------
 
 from sasf.core.config_loader import load_config
-from sasf.core.environment import LaboratoryEnvironment
-from sasf.middleware.a2a_protocol import A2AIntent
+from sasf.core.orchestrator import Orchestrator, TaskPriority
 from sasf.middleware.mcp_registry import MCPToolContext, MCPToolRegistry
 from sasf.physics.interlock_engine import InterlockEngine
 from sasf.physics.telemetry_bus import TelemetryBus
-
-from langgraph.checkpoint.memory import MemorySaver
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 logger = logging.getLogger(__name__)
@@ -180,7 +174,7 @@ def register_macros(registry: MCPToolRegistry) -> None:
 
 
 # ============================================================================ #
-#  HITL 循环                                                                    #
+#  HITL 循环 (保留，供单任务模式使用)                                               #
 # ============================================================================ #
 
 
@@ -219,15 +213,14 @@ async def hitl_loop(compiled, initial_state, config, lab_id):
 
         if raw and raw not in ("", "y", "yes"):
             corrected = None
-            # 尝试 JSON 解析
             try:
                 corrected = json.loads(raw)
             except json.JSONDecodeError:
                 pass
-            # 退级：ast.literal_eval（容忍单引号 Python 字典）
             if corrected is None:
                 try:
                     import ast as _ast
+
                     corrected = _ast.literal_eval(raw)
                 except (ValueError, SyntaxError):
                     logger.warning("[%s] 无法解析输入，按原计划继续", lab_id)
@@ -256,7 +249,7 @@ async def hitl_loop(compiled, initial_state, config, lab_id):
 
 
 # ============================================================================ #
-#  主函数                                                                        #
+#  主函数 — V5.1 优先级调度 + 抢占演示                                             #
 # ============================================================================ #
 
 
@@ -277,10 +270,10 @@ async def main() -> None:
 ║    ███████║███████╗   ██║   ██████╔╝██║   ██║                ║
 ║    ██╔══██║╚════██║   ██║   ██╔══██╗██║   ██║                ║
 ║    ██║  ██║███████║   ██║   ██║  ██║╚██████╔╝                ║
-║    ╚═╝  ╚═╝╚══════╝   ╚═╝   ╚═╝  ╚═╝ ╚═════╝                ║
+║    ╚═╝  ╚═╝╚══════╝   ╚═╝   ╚═╝  ╚═╝ ╚═════╝                 ║
 ║                                                              ║
-║    S A S F  v5.0  ·  Interlock Engine + Guard + Macro        ║
-║    Astro Scientific Agent Scheduling Framework               ║
+║    S A S F  v5.1  ·  Priority Scheduling Kernel              ║
+║    Preemptive Task Scheduler + Interlock Engine              ║
 ║                                                              ║
 ╚══════════════════════════════════════════════════════════════╝
 """)
@@ -288,39 +281,31 @@ async def main() -> None:
     # ── 1) 配置 ── #
     config = load_config(PROJECT_ROOT / "config.yaml")
 
-    # ── 2) InterlockEngine from YAML ── #
+    # ── 2) InterlockEngine ── #
     engine = InterlockEngine.from_yaml(
         path=PROJECT_ROOT / "fsm_rules.yaml",
         lab_id="Lab-Alpha",
     )
 
-    # ── 3) 构建环境（注入 Tools + Macros） ── #
-    env = LaboratoryEnvironment(
+    # ── 3) 创建调度器 ── #
+    scheduler = Orchestrator(config=config, max_workers=2)
+
+    # ── 4) 创建实验柜 ── #
+    env = scheduler.spawn_laboratory(
         lab_id="Lab-Alpha",
-        config=config,
         engine=engine,
         tool_registrar=register_tools,
         macro_registrar=register_macros,
         initial_telemetry=INITIAL_TELEMETRY,
     )
 
-    # ── 4) A2A 订阅 ── #
-    env.a2a_router.subscribe(
-        A2AIntent.SKILL_RESULT,
-        lambda msg: logger.info(
-            "📬 [订阅] SKILL_RESULT: %s",
-            msg.payload.get("status") if isinstance(msg.payload, dict) else msg.payload,
-        ),
-    )
-
-    # ── 5) 展示信息 ── #
+    # ── 5) 展示初始化信息 ── #
     logger.info("")
     logger.info("╔" + "═" * 60 + "╗")
     logger.info("║          📖 动态字典 (自动握手 — 含 Macro)                  ║")
     logger.info("╚" + "═" * 60 + "╝")
     for word, tid in env.codec_dictionary.items():
         logger.info("    0x%02X  ←  '%s'", tid, word)
-    logger.info("    共 %d 个映射词条", len(env.codec_dictionary))
 
     logger.info("")
     logger.info("╔" + "═" * 60 + "╗")
@@ -336,60 +321,46 @@ async def main() -> None:
     for rule in engine.interlocks:
         logger.info("    [%s] %s → %s", rule.scope or "*", rule.condition, rule.message)
 
-    logger.info("")
-    logger.info("╔" + "═" * 60 + "╗")
-    logger.info("║          📚 已加载 OpenAI Skills                            ║")
-    logger.info("╚" + "═" * 60 + "╝")
-    for s in env.loaded_skills:
-        logger.info("    ✅ %s — %s", s["name"], s["description"])
+    # ── 6) 启动调度器 ── #
+    await scheduler.start()
 
-    # ── 6) HITL 模式运行 ── #
-    logger.info("")
-    logger.info("💡 HITL: y/回车 = 批准 | n = 中止 | JSON = 修正参数")
-
-    tasks = ["请执行流体实验的环境准备和样品装载流程"]
-
-    memory = MemorySaver()
-    compiled = env.graph.compile(
-        checkpointer=memory,
-        interrupt_before=["execute_node"],
+    # ── 7) 提交 NORMAL 任务（常规实验） ── #
+    _normal_task = await scheduler.submit_task(
+        lab_id="Lab-Alpha",
+        description="执行流体实验的环境准备和样品装载流程",
+        priority=TaskPriority.NORMAL,
     )
 
-    logger.info("")
-    logger.info("=" * 64)
-    logger.info("[Lab-Alpha] 🚀 V5 启动 (HITL 模式)")
-    logger.info(
-        "[Lab-Alpha] 🔧 Tools (含 Macro): %s",
-        [t["name"] for t in env.available_tools],
-    )
-    logger.info("=" * 64)
-
-    all_results = []
-    for task_desc in tasks:
+    # ── 8) 延迟后提交 CRITICAL 紧急任务（模拟异常响应） ── #
+    async def inject_critical_task():
+        await asyncio.sleep(2)
         logger.info("")
-        logger.info("[Lab-Alpha] 📥 任务: %s", task_desc)
+        logger.info("🚨" * 30)
+        logger.info("🚨 [模拟] 检测到异常！提交 CRITICAL 紧急任务...")
+        logger.info("🚨" * 30)
+        logger.info("")
+        await scheduler.submit_task(
+            lab_id="Lab-Alpha",
+            description="紧急安全复位: 机械臂归零并关闭真空泵",
+            priority=TaskPriority.CRITICAL,
+        )
 
-        initial_state = {
-            "original_task": task_desc,
-            "plan": [],
-            "current_step_index": 0,
-            "current_step": None,
-            "fsm_feedback": None,
-            "execution_log": [],
-            "error_count": 0,
-            "final_result": None,
-        }
+    # 并发：NORMAL 任务执行 + 2s 后注入 CRITICAL
+    critical_injector = asyncio.create_task(inject_critical_task())
 
-        thread_config = {"configurable": {"thread_id": uuid.uuid4().hex}}
-        result = await hitl_loop(compiled, initial_state, thread_config, "Lab-Alpha")
-        all_results.append(result)
+    # ── 9) 等待队列清空 ── #
+    await scheduler._queue.join()
+    await critical_injector
 
-    # ── 7) 结果汇总 ── #
+    # ── 10) 关闭调度器 ── #
+    completed = await scheduler.shutdown()
+
+    # ── 11) 结果汇总 ── #
     final_telemetry = await env.get_telemetry()
 
     logger.info("")
     logger.info("╔" + "═" * 60 + "╗")
-    logger.info("║     📊 AstroSASF V5 结果汇总                               ║")
+    logger.info("║     📊 AstroSASF V5.1 结果汇总                             ║")
     logger.info("╚" + "═" * 60 + "╝")
     logger.info("")
     logger.info("  ┌─── Lab-Alpha ────────────────────────────────────")
@@ -406,18 +377,25 @@ async def main() -> None:
     logger.info(
         "  │     综合压缩率    : %s", cs.get("overall_compression_ratio", "N/A")
     )
-    logger.info("  │     词条数        : %s (含 Macro)", cs.get("dictionary_size", 0))
+    logger.info("  │")
+
+    logger.info("  │  📋 调度统计:")
+    logger.info("  │     总完成任务    : %d", len(completed))
+    for t in completed:
+        logger.info(
+            "  │     [%s] %-8s %s → %s",
+            t.task_id[:8],
+            t.priority.name,
+            t.description,
+            t.status,
+        )
     logger.info("  │")
 
     logger.info("  │  📨 A2A: %s", env.a2a_stats)
-    logger.info("  │")
-
-    for i, r in enumerate(all_results, 1):
-        logger.info("  │  🧠 任务 %d: %s", i, r.get("status", "N/A"))
     logger.info("  └──────────────────────────────────────────────────")
 
     logger.info("")
-    logger.info("AstroSASF V5 运行完毕。🚀")
+    logger.info("AstroSASF V5.1 运行完毕。🚀")
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
 # AstroSASF — Astro Scientific Agent Scheduling Framework
 
-> 面向太空实验室的科学智能体调度框架 · 正交联锁引擎 + Guard 装饰器 + Macro 绑定
+> 面向太空实验室的科学智能体调度框架 · 优先级抢占调度 + 正交联锁引擎 + Guard + Macro
 
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
 [![LangGraph](https://img.shields.io/badge/LangGraph-StateGraph-orange.svg)](https://github.com/langchain-ai/langgraph)
@@ -13,9 +13,9 @@
 
 AstroSASF 是面向空间站科学实验柜的**多智能体协作调度框架**。核心矛盾：大模型推理的 _"概率性/高延迟"_ 与物理硬件控制的 _"确定性/硬实时"_ 之间的冲突。
 
-### V5 核心设计
+### V5.1 核心设计
 
-> **正交状态 + 联锁规则**取代单体 FSM，消灭状态爆炸。
+> **优先级抢占式调度** + **正交状态联锁** + **Guard 装饰器** + **Macro 预绑定**。
 
 | 概念 | 层级 | 本质 | 管理者 |
 |------|------|------|--------|
@@ -28,8 +28,9 @@ AstroSASF 是面向空间站科学实验柜的**多智能体协作调度框架**
 
 ## 核心特性
 
-| 能力 | 模块 | V5 变化 |
-|------|------|---------|
+| 能力 | 模块 | 描述 |
+|------|------|------|
+| **优先级调度** | `orchestrator.py` | PriorityQueue + Worker 池 + CRITICAL 抢占 |
 | **Guard 装饰器** | `mcp_registry.py` | `@mcp_tool(forbid_states=..., telemetry_rules=...)` |
 | **Macro 绑定** | `mcp_registry.py` | `bind_macro("heat_50", "set_temperature", {"target": 50})` |
 | **正交联锁引擎** | `interlock_engine.py` | 子系统独立状态 + `ast` 安全表达式求值 |
@@ -43,7 +44,11 @@ AstroSASF 是面向空间站科学实验柜的**多智能体协作调度框架**
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│  Core Layer — Orchestrator / LaboratoryEnvironment          │
+│  Core Layer — Orchestrator (V5.1 Priority Scheduler)        │
+│  PriorityQueue │ Worker Pool │ Preemption (asyncio.Event)   │
+│  ┌──────────────────────────────────────────────────────┐    │
+│  │ LaboratoryEnvironment (suspend_event checkpoint)     │    │
+│  └──────────────────────────────────────────────────────┘    │
 │  (config.yaml 驱动 · Headless / HITL 可选)                   │
 ├─────────────────────────────────────────────────────────────┤
 │  Cognition Layer                                            │
@@ -109,7 +114,50 @@ python examples/space_station_demo.py
 
 ---
 
-## V5 核心机制
+## V5.1 核心机制
+
+### 〇、优先级抢占式调度内核 (`core/orchestrator.py`)
+
+**问题**：`asyncio.gather` 仅支持同级并发，无法区分任务优先级，更无法在紧急异常时抢占资源。
+
+**方案**：`PriorityQueue` + Worker 协程池 + `asyncio.Event` 抢占/挂起。
+
+```
+优先级枚举:
+  CRITICAL = 0   (紧急异常响应 — 最高)
+  HIGH     = 1   (核心科学任务)
+  NORMAL   = 2   (常规任务)
+  LOW      = 3   (清理/待机)
+```
+
+#### 抢占序列
+
+```
+时刻 T=0    提交 NORMAL 任务 → Worker-0 取出 → 开始执行
+               ┌──────────────────────────────────┐
+时刻 T=2    │ 🚨 CRITICAL 任务入队               │
+               │ → Orchestrator._preempt()        │
+               │ → NORMAL 任务 event.clear() 挂起  │
+               └──────────────────────────────────┘
+            Worker-1 取出 CRITICAL → 执行紧急安全复位
+
+时刻 T=T₁   CRITICAL 完成 → _resume_suspended_tasks()
+            → NORMAL 任务 event.set() 恢复 → 继续执行
+```
+
+#### API
+
+```python
+scheduler = Orchestrator(config=config, max_workers=2)
+env = scheduler.spawn_laboratory(lab_id="Lab-01", engine=engine, ...)
+
+await scheduler.start()
+await scheduler.submit_task("Lab-01", "常规实验", TaskPriority.NORMAL)
+await scheduler.submit_task("Lab-01", "紧急复位", TaskPriority.CRITICAL)
+await scheduler.shutdown()
+```
+
+---
 
 ### 一、正交联锁引擎 (`physics/interlock_engine.py`)
 

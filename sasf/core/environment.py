@@ -10,6 +10,7 @@ V5 变化：
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
 from dataclasses import dataclass, field
@@ -204,8 +205,55 @@ class LaboratoryEnvironment:
 
     # ---- Headless 运行 --------------------------------------------------- #
 
+    async def run_single_task(
+        self,
+        task_description: str,
+        suspend_event: asyncio.Event | None = None,
+    ) -> dict[str, Any]:
+        """执行单个任务（支持调度器挂起检查点）。
+
+        Parameters
+        ----------
+        task_description : str
+            任务描述。
+        suspend_event : asyncio.Event, optional
+            调度器挂起信号。每步执行前检查，clear=阻塞/set=放行。
+        """
+        logger.info("[%s] 📥 执行任务: %s", self.lab_id, task_description)
+
+        compiled = self._graph.compile()
+
+        initial_state: LabGraphState = {
+            "original_task": task_description,
+            "plan": [],
+            "current_step_index": 0,
+            "current_step": None,
+            "fsm_feedback": None,
+            "execution_log": [],
+            "error_count": 0,
+            "final_result": None,
+        }
+
+        config = {"configurable": {"thread_id": uuid.uuid4().hex}}
+
+        # ── 挂起检查点（任务开始前） ── #
+        if suspend_event is not None:
+            await suspend_event.wait()
+
+        state = await compiled.ainvoke(initial_state, config)
+
+        final = state.get("final_result")
+        if final and isinstance(final, dict):
+            return final
+
+        return {
+            "status": "completed",
+            "total_steps": len(state.get("plan", [])),
+            "execution_log": list(state.get("execution_log") or []),
+        }
+
     async def run(self, tasks: list[str]) -> dict[str, Any]:
-        """Headless 全自动运行。"""
+        """Headless 全自动运行（无调度器时使用）。"""
         logger.info("=" * 64)
         logger.info("[%s] 🚀 实验柜启动 (V5 Headless)", self.lab_id)
         logger.info(
@@ -216,36 +264,10 @@ class LaboratoryEnvironment:
         )
         logger.info("=" * 64)
 
-        compiled = self._graph.compile()
-
         all_results: list[dict[str, Any]] = []
         for task_desc in tasks:
-            logger.info("")
-            logger.info("[%s] 📥 提交任务: %s", self.lab_id, task_desc)
-
-            initial_state: LabGraphState = {
-                "original_task": task_desc,
-                "plan": [],
-                "current_step_index": 0,
-                "current_step": None,
-                "fsm_feedback": None,
-                "execution_log": [],
-                "error_count": 0,
-                "final_result": None,
-            }
-
-            config = {"configurable": {"thread_id": uuid.uuid4().hex}}
-            state = await compiled.ainvoke(initial_state, config)
-
-            final = state.get("final_result")
-            if final and isinstance(final, dict):
-                all_results.append(final)
-            else:
-                all_results.append({
-                    "status": "completed",
-                    "total_steps": len(state.get("plan", [])),
-                    "execution_log": list(state.get("execution_log") or []),
-                })
+            result = await self.run_single_task(task_desc)
+            all_results.append(result)
 
         final_telemetry = await self._bus.snapshot()
         return {
