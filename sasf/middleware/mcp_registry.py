@@ -1,15 +1,14 @@
 """
-AstroSASF · Middleware · MCPToolRegistry (V4.2)
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-MCP 工具注册中心 —— **自动反射生成 JSON Schema**。
+AstroSASF · Middleware · MCPToolRegistry (V5)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+MCP 工具注册中心 —— Guard 装饰器 + Macro 参数预绑定。
 
-V4.2 核心区分：
-- **MCP Tools** = 底层原子操作接口（此模块管理），由 ``@registry.mcp_tool`` 注册
-- **OpenAI Skills** = 认知层 SOP 知识套件（由 ``cognition/skill_loader.py`` 管理）
-
-``@mcp_tool`` 装饰器通过 ``inspect`` + ``typing`` 自动反射目标函数的
-Type Hints 和 Docstring，动态生成兼容 **OpenAI Function Calling** 的
-JSON Schema。物理开发者 **无需手写任何 Schema 字典**。
+V5 核心变化：
+- ``@mcp_tool(forbid_states=..., require_states=..., telemetry_rules=...)``
+  声明式前置 Guard，invoke 前自动校验
+- ``bind_macro(macro_name, target_tool, preset_params)``
+  参数预绑定宏指令，注册为独立 Tool 暴露给 LLM
+- ``all_vocabulary()`` 自动包含 Macro 名
 """
 
 from __future__ import annotations
@@ -35,29 +34,54 @@ _PYTHON_TYPE_TO_JSON: dict[type, str] = {
 
 
 def _type_to_json_schema(py_type: type) -> str:
-    """将 Python 类型注解映射为 JSON Schema 类型字符串。"""
     return _PYTHON_TYPE_TO_JSON.get(py_type, "string")
 
 
 # --------------------------------------------------------------------------- #
-#  MCPToolContext — 替代旧 SkillContext                                         #
+#  MCPToolContext                                                               #
 # --------------------------------------------------------------------------- #
 
 class MCPToolContext:
-    """MCP Tool 执行上下文 —— 封装 Handler 运行时所需的依赖。
+    """MCP Tool 执行上下文。
 
-    由 Gateway 在调用 Tool 前构造，注入 FSM / TelemetryBus 等运行时依赖，
-    使 Tool Handler 无需直接依赖 Gateway 类型。
+    V5: ``fsm`` 更名为 ``engine`` (InterlockEngine)，同时保留 ``fsm``
+    属性作为向后兼容别名。
     """
 
-    def __init__(self, fsm: Any, bus: Any, lab_id: str) -> None:
-        self.fsm = fsm
+    def __init__(self, engine: Any, bus: Any, lab_id: str) -> None:
+        self.engine = engine
         self.bus = bus
         self.lab_id = lab_id
 
+    @property
+    def fsm(self) -> Any:
+        """向后兼容别名。"""
+        return self.engine
 
-# MCP Tool Handler 签名：(context, **kwargs) → result dict
+
 MCPToolHandler = Callable[..., Awaitable[dict[str, Any]]]
+
+
+# --------------------------------------------------------------------------- #
+#  ToolGuard — 声明式前置守卫                                                    #
+# --------------------------------------------------------------------------- #
+
+@dataclass(frozen=True)
+class ToolGuard:
+    """MCP Tool 的声明式安全守卫。
+
+    Attributes
+    ----------
+    require_states : dict[str, str]
+        子系统必须处于的状态 ``{subsystem: required_state}``
+    forbid_states : dict[str, str]
+        子系统禁止处于的状态 ``{subsystem: forbidden_state}``
+    telemetry_rules : list[str]
+        遥测条件表达式（满足时**放行**，不满足时拦截）
+    """
+    require_states: dict[str, str] = field(default_factory=dict)
+    forbid_states: dict[str, str] = field(default_factory=dict)
+    telemetry_rules: list[str] = field(default_factory=list)
 
 
 # --------------------------------------------------------------------------- #
@@ -69,9 +93,13 @@ class ToolDescriptor:
     """已注册 MCP Tool 的元信息。"""
     name: str
     description: str
-    json_schema: dict[str, Any]     # OpenAI Function Calling 兼容 schema
-    param_keys: list[str]           # 参数键名列表（供 Codec 动态字典）
+    json_schema: dict[str, Any]
+    param_keys: list[str]
     handler: MCPToolHandler
+    guard: ToolGuard | None = None
+    is_macro: bool = False
+    macro_target: str | None = None        # Macro 指向的底层 Tool
+    macro_preset: dict[str, Any] = field(default_factory=dict)
 
 
 # --------------------------------------------------------------------------- #
@@ -80,19 +108,24 @@ class ToolDescriptor:
 
 @dataclass
 class MCPToolRegistry:
-    """实例级 MCP 工具注册中心（V4.2 自动反射版本）。
+    """实例级 MCP 工具注册中心 (V5)。
 
-    提供 ``@mcp_tool`` 声明式装饰器。装饰器通过 ``inspect`` 自动反射
-    目标函数的 Type Hints 和 Docstring，动态生成 JSON Schema。
+    Features
+    --------
+    - ``@mcp_tool(...)`` — 带 Guard 的声明式装饰器
+    - ``bind_macro()`` — 参数预绑定宏指令
+    - ``invoke()`` — 调用前自动 Guard 校验
 
     Example
     -------
     >>> registry = MCPToolRegistry(lab_id="Lab-01")
     >>>
-    >>> @registry.mcp_tool
+    >>> @registry.mcp_tool(forbid_states={"vacuum": "ACTIVE"})
     ... async def measure_sensor(ctx: MCPToolContext, channel: int) -> dict:
-    ...     \"\"\"读取传感器通道值\"\"\"
+    ...     \\"\\"\\"读取传感器通道值\\"\\"\\"
     ...     ...
+    >>>
+    >>> registry.bind_macro("quick_measure", "measure_sensor", {"channel": 1})
     """
 
     lab_id: str
@@ -100,24 +133,43 @@ class MCPToolRegistry:
 
     # ---- 装饰器 ----------------------------------------------------------- #
 
-    def mcp_tool(self, func: MCPToolHandler) -> MCPToolHandler:
-        """声明式 MCP Tool 注册装饰器。
+    def mcp_tool(
+        self,
+        func: MCPToolHandler | None = None,
+        *,
+        require_states: dict[str, str] | None = None,
+        forbid_states: dict[str, str] | None = None,
+        telemetry_rules: list[str] | None = None,
+    ) -> MCPToolHandler | Callable[[MCPToolHandler], MCPToolHandler]:
+        """声明式 MCP Tool 注册装饰器 (V5)。
 
-        自动从函数签名中提取：
-        - 函数名 → tool name
-        - Docstring → description
-        - Type Hints → JSON Schema (排除 ctx 参数和 return)
-
-        Parameters
-        ----------
-        func : MCPToolHandler
-            目标异步函数，签名为 ``(ctx: MCPToolContext, **业务参数) → dict``。
-
-        Returns
-        -------
-        MCPToolHandler
-            原函数（不做包装，仅注册侧效应）。
+        可无参使用 ``@mcp_tool`` 或带参使用
+        ``@mcp_tool(forbid_states={"vacuum": "ACTIVE"})``。
         """
+        guard = None
+        if require_states or forbid_states or telemetry_rules:
+            guard = ToolGuard(
+                require_states=require_states or {},
+                forbid_states=forbid_states or {},
+                telemetry_rules=telemetry_rules or [],
+            )
+
+        def decorator(fn: MCPToolHandler) -> MCPToolHandler:
+            self._register_function(fn, guard=guard)
+            return fn
+
+        if func is not None:
+            # @mcp_tool (无参)
+            return decorator(func)
+        # @mcp_tool(...) (带参)
+        return decorator
+
+    def _register_function(
+        self,
+        func: MCPToolHandler,
+        guard: ToolGuard | None = None,
+    ) -> None:
+        """内部注册逻辑：反射签名 → 生成 Schema → 存储描述符。"""
         name = func.__name__
         description = (inspect.getdoc(func) or "").strip()
 
@@ -127,12 +179,9 @@ class MCPToolRegistry:
         param_keys: list[str] = []
 
         for param_name, param in sig.parameters.items():
-            # 跳过 ctx (第一个参数) 和 self
             if param_name in ("ctx", "self", "return"):
                 continue
 
-            # 使用相对简单的启发式方法解析注解，避免 get_type_hints() 因为局部 import 引发 NameError
-            # (由于 from __future__ import annotations，annotation 可能是字符串)
             ann = param.annotation
             json_type = "string"
             if ann is not inspect.Parameter.empty:
@@ -148,10 +197,7 @@ class MCPToolRegistry:
                     json_type = _type_to_json_schema(ann)
 
             param_keys.append(param_name)
-            prop: dict[str, str] = {"type": json_type}
-            properties[param_name] = prop
-
-            # 没有默认值 → required
+            properties[param_name] = {"type": json_type}
             if param.default is inspect.Parameter.empty:
                 required.append(param_name)
 
@@ -174,6 +220,7 @@ class MCPToolRegistry:
             json_schema=json_schema,
             param_keys=param_keys,
             handler=func,
+            guard=guard,
         )
 
         if name in self._tools:
@@ -184,13 +231,89 @@ class MCPToolRegistry:
 
         self._tools[name] = descriptor
 
+        guard_info = ""
+        if guard:
+            parts = []
+            if guard.require_states:
+                parts.append(f"require={guard.require_states}")
+            if guard.forbid_states:
+                parts.append(f"forbid={guard.forbid_states}")
+            if guard.telemetry_rules:
+                parts.append(f"rules={guard.telemetry_rules}")
+            guard_info = f"  Guard: {', '.join(parts)}"
+
         logger.info(
             "[%s] MCPToolRegistry: ✅ 注册 Tool '%s' — %s  "
-            "Schema 自动生成: %s",
-            self.lab_id, name, description, list(properties.keys()),
+            "Schema: %s%s",
+            self.lab_id, name, description,
+            list(properties.keys()), guard_info,
         )
 
-        return func
+    # ---- Macro 绑定 ------------------------------------------------------- #
+
+    def bind_macro(
+        self,
+        macro_name: str,
+        target_tool: str,
+        preset_params: dict[str, Any],
+        description: str | None = None,
+    ) -> None:
+        """将底层 Tool 绑定为参数预设的宏指令。
+
+        Macro 作为独立 Tool 暴露给 LLM（无参或少参调用）。
+        """
+        target = self._tools.get(target_tool)
+        if target is None:
+            raise ValueError(
+                f"[{self.lab_id}] bind_macro: 目标 Tool '{target_tool}' 未注册"
+            )
+
+        # 计算剩余参数（未被预绑定的）
+        remaining_params = {
+            k: v
+            for k, v in target.json_schema["function"]["parameters"]["properties"].items()
+            if k not in preset_params
+        }
+        remaining_required = [
+            k for k in target.json_schema["function"]["parameters"].get("required", [])
+            if k not in preset_params
+        ]
+
+        macro_desc = description or f"宏指令: {target_tool}({preset_params})"
+
+        json_schema: dict[str, Any] = {
+            "type": "function",
+            "function": {
+                "name": macro_name,
+                "description": macro_desc,
+                "parameters": {
+                    "type": "object",
+                    "properties": remaining_params,
+                    "required": remaining_required,
+                },
+            },
+        }
+
+        descriptor = ToolDescriptor(
+            name=macro_name,
+            description=macro_desc,
+            json_schema=json_schema,
+            param_keys=list(remaining_params.keys()),
+            handler=target.handler,
+            guard=target.guard,
+            is_macro=True,
+            macro_target=target_tool,
+            macro_preset=dict(preset_params),
+        )
+
+        self._tools[macro_name] = descriptor
+
+        logger.info(
+            "[%s] MCPToolRegistry: 🔗 绑定 Macro '%s' → %s(%s)  "
+            "剩余参数: %s",
+            self.lab_id, macro_name, target_tool,
+            preset_params, list(remaining_params.keys()) or "(无)",
+        )
 
     # ---- 查询 ------------------------------------------------------------- #
 
@@ -201,22 +324,20 @@ class MCPToolRegistry:
         return self._tools.get(name)
 
     def list_tools(self) -> list[dict[str, Any]]:
-        """返回所有已注册 Tool 的摘要（供 LLM prompt 和 Function Calling 注入）。"""
         return [
             {
                 "name": t.name,
                 "description": t.description,
                 "json_schema": t.json_schema,
+                "is_macro": t.is_macro,
             }
             for t in self._tools.values()
         ]
 
     def all_tool_names(self) -> list[str]:
-        """返回所有 Tool 名称。"""
         return list(self._tools.keys())
 
     def all_param_keys(self) -> list[str]:
-        """返回所有 Tool 的参数键名（去重、确定性排序）。"""
         seen: set[str] = set()
         keys: list[str] = []
         for t in self._tools.values():
@@ -227,19 +348,27 @@ class MCPToolRegistry:
         return sorted(keys)
 
     def all_vocabulary(self) -> list[str]:
-        """返回 Codec 协商所需的完整词汇表 —— Tool 名 + 参数键 + 常见状态值。
-
-        按字母序排列，确保跨实例字典一致性。
-        """
+        """返回 Codec 所需的完整词汇表 (含 Macro 名)。"""
         vocab: set[str] = set()
         for t in self._tools.values():
             vocab.add(t.name)
             vocab.update(t.param_keys)
-        # 添加协议级常见字符串
         vocab.update(["skill", "status", "detail", "fsm_state", "success", "error"])
         return sorted(vocab)
 
-    # ---- 调用 ------------------------------------------------------------- #
+    def get_macros(self) -> dict[str, dict[str, Any]]:
+        """返回所有 Macro 的 target→preset 映射（供 SkillLoader 使用）。"""
+        return {
+            t.name: {
+                "target": t.macro_target,
+                "preset": t.macro_preset,
+                "description": t.description,
+            }
+            for t in self._tools.values()
+            if t.is_macro
+        }
+
+    # ---- 调用 (含 Guard 校验) --------------------------------------------- #
 
     async def invoke(
         self,
@@ -247,10 +376,9 @@ class MCPToolRegistry:
         params: dict[str, Any],
         context: MCPToolContext,
     ) -> dict[str, Any]:
-        """查找并调用已注册的 MCP Tool。
+        """查找并调用 MCP Tool（含 Guard 前置校验）。"""
+        from sasf.physics.interlock_engine import SecurityGuardrailException
 
-        Handler 签名为 ``(ctx, **params)`` — 参数以关键字方式传入。
-        """
         descriptor = self._tools.get(name)
         if descriptor is None:
             return {
@@ -259,11 +387,75 @@ class MCPToolRegistry:
                 "detail": f"MCPToolRegistry: 未注册的 Tool '{name}'",
             }
 
-        return await descriptor.handler(context, **params)
+        # ── Guard 前置校验 ── #
+        if descriptor.guard:
+            guard = descriptor.guard
+            engine = context.engine
 
+            # 1) require_states 校验
+            for subsystem, required_state in guard.require_states.items():
+                try:
+                    current = engine.get_subsystem_state(subsystem)
+                    if current != required_state:
+                        raise SecurityGuardrailException(
+                            f"[{self.lab_id}] Guard 拦截 '{name}': "
+                            f"子系统 '{subsystem}' 需要 '{required_state}' "
+                            f"但当前为 '{current}'"
+                        )
+                except KeyError:
+                    raise SecurityGuardrailException(
+                        f"[{self.lab_id}] Guard 拦截 '{name}': "
+                        f"未知子系统 '{subsystem}'"
+                    )
+
+            # 2) forbid_states 校验
+            for subsystem, forbidden_state in guard.forbid_states.items():
+                try:
+                    current = engine.get_subsystem_state(subsystem)
+                    if current == forbidden_state:
+                        raise SecurityGuardrailException(
+                            f"[{self.lab_id}] Guard 拦截 '{name}': "
+                            f"子系统 '{subsystem}' 处于禁止状态 '{forbidden_state}'"
+                        )
+                except KeyError:
+                    raise SecurityGuardrailException(
+                        f"[{self.lab_id}] Guard 拦截 '{name}': "
+                        f"未知子系统 '{subsystem}'"
+                    )
+
+            # 3) telemetry_rules 校验（表达式为 True 时放行）
+            if guard.telemetry_rules:
+                from sasf.physics.interlock_engine import safe_eval_bool
+                telemetry = await context.bus.snapshot()
+                for rule_expr in guard.telemetry_rules:
+                    try:
+                        if not safe_eval_bool(rule_expr, telemetry):
+                            raise SecurityGuardrailException(
+                                f"[{self.lab_id}] Guard 拦截 '{name}': "
+                                f"遥测条件不满足: {rule_expr}"
+                            )
+                    except SecurityGuardrailException:
+                        raise
+                    except Exception as exc:
+                        raise SecurityGuardrailException(
+                            f"[{self.lab_id}] Guard 校验异常 '{name}': {exc}"
+                        ) from exc
+
+        # ── Macro: 合并预设参数 ── #
+        actual_params = dict(params)
+        if descriptor.is_macro and descriptor.macro_preset:
+            merged = dict(descriptor.macro_preset)
+            merged.update(actual_params)
+            actual_params = merged
+
+        return await descriptor.handler(context, **actual_params)
 
     # ---- 统计 ------------------------------------------------------------- #
 
     @property
     def count(self) -> int:
         return len(self._tools)
+
+    @property
+    def macro_count(self) -> int:
+        return sum(1 for t in self._tools.values() if t.is_macro)

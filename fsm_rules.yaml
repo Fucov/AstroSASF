@@ -1,87 +1,38 @@
 # ============================================================================ #
-#  AstroSASF — FSM 规则定义 (业务层配置)                                         #
-#  此文件由应用开发者编写，框架 ShadowFSM 引擎只负责加载和校验。                    #
+#  AstroSASF — V5 联锁规则配置                                                   #
+#  正交子系统状态 + 跨系统联锁规则（应用层定义，框架加载）                            #
 # ============================================================================ #
 
-# 所有合法状态（字符串标识）
-states:
-  - IDLE
-  - HEATING
-  - COOLING
-  - ROBOTIC_ARM_MOVING
-  - VACUUM_ACTIVE
-  - EMERGENCY_STOP
+# 子系统定义：每个子系统独立维护自己的状态空间
+subsystems:
+  thermal: [IDLE, HEATING, COOLING]
+  vacuum:  [IDLE, ACTIVE]
+  arm:     [IDLE, MOVING]
 
 # 初始状态
-initial_state: IDLE
+initial_states:
+  thermal: IDLE
+  vacuum: IDLE
+  arm: IDLE
 
-# 状态转移规则：[当前状态, 动作] → 目标状态
-transitions:
-  - from: IDLE
-    action: START_HEATING
-    to: HEATING
+# 联锁规则（跨子系统安全约束）
+# condition: 安全求值布尔表达式（变量 = 子系统状态 + 遥测值）
+# message: 拦截时的人类可读消息
+# scope: 可选，仅对指定 tool 生效（省略 = 全局）
+interlocks:
+  # 真空激活时禁止移动机械臂
+  - condition: "vacuum == 'ACTIVE' and arm == 'MOVING'"
+    message: "联锁: 真空激活时禁止移动机械臂"
 
-  - from: IDLE
-    action: START_COOLING
-    to: COOLING
+  # 机械臂运动中禁止启动加热
+  - condition: "arm == 'MOVING' and thermal == 'HEATING'"
+    message: "联锁: 机械臂运动中禁止启动加热"
 
-  - from: IDLE
-    action: MOVE_ROBOTIC_ARM
-    to: ROBOTIC_ARM_MOVING
+  # 温度过高时全局禁止操作（遥测变量）
+  - condition: "temperature >= 80"
+    message: "联锁: 温度 >= 80℃，安全停机"
 
-  - from: IDLE
-    action: ACTIVATE_VACUUM
-    to: VACUUM_ACTIVE
-
-  - from: IDLE
-    action: EMERGENCY_STOP
-    to: EMERGENCY_STOP
-
-  - from: HEATING
-    action: STOP_HEATING
-    to: IDLE
-
-  - from: HEATING
-    action: EMERGENCY_STOP
-    to: EMERGENCY_STOP
-
-  - from: COOLING
-    action: STOP_COOLING
-    to: IDLE
-
-  - from: COOLING
-    action: EMERGENCY_STOP
-    to: EMERGENCY_STOP
-
-  - from: ROBOTIC_ARM_MOVING
-    action: STOP_ROBOTIC_ARM
-    to: IDLE
-
-  - from: ROBOTIC_ARM_MOVING
-    action: EMERGENCY_STOP
-    to: EMERGENCY_STOP
-
-  - from: VACUUM_ACTIVE
-    action: DEACTIVATE_VACUUM
-    to: IDLE
-
-  - from: VACUUM_ACTIVE
-    action: EMERGENCY_STOP
-    to: EMERGENCY_STOP
-
-  - from: EMERGENCY_STOP
-    action: RESET
-    to: IDLE
-
-# 安全约束：执行某动作前，遥测值必须满足条件，否则拦截
-# 格式: { action, metric, operator, threshold }
-safety_constraints:
-  - action: START_HEATING
-    metric: temperature
-    operator: ">="
-    threshold: 80.0
-
-  - action: MOVE_ROBOTIC_ARM
-    metric: pressure
-    operator: "<"
-    threshold: 50.0
+  # 低压下禁止移动机械臂（遥测变量 + scope 过滤）
+  - condition: "pressure < 50"
+    message: "联锁: 低压 (< 50 kPa) 下禁止移动机械臂"
+    scope: move_robotic_arm
