@@ -1,19 +1,17 @@
 #!/usr/bin/env python3
 """
-AstroSASF · Space Station Demo (V5.1)
+AstroSASF · Space Station Demo (V6.0)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-全逻辑验证演示 — 优先级调度 + 抢占式调度内核。
+全逻辑验证演示：
 
-场景设计：
-1. 提交 NORMAL 任务（常规流体实验）
-2. 延迟 2 秒后提交 CRITICAL 任务（紧急安全复位）
-3. 终端日志展示：挂起 → 抢占 → 恢复 完整过程
+1. 多领域知识库 (流体实验 / 生物培养 / 材料合成)
+2. Edge-RAG 动态 SOP 检索 (BM25-lite, 零第三方依赖)
+3. 优先级抢占调度 + InterlockEngine + Guard + Macro
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import sys
 from pathlib import Path
@@ -25,7 +23,6 @@ root_dir = Path(__file__).resolve().parent.parent
 if str(root_dir) not in sys.path:
     sys.path.insert(0, str(root_dir))
 # ---------------------------------------
-
 from sasf.core.config_loader import load_config
 from sasf.core.orchestrator import Orchestrator, TaskPriority
 from sasf.middleware.mcp_registry import MCPToolContext, MCPToolRegistry
@@ -47,11 +44,13 @@ INITIAL_TELEMETRY: dict[str, Any] = {
     "vacuum_pump_active": False,
     "heater_active": False,
     "coolant_flow_rate": 0.0,
+    "nutrient_injected": False,
+    "laser_active": False,
 }
 
 
 # ============================================================================ #
-#  业务层: MCP Tools 注册 (含 Guard)                                              #
+#  业务层: MCP Tools 注册 (含 Guard + 多领域工具)                                  #
 # ============================================================================ #
 
 
@@ -60,7 +59,7 @@ def register_tools(
     engine: InterlockEngine,
     bus: TelemetryBus,
 ) -> None:
-    """注册太空实验柜 MCP Tools（含声明式 Guard）。"""
+    """注册太空实验柜 MCP Tools。"""
 
     @registry.mcp_tool(
         require_states={"thermal": "IDLE"},
@@ -103,9 +102,7 @@ def register_tools(
             "detail": f"机械臂已移至 {target_angle}°",
         }
 
-    @registry.mcp_tool(
-        require_states={"arm": "IDLE"},
-    )
+    @registry.mcp_tool(require_states={"arm": "IDLE"})
     async def toggle_vacuum_pump(ctx: MCPToolContext, activate: bool) -> dict[str, Any]:
         """切换真空泵开关"""
         if isinstance(activate, str):
@@ -121,8 +118,40 @@ def register_tools(
             "detail": f"真空泵已{'激活' if activate else '关闭'}",
         }
 
+    # ── 多领域通用工具 ── #
+
+    @registry.mcp_tool
+    async def inject_nutrient(
+        ctx: MCPToolContext, volume_ml: float = 10.0
+    ) -> dict[str, Any]:
+        """注入培养基营养液（mL）"""
+        volume_ml = float(volume_ml)
+        await ctx.bus.write("nutrient_injected", True)
+
+        return {
+            "skill": "inject_nutrient",
+            "status": "success",
+            "detail": f"已注入 {volume_ml}mL 营养液",
+        }
+
+    @registry.mcp_tool
+    async def turn_on_laser(
+        ctx: MCPToolContext, activate: bool = True
+    ) -> dict[str, Any]:
+        """控制激光烧结设备开关"""
+        if isinstance(activate, str):
+            activate = activate.lower() in ("true", "1", "yes")
+
+        await ctx.bus.write("laser_active", activate)
+
+        return {
+            "skill": "turn_on_laser",
+            "status": "success",
+            "detail": f"激光设备已{'开启' if activate else '关闭'}",
+        }
+
     logger.info(
-        "[%s] 物理设备层: 已注册 %d 个 MCP Tools",
+        "[%s] 物理设备层: 已注册 %d 个 MCP Tools (含多领域)",
         registry.lab_id,
         registry.count,
     )
@@ -140,6 +169,12 @@ def register_macros(registry: MCPToolRegistry) -> None:
         "set_temperature",
         {"target": 50.0},
         description="快速加热到 50℃",
+    )
+    registry.bind_macro(
+        "heat_to_37",
+        "set_temperature",
+        {"target": 37.0},
+        description="加热到 37℃（细胞培养温度）",
     )
     registry.bind_macro(
         "arm_to_observation",
@@ -174,82 +209,7 @@ def register_macros(registry: MCPToolRegistry) -> None:
 
 
 # ============================================================================ #
-#  HITL 循环 (保留，供单任务模式使用)                                               #
-# ============================================================================ #
-
-
-async def hitl_loop(compiled, initial_state, config, lab_id):
-    state = await compiled.ainvoke(initial_state, config)
-    snapshot = compiled.get_state(config)
-
-    while snapshot.next:
-        step = state.get("current_step")
-        if step and isinstance(step, dict):
-            logger.info("")
-            logger.info("[%s] ⏸️  HITL — 即将执行:", lab_id)
-            logger.info("[%s]    Tool  : %s", lab_id, step.get("skill"))
-            logger.info(
-                "[%s]    Params: %s",
-                lab_id,
-                json.dumps(step.get("params", {}), ensure_ascii=False),
-            )
-
-        raw = await asyncio.get_event_loop().run_in_executor(
-            None,
-            lambda: input(
-                f"\n{'─' * 60}\n"
-                f"🛡️ HITL | {step.get('skill', '?')}({step.get('params', {})})\n"
-                f"  [y/回车] 批准  |  [n] 中止  |  [JSON] 修正\n"
-                f"{'─' * 60}\n>>> "
-            ),
-        )
-        raw = raw.strip()
-
-        if raw.lower() in ("n", "no"):
-            return {
-                "status": "aborted_by_user",
-                "execution_log": list(state.get("execution_log") or []),
-            }
-
-        if raw and raw not in ("", "y", "yes"):
-            corrected = None
-            try:
-                corrected = json.loads(raw)
-            except json.JSONDecodeError:
-                pass
-            if corrected is None:
-                try:
-                    import ast as _ast
-
-                    corrected = _ast.literal_eval(raw)
-                except (ValueError, SyntaxError):
-                    logger.warning("[%s] 无法解析输入，按原计划继续", lab_id)
-
-            if isinstance(corrected, dict):
-                if "skill" in corrected and "params" in corrected:
-                    new_step = corrected
-                else:
-                    new_step = dict(step) if step else {}
-                    new_step.setdefault("params", {}).update(corrected)
-                compiled.update_state(config, {"current_step": new_step})
-                logger.info("[%s] ✏️  参数修正: %s", lab_id, new_step)
-
-        state = await compiled.ainvoke(None, config)
-        snapshot = compiled.get_state(config)
-
-    final = state.get("final_result")
-    return (
-        final
-        if isinstance(final, dict)
-        else {
-            "status": "completed",
-            "execution_log": list(state.get("execution_log") or []),
-        }
-    )
-
-
-# ============================================================================ #
-#  主函数 — V5.1 优先级调度 + 抢占演示                                             #
+#  主函数 — V6.0 多领域 Edge-RAG + 优先级调度                                      #
 # ============================================================================ #
 
 
@@ -272,8 +232,8 @@ async def main() -> None:
 ║    ██║  ██║███████║   ██║   ██║  ██║╚██████╔╝                ║
 ║    ╚═╝  ╚═╝╚══════╝   ╚═╝   ╚═╝  ╚═╝ ╚═════╝                 ║
 ║                                                              ║
-║    S A S F  v5.1  ·  Priority Scheduling Kernel              ║
-║    Preemptive Task Scheduler + Interlock Engine              ║
+║    S A S F  v6.0  ·  Lightweight Edge-RAG                    ║
+║    BM25-lite (Zero Deps) + Multi-Domain Knowledge            ║
 ║                                                              ║
 ╚══════════════════════════════════════════════════════════════╝
 """)
@@ -288,7 +248,7 @@ async def main() -> None:
     )
 
     # ── 3) 创建调度器 ── #
-    scheduler = Orchestrator(config=config, max_workers=2)
+    scheduler = Orchestrator(config=config, max_workers=1)
 
     # ── 4) 创建实验柜 ── #
     env = scheduler.spawn_laboratory(
@@ -302,67 +262,63 @@ async def main() -> None:
     # ── 5) 展示初始化信息 ── #
     logger.info("")
     logger.info("╔" + "═" * 60 + "╗")
-    logger.info("║          📖 动态字典 (自动握手 — 含 Macro)                  ║")
+    logger.info("║          📖 动态字典 (含 Macro + 多领域 Tools)              ║")
     logger.info("╚" + "═" * 60 + "╝")
     for word, tid in env.codec_dictionary.items():
         logger.info("    0x%02X  ←  '%s'", tid, word)
+    logger.info("    共 %d 个映射词条", len(env.codec_dictionary))
+
+    logger.info("")
+    logger.info("╔" + "═" * 60 + "╗")
+    logger.info("║          📚 已加载 OpenAI Skills (多领域知识库)              ║")
+    logger.info("╚" + "═" * 60 + "╝")
+    for s in env.loaded_skills:
+        logger.info("    ✅ %-25s — %s", s["name"], s["description"])
 
     logger.info("")
     logger.info("╔" + "═" * 60 + "╗")
     logger.info("║          🔗 已注册 Macro                                    ║")
     logger.info("╚" + "═" * 60 + "╝")
     for name, info in env.registry.get_macros().items():
-        logger.info("    🔗 %s → %s(%s)", name, info["target"], info["preset"])
+        logger.info("    🔗 %-20s → %s(%s)", name, info["target"], info["preset"])
+
+    # ── 6) 多领域任务 — Edge-RAG 动态上下文切换验证 ── #
+    tasks = [
+        ("请执行流体实验的环境准备工作", TaskPriority.NORMAL),
+        ("开始进行太空生物细胞培养", TaskPriority.NORMAL),
+        ("执行微重力合金材料合成", TaskPriority.NORMAL),
+    ]
 
     logger.info("")
     logger.info("╔" + "═" * 60 + "╗")
-    logger.info("║          🔒 联锁规则                                        ║")
+    logger.info("║     🧪 多领域 Edge-RAG 验证 (3 个不同领域任务)              ║")
     logger.info("╚" + "═" * 60 + "╝")
-    for rule in engine.interlocks:
-        logger.info("    [%s] %s → %s", rule.scope or "*", rule.condition, rule.message)
+    for desc, prio in tasks:
+        logger.info("    📋 [%s] %s", prio.name, desc)
 
-    # ── 6) 启动调度器 ── #
+    # ── 7) 启动调度器 + 提交任务 ── #
     await scheduler.start()
 
-    # ── 7) 提交 NORMAL 任务（常规实验） ── #
-    _normal_task = await scheduler.submit_task(
-        lab_id="Lab-Alpha",
-        description="执行流体实验的环境准备和样品装载流程",
-        priority=TaskPriority.NORMAL,
-    )
-
-    # ── 8) 延迟后提交 CRITICAL 紧急任务（模拟异常响应） ── #
-    async def inject_critical_task():
-        await asyncio.sleep(2)
-        logger.info("")
-        logger.info("🚨" * 30)
-        logger.info("🚨 [模拟] 检测到异常！提交 CRITICAL 紧急任务...")
-        logger.info("🚨" * 30)
-        logger.info("")
+    for desc, prio in tasks:
         await scheduler.submit_task(
             lab_id="Lab-Alpha",
-            description="紧急安全复位: 机械臂归零并关闭真空泵",
-            priority=TaskPriority.CRITICAL,
+            description=desc,
+            priority=prio,
         )
 
-    # 并发：NORMAL 任务执行 + 2s 后注入 CRITICAL
-    critical_injector = asyncio.create_task(inject_critical_task())
-
-    # ── 9) 等待队列清空 ── #
+    # ── 8) 等待完成 ── #
     await scheduler._queue.join()
-    await critical_injector
-
-    # ── 10) 关闭调度器 ── #
     completed = await scheduler.shutdown()
 
-    # ── 11) 结果汇总 ── #
+    # ── 9) 结果汇总 ── #
     final_telemetry = await env.get_telemetry()
 
     logger.info("")
     logger.info("╔" + "═" * 60 + "╗")
-    logger.info("║     📊 AstroSASF V5.1 结果汇总                             ║")
+    logger.info("║     📊 AstroSASF V6.0 结果汇总                             ║")
     logger.info("╚" + "═" * 60 + "╝")
     logger.info("")
+
     logger.info("  ┌─── Lab-Alpha ────────────────────────────────────")
     logger.info("  │  🔒 正交状态       : %s", env.engine_states)
     logger.info("  │")
@@ -375,7 +331,7 @@ async def main() -> None:
     logger.info("  │  🗜️  编解码器:")
     logger.info("  │     编码次数      : %s", cs.get("encode_count", 0))
     logger.info(
-        "  │     综合压缩率    : %s", cs.get("overall_compression_ratio", "N/A")
+        "  │     词条数        : %s (含 Macro + 多领域)", cs.get("dictionary_size", 0)
     )
     logger.info("  │")
 
@@ -386,7 +342,7 @@ async def main() -> None:
             "  │     [%s] %-8s %s → %s",
             t.task_id[:8],
             t.priority.name,
-            t.description,
+            t.description[:25],
             t.status,
         )
     logger.info("  │")
@@ -395,7 +351,7 @@ async def main() -> None:
     logger.info("  └──────────────────────────────────────────────────")
 
     logger.info("")
-    logger.info("AstroSASF V5.1 运行完毕。🚀")
+    logger.info("AstroSASF V6.0 运行完毕。🚀")
 
 
 if __name__ == "__main__":

@@ -138,17 +138,11 @@ def build_lab_graph(
     )
     tool_name_set = set(tool_names)
 
-    # ── OpenAI Skills SOP 上下文 ── #
-    skills_context = ""
-    if skill_catalog and skill_catalog.count > 0:
-        skills_context = (
-            "## 已加载的 OpenAI Skills (标准操作程序 SOP)\n"
-            "以下 Skill 告诉你**如何**组合调用 MCP Tools 完成复杂任务，请参考它们规划步骤：\n\n"
-            + skill_catalog.get_all_skills_context()
-        )
+    # ── OpenAI Skills SOP 上下文 (V6.0: 动态 RAG 替代全量注入) ── #
+    # skills_context 不再在此处静态构建，改为 planner_node 内动态检索
 
     # ================================================================== #
-    #  Node: planner_node                                                 #
+    #  Node: planner_node (V6.0 — Edge-RAG)                               #
     # ================================================================== #
 
     async def planner_node(state: LabGraphState) -> dict[str, Any]:
@@ -161,10 +155,46 @@ def build_lab_graph(
             payload={"task": task},
         )
 
+        # ── V6.0: Edge-RAG 动态检索最相关 SOP ── #
+        rag_context = ""
+        if skill_catalog and skill_catalog.count > 0:
+            retrieved = skill_catalog.retrieve_relevant_skills(task, top_k=1)
+            if retrieved:
+                hit = retrieved[0]
+                logger.info("")
+                logger.info("╔" + "═" * 60 + "╗")
+                logger.info(
+                    "║  🔍 Edge-RAG: 动态检索到相关知识                            ║",
+                )
+                logger.info("╚" + "═" * 60 + "╝")
+                logger.info(
+                    "[%s] 🔍 Edge-RAG: '%s' → '%s' (BM25 评分: %.4f)",
+                    lab_id, task[:30], hit["name"], hit["score"],
+                )
+                logger.info(
+                    "[%s] 🔍 Edge-RAG: %s",
+                    lab_id, hit["description"],
+                )
+                logger.info("")
+
+                rag_context = (
+                    "## 🔍 Edge-RAG 检索到的最相关操作程序 (BM25 自动匹配)\n"
+                    f"匹配度: {hit['score']:.4f}\n\n"
+                    f"{hit['context']}"
+                )
+
+                # 追加 Macro 提示
+                if skill_catalog.registry is not None:
+                    macro_hint = skill_catalog._build_macro_hint()
+                    if macro_hint:
+                        rag_context += "\n\n" + macro_hint
+            else:
+                logger.info("[%s] 🔍 Edge-RAG: 未检索到相关知识", lab_id)
+
         prompt = _PLANNER_PROMPT.format(
             tools_whitelist=tools_whitelist,
             tools_description=tools_desc,
-            skills_context=skills_context,
+            skills_context=rag_context,
             task=task,
         )
         response = await llm.ainvoke(prompt)

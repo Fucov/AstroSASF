@@ -1,6 +1,6 @@
 # AstroSASF — Astro Scientific Agent Scheduling Framework
 
-> 面向太空实验室的科学智能体调度框架 · 优先级抢占调度 + 正交联锁引擎 + Guard + Macro
+> 面向太空实验室的科学智能体调度框架 · Edge-RAG + 抢占调度 + 正交联锁 + Guard + Macro
 
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
 [![LangGraph](https://img.shields.io/badge/LangGraph-StateGraph-orange.svg)](https://github.com/langchain-ai/langgraph)
@@ -13,9 +13,9 @@
 
 AstroSASF 是面向空间站科学实验柜的**多智能体协作调度框架**。核心矛盾：大模型推理的 _"概率性/高延迟"_ 与物理硬件控制的 _"确定性/硬实时"_ 之间的冲突。
 
-### V5.1 核心设计
+### V6.0 核心设计
 
-> **优先级抢占式调度** + **正交状态联锁** + **Guard 装饰器** + **Macro 预绑定**。
+> **Edge-RAG 动态检索** + **优先级抢占调度** + **正交联锁** + **Guard** + **Macro**。
 
 | 概念 | 层级 | 本质 | 管理者 |
 |------|------|------|--------|
@@ -30,10 +30,12 @@ AstroSASF 是面向空间站科学实验柜的**多智能体协作调度框架**
 
 | 能力 | 模块 | 描述 |
 |------|------|------|
+| **Edge-RAG** | `skill_loader.py` | BM25-lite 零依赖检索，动态匹配最相关 SOP |
+| **多领域知识库** | `skills_catalog/` | 流体实验 / 生物培养 / 材料合成 |
 | **优先级调度** | `orchestrator.py` | PriorityQueue + Worker 池 + CRITICAL 抢占 |
 | **Guard 装饰器** | `mcp_registry.py` | `@mcp_tool(forbid_states=..., telemetry_rules=...)` |
 | **Macro 绑定** | `mcp_registry.py` | `bind_macro("heat_50", "set_temperature", {"target": 50})` |
-| **正交联锁引擎** | `interlock_engine.py` | 子系统独立状态 + `ast` 安全表达式求值 |
+| **正交联锁引擎** | `interlock_engine.py` | 子系统独立状态 + `ast` 安全求值 |
 | **动态字典压缩** | `codec.py` | 自动握手含 Macro 名 |
 | **Macro 感知 SOP** | `skill_loader.py` | 自动引导 LLM 优先调用 Macro |
 | **HITL** | 应用层注入 | `graph.compile(checkpointer=MemorySaver())` |
@@ -112,9 +114,34 @@ pip install -r requirements.txt
 python examples/space_station_demo.py
 ```
 
----
+## V6.0 核心机制
 
-## V5.1 核心机制
+### 〇、Edge-RAG 轻量级边缘检索增强 (`cognition/skill_loader.py`)
+
+**问题**：太空站边缘节点算力受限，无法运行向量数据库或 Embedding 模型，但多领域知识库持续增长，全量注入 Prompt 会浪费 Token。
+
+**方案**：纯 Python 标准库 BM25-lite（`collections.Counter` + `math.log`），零第三方依赖。
+
+```python
+# planner_node 内部：每个任务动态检索最相关的 SOP
+retrieved = catalog.retrieve_relevant_skills(task, top_k=1)
+# → [{"name": "bio_culture", "score": 0.85, "context": "..."}]
+```
+
+#### BM25 公式
+```
+IDF(t)  = ln((N - df + 0.5) / (df + 0.5) + 1)
+Score   = Σ IDF(t) × tf(t) × (k1+1) / (tf(t) + k1 × (1 - b + b × dl/avgdl))
+```
+
+#### 多领域知识库
+| 领域 | SKILL.md | 关键工具 |
+|------|----------|----------|
+| 流体实验 | `fluid_experiment` | set_temperature, vacuum, arm |
+| 生物培养 | `bio_culture` | set_temperature(37℃), inject_nutrient |
+| 材料合成 | `material_synthesis` | vacuum, turn_on_laser, set_temperature |
+
+---
 
 ### 〇、优先级抢占式调度内核 (`core/orchestrator.py`)
 
