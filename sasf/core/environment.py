@@ -225,12 +225,14 @@ class LaboratoryEnvironment:
 
         initial_state: LabGraphState = {
             "original_task": task_description,
+            "selected_skill": None,
             "plan": [],
             "current_step_index": 0,
             "current_step": None,
             "fsm_feedback": None,
             "execution_log": [],
             "error_count": 0,
+            "error_msg": None,
             "final_result": None,
         }
 

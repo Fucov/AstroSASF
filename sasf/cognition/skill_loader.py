@@ -1,23 +1,20 @@
 """
-AstroSASF · Cognition · SkillLoader (V6.0 — Edge-RAG)
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-OpenAI Skill 知识套件加载 + **轻量级边缘 RAG 检索器**。
+AstroSASF · Cognition · SkillLoader (V6.2 — Semantic Routing)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+OpenAI Skill 知识套件加载器。
 
-V6.0 核心变化:
-- 纯 Python 标准库 BM25-lite 相似度打分（零第三方依赖）
-- ``retrieve_relevant_skills(query, top_k)`` 动态检索相关 SOP
+V6.2 变化：
+- **删除** BM25/TF-IDF 算法（语义路由由 LLM router_node 承担）
+- 保留纯知识目录：扫描 → 解析 → 按名称提供 SOP 内容
 - Macro 感知上下文保留
 """
 
 from __future__ import annotations
 
 import logging
-import math
 import re
-from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -64,137 +61,24 @@ def _parse_frontmatter(text: str) -> tuple[dict[str, str], str]:
 
 
 # --------------------------------------------------------------------------- #
-#  BM25-Lite: 零依赖轻量级文本相关性评分                                          #
-# --------------------------------------------------------------------------- #
-
-# CJK 字符范围正则
-_CJK_RE = re.compile(r"[\u4e00-\u9fff]")
-# 英文/数字连续词正则
-_WORD_RE = re.compile(r"[a-zA-Z0-9_]+")
-
-# BM25 超参数
-_BM25_K1 = 1.5
-_BM25_B = 0.75
-
-
-def _tokenize(text: str) -> list[str]:
-    """中文感知分词：CJK 字符按单字切分，英文按词切分。
-
-    零第三方依赖，适配太空站边缘计算。
-    """
-    tokens: list[str] = []
-    i = 0
-    while i < len(text):
-        ch = text[i]
-        # CJK 字符 → 单字 token
-        if _CJK_RE.match(ch):
-            tokens.append(ch)
-            i += 1
-        # 英文/数字 → 连续词 token
-        elif ch.isascii() and (ch.isalnum() or ch == '_'):
-            m = _WORD_RE.match(text, i)
-            if m:
-                tokens.append(m.group().lower())
-                i = m.end()
-            else:
-                i += 1
-        else:
-            # 标点、空白 → 跳过
-            i += 1
-    return tokens
-
-
-@dataclass
-class _BM25Index:
-    """纯 Python BM25 索引（零第三方依赖）。
-
-    针对太空站边缘计算节点极度受限算力设计。
-    """
-    doc_ids: list[str] = field(default_factory=list)
-    doc_tokens: list[list[str]] = field(default_factory=list)
-    doc_lens: list[int] = field(default_factory=list)
-    avg_dl: float = 0.0
-    idf_cache: dict[str, float] = field(default_factory=dict)
-    _n_docs: int = 0
-
-    def add_document(self, doc_id: str, text: str) -> None:
-        """添加文档到索引。"""
-        tokens = _tokenize(text)
-        self.doc_ids.append(doc_id)
-        self.doc_tokens.append(tokens)
-        self.doc_lens.append(len(tokens))
-        self._n_docs = len(self.doc_ids)
-        # 重算 avg_dl
-        self.avg_dl = sum(self.doc_lens) / self._n_docs if self._n_docs else 0
-        # 清缓存（文档变化后需重算 IDF）
-        self.idf_cache.clear()
-
-    def _compute_idf(self, term: str) -> float:
-        """IDF = ln((N - df + 0.5) / (df + 0.5) + 1)"""
-        if term in self.idf_cache:
-            return self.idf_cache[term]
-
-        df = sum(1 for tokens in self.doc_tokens if term in tokens)
-        idf = math.log(
-            (self._n_docs - df + 0.5) / (df + 0.5) + 1.0
-        )
-        self.idf_cache[term] = idf
-        return idf
-
-    def score(self, query: str) -> list[tuple[str, float]]:
-        """对 query 计算每个文档的 BM25 分数。
-
-        Returns
-        -------
-        list of (doc_id, score) 按分数降序排列
-        """
-        query_tokens = _tokenize(query)
-        if not query_tokens or not self._n_docs:
-            return [(did, 0.0) for did in self.doc_ids]
-
-        results: list[tuple[str, float]] = []
-        for i, (doc_id, tokens) in enumerate(zip(self.doc_ids, self.doc_tokens)):
-            dl = self.doc_lens[i]
-            tf_map = Counter(tokens)
-            doc_score = 0.0
-
-            for term in query_tokens:
-                if term not in tf_map:
-                    continue
-                tf = tf_map[term]
-                idf = self._compute_idf(term)
-                # BM25 公式
-                numerator = tf * (_BM25_K1 + 1)
-                denominator = tf + _BM25_K1 * (
-                    1 - _BM25_B + _BM25_B * dl / self.avg_dl
-                )
-                doc_score += idf * (numerator / denominator)
-
-            results.append((doc_id, doc_score))
-
-        results.sort(key=lambda x: x[1], reverse=True)
-        return results
-
-
-# --------------------------------------------------------------------------- #
-#  OpenAISkillCatalog (V6.0)                                                   #
+#  OpenAISkillCatalog (V6.2 — Pure Knowledge Directory)                        #
 # --------------------------------------------------------------------------- #
 
 @dataclass
 class OpenAISkillCatalog:
-    """OpenAI Skill 知识目录 + Edge-RAG 检索器 (V6.0)。
+    """OpenAI Skill 知识目录 (V6.2)。
 
-    Parameters
-    ----------
-    catalog_dir : str | Path
-    registry : MCPToolRegistry | None
-        可选，用于获取 Macro 映射信息。
+    不再包含检索算法，仅负责：
+    1. 扫描并解析 ``skills_catalog/*/SKILL.md``
+    2. 按名称提供 SOP 全文
+    3. 生成 Macro 感知提示
+
+    语义路由由 ``graph_builder.router_node`` 中的 LLM 承担。
     """
 
     catalog_dir: Path
     registry: object | None = None
     _skills: dict[str, SkillEntry] = field(default_factory=dict, init=False)
-    _bm25: _BM25Index = field(default_factory=_BM25Index, init=False)
 
     def __post_init__(self) -> None:
         self.catalog_dir = Path(self.catalog_dir)
@@ -226,10 +110,6 @@ class OpenAISkillCatalog:
                 )
                 self._skills[name] = entry
 
-                # 建立 BM25 索引（合并 name + description + workflow）
-                index_text = f"{name} {description} {body}"
-                self._bm25.add_document(name, index_text)
-
                 logger.info(
                     "📚 SkillCatalog: ✅ 加载 Skill '%s' — %s",
                     name, description,
@@ -239,51 +119,6 @@ class OpenAISkillCatalog:
                 logger.warning(
                     "📚 SkillCatalog: 加载 '%s' 失败: %s", skill_path, exc,
                 )
-
-        logger.info(
-            "📚 SkillCatalog: BM25 索引构建完成 (%d 文档, avg_dl=%.0f tokens)",
-            self._bm25._n_docs, self._bm25.avg_dl,
-        )
-
-    # ---- Edge-RAG 检索 --------------------------------------------------- #
-
-    def retrieve_relevant_skills(
-        self,
-        query: str,
-        top_k: int = 1,
-    ) -> list[dict[str, Any]]:
-        """基于 BM25-lite 的轻量级边缘 RAG 检索。
-
-        Parameters
-        ----------
-        query : str
-            用户任务描述或自然语言查询。
-        top_k : int
-            返回相关度最高的 K 个 SOP。
-
-        Returns
-        -------
-        list[dict]
-            ``[{"name", "description", "score", "context"}]``
-        """
-        if not self._skills:
-            return []
-
-        scored = self._bm25.score(query)
-        results: list[dict[str, Any]] = []
-
-        for doc_id, score in scored[:top_k]:
-            entry = self._skills.get(doc_id)
-            if entry is None:
-                continue
-            results.append({
-                "name": entry.name,
-                "description": entry.description,
-                "score": round(score, 4),
-                "context": self.get_skill_context(entry.name),
-            })
-
-        return results
 
     # ---- 查询 ------------------------------------------------------------- #
 
@@ -296,7 +131,15 @@ class OpenAISkillCatalog:
             for s in self._skills.values()
         ]
 
+    def get_skill_names_and_descriptions(self) -> list[dict[str, str]]:
+        """返回所有 Skill 的 name + description（供 Router LLM 使用）。"""
+        return [
+            {"name": s.name, "description": s.description}
+            for s in self._skills.values()
+        ]
+
     def get_skill_context(self, skill_name: str) -> str:
+        """获取指定 Skill 的完整 SOP 上下文。"""
         entry = self._skills.get(skill_name)
         if entry is None:
             return ""
@@ -312,10 +155,7 @@ class OpenAISkillCatalog:
         if not self._skills:
             return ""
 
-        sections: list[str] = [
-            "# 已加载的 OpenAI Skills (标准操作程序)\n"
-            "以下 Skill 告诉你**如何**组合调用底层 MCP Tools 来完成复杂任务。\n"
-        ]
+        sections: list[str] = []
         for entry in self._skills.values():
             sections.append(self.get_skill_context(entry.name))
 

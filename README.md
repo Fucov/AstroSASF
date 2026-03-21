@@ -13,9 +13,9 @@
 
 AstroSASF 是面向空间站科学实验柜的**多智能体协作调度框架**。核心矛盾：大模型推理的 _"概率性/高延迟"_ 与物理硬件控制的 _"确定性/硬实时"_ 之间的冲突。
 
-### V6.0 核心设计
+### V6.2 核心设计
 
-> **Edge-RAG 动态检索** + **优先级抢占调度** + **正交联锁** + **Guard** + **Macro**。
+> **LLM 语义路由** + **优先级抢占调度** + **正交联锁** + **Guard** + **Macro**。
 
 | 概念 | 层级 | 本质 | 管理者 |
 |------|------|------|--------|
@@ -30,7 +30,7 @@ AstroSASF 是面向空间站科学实验柜的**多智能体协作调度框架**
 
 | 能力 | 模块 | 描述 |
 |------|------|------|
-| **Edge-RAG** | `skill_loader.py` | BM25-lite 零依赖检索，动态匹配最相关 SOP |
+| **语义路由** | `graph_builder.py` | LLM router_node 意图分析，动态选择 SOP |
 | **多领域知识库** | `skills_catalog/` | 流体实验 / 生物培养 / 材料合成 |
 | **优先级调度** | `orchestrator.py` | PriorityQueue + Worker 池 + CRITICAL 抢占 |
 | **Guard 装饰器** | `mcp_registry.py` | `@mcp_tool(forbid_states=..., telemetry_rules=...)` |
@@ -114,25 +114,32 @@ pip install -r requirements.txt
 python examples/space_station_demo.py
 ```
 
-## V6.0 核心机制
+## V6.2 核心机制
 
-### 〇、Edge-RAG 轻量级边缘检索增强 (`cognition/skill_loader.py`)
+### 〇、LLM 语义路由 (`cognition/graph_builder.py`)
 
-**问题**：太空站边缘节点算力受限，无法运行向量数据库或 Embedding 模型，但多领域知识库持续增长，全量注入 Prompt 会浪费 Token。
+**问题**：BM25 等传统 NLP 算法无法处理中文语义，边缘场景下评分全为 0。
 
-**方案**：纯 Python 标准库 BM25-lite（`collections.Counter` + `math.log`），零第三方依赖。
+**方案**：用 LLM 本身做语义路由 — 新增 `router_node` 节点，轻量 Prompt 选择最匹配的 SOP。
 
-```python
-# planner_node 内部：每个任务动态检索最相关的 SOP
-retrieved = catalog.retrieve_relevant_skills(task, top_k=1)
-# → [{"name": "bio_culture", "score": 0.85, "context": "..."}]
+```
+LangGraph V6.2 节点流:
+  router_node → planner_node → operator_node ⇄ execute_node → END
 ```
 
-#### BM25 公式
+#### Router 工作流
 ```
-IDF(t)  = ln((N - df + 0.5) / (df + 0.5) + 1)
-Score   = Σ IDF(t) × tf(t) × (k1+1) / (tf(t) + k1 × (1 - b + b × dl/avgdl))
+1. router_node 收到任务 "开始进行太空生物细胞培养"
+2. 构造 Router Prompt：列出所有 SOP name + description
+3. LLM 输出: "bio_culture" (仅一个词)
+4. 存入 State: selected_skill = "bio_culture"
+5. planner_node 读取 → 向 catalog 获取完整 SOP → 注入 Prompt
 ```
+
+#### 异常容错
+- JSON 提取失败 → `plan=[]`, `error_msg=LLM原文`, `final_result.status="failed"`
+- LLM 拒绝执行 → 优雅结束，不抛异常
+- 四层 JSON 防护：代码块剥离 → 直接解析 → 正则提取 → ast.literal_eval
 
 #### 多领域知识库
 | 领域 | SKILL.md | 关键工具 |

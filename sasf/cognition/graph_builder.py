@@ -1,16 +1,18 @@
 """
-AstroSASF · Cognition · GraphBuilder (V4.3 — Headless)
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+AstroSASF · Cognition · GraphBuilder (V6.2 — Semantic Routing)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 LangGraph 状态图工作流构建器。
 
-V4.3 变化：
-- 返回 **未编译的 StateGraph**（不含 MemorySaver / interrupt）
-- 调用方自行决定编译选项（Headless 或 HITL）
-- 保留 V4.3 修复的三段式 operator_node 逻辑
+V6.2 核心变化：
+- 新增 ``router_node``：LLM 语义路由，选择最匹配的 SOP
+- ``planner_node`` 根据 router 结果动态注入单个 SOP
+- 增强 ``_extract_json``：四层防护 + 优雅降级
+- LLM 调用显式设置 ``max_tokens=2048`` 防止截断
 """
 
 from __future__ import annotations
 
+import ast as _ast
 import json
 import logging
 import re
@@ -26,11 +28,27 @@ from sasf.middleware.gateway import SpaceMCPGateway
 logger = logging.getLogger(__name__)
 
 _MAX_RETRIES_PER_STEP: int = 2
+_LLM_MAX_TOKENS: int = 2048
 
 
 # --------------------------------------------------------------------------- #
 #  Prompt Templates                                                            #
 # --------------------------------------------------------------------------- #
+
+_ROUTER_PROMPT = """你是太空实验柜的语义路由智能体 (Semantic Router)。
+
+## 任务
+分析用户的任务指令，从以下已注册的 SOP (标准操作程序) 列表中选择最匹配的一个。
+
+## 已注册的 SOP 列表
+{skills_list}
+
+## 输出规则 (严格遵守)
+- **只输出一个 SOP 的 name（不加引号、不加解释）**
+- 如果没有任何 SOP 匹配该任务，输出: UNKNOWN
+
+用户指令: {task}"""
+
 
 _PLANNER_PROMPT = """你是太空实验柜的规划智能体 (Planner)。
 你的唯一任务：将用户指令拆解为 **底层 MCP Tool 原子调用序列**。
@@ -78,23 +96,30 @@ _CORRECTION_PROMPT = """你是太空实验柜的操作智能体 (Operator)。
 
 
 # --------------------------------------------------------------------------- #
-#  JSON 提取工具                                                                #
+#  JSON 提取工具 (V6.2 四层防护)                                                 #
 # --------------------------------------------------------------------------- #
 
 def _extract_json(text: str) -> Any:
-    """从 LLM 输出中鲁棒地提取 JSON（容忍代码块、多余文字）。"""
-    # 1) 去除 ```json ... ``` 代码块包裹
+    """从 LLM 输出中鲁棒地提取 JSON。
+
+    四层防护：
+    1. 去除 ```json ``` 代码块
+    2. 直接 json.loads
+    3. 正则提取 [...] 或 {...}
+    4. ast.literal_eval 兜底
+    """
+    # 1) 去除代码块包裹
     fence_match = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
     if fence_match:
         text = fence_match.group(1).strip()
 
-    # 2) 直接尝试解析
+    # 2) 直接解析
     try:
         return json.loads(text)
     except json.JSONDecodeError:
         pass
 
-    # 3) 正则提取 JSON 数组或对象（DOTALL 跨行匹配）
+    # 3) 正则提取 JSON 数组或对象
     for pattern in [r"\[[\s\S]*\]", r"\{[\s\S]*\}"]:
         m = re.search(pattern, text, re.DOTALL)
         if m:
@@ -103,8 +128,7 @@ def _extract_json(text: str) -> Any:
             except json.JSONDecodeError:
                 continue
 
-    # 4) 最后一搏：ast.literal_eval（容忍单引号等 Python 格式）
-    import ast as _ast
+    # 4) ast.literal_eval（容忍单引号等 Python 格式）
     try:
         result = _ast.literal_eval(text.strip())
         if isinstance(result, (list, dict)):
@@ -128,20 +152,8 @@ def build_lab_graph(
 ) -> StateGraph:
     """构建实验柜的 LangGraph 状态图（**未编译**）。
 
-    调用方自行编译，可选注入 checkpointer / interrupt::
-
-        # Headless（默认）
-        compiled = graph.compile()
-
-        # HITL
-        from langgraph.checkpoint.memory import MemorySaver
-        memory = MemorySaver()
-        compiled = graph.compile(checkpointer=memory, interrupt_before=["execute_node"])
-
-    Returns
-    -------
-    StateGraph
-        未编译的状态图。
+    V6.2 节点流:
+        router_node → planner_node → operator_node ⇄ execute_node → END
     """
 
     # ── MCP Tools 描述 ── #
@@ -154,15 +166,71 @@ def build_lab_graph(
     )
     tool_name_set = set(tool_names)
 
-    # ── OpenAI Skills SOP 上下文 (V6.0: 动态 RAG 替代全量注入) ── #
-    # skills_context 不再在此处静态构建，改为 planner_node 内动态检索
+    # ── Skills 列表（供 Router 使用） ── #
+    skills_list_str = ""
+    if skill_catalog and skill_catalog.count > 0:
+        skills_info = skill_catalog.get_skill_names_and_descriptions()
+        skills_list_str = "\n".join(
+            f"- `{s['name']}`: {s['description']}" for s in skills_info
+        )
 
     # ================================================================== #
-    #  Node: planner_node (V6.0 — Edge-RAG)                               #
+    #  Node: router_node (V6.2 — LLM Semantic Router)                     #
+    # ================================================================== #
+
+    async def router_node(state: LabGraphState) -> dict[str, Any]:
+        task = state["original_task"]
+
+        if not skill_catalog or skill_catalog.count == 0:
+            logger.info("[%s] 🧭 Semantic Router: 无可用 SOP，跳过路由", lab_id)
+            return {"selected_skill": None}
+
+        logger.info("")
+        logger.info("╔" + "═" * 60 + "╗")
+        logger.info("║  🧭 Semantic Router: 正在分析任务意图...                   ║")
+        logger.info("╚" + "═" * 60 + "╝")
+        logger.info("[%s] 🧭 任务: %s", lab_id, task)
+        logger.info("[%s] 🧭 候选 SOP: %s", lab_id,
+                     [s["name"] for s in skill_catalog.get_skill_names_and_descriptions()])
+
+        prompt = _ROUTER_PROMPT.format(
+            skills_list=skills_list_str,
+            task=task,
+        )
+
+        try:
+            response = await llm.ainvoke(
+                prompt,
+                max_tokens=128,
+            )
+            raw = response.content if hasattr(response, "content") else str(response)
+            selected = raw.strip().strip('"').strip("'").strip('`')
+        except Exception as exc:
+            logger.warning("[%s] 🧭 Router LLM 调用失败: %s", lab_id, exc)
+            selected = "UNKNOWN"
+
+        # 校验：选中的 SOP 是否存在
+        if selected != "UNKNOWN" and skill_catalog.get_skill(selected) is not None:
+            logger.info(
+                "[%s] 🧭 Semantic Router: ✅ 选中 SOP → '%s'",
+                lab_id, selected,
+            )
+            return {"selected_skill": selected}
+        else:
+            logger.info(
+                "[%s] 🧭 Semantic Router: ⚠️ 未匹配到已知 SOP (LLM 输出: '%s')",
+                lab_id, selected,
+            )
+            return {"selected_skill": None}
+
+    # ================================================================== #
+    #  Node: planner_node (V6.2 — 根据 Router 结果注入 SOP)                #
     # ================================================================== #
 
     async def planner_node(state: LabGraphState) -> dict[str, Any]:
         task = state["original_task"]
+        selected_skill = state.get("selected_skill")
+
         logger.info("[%s] 🧠 Planner: 正在规划「%s」...", lab_id, task)
 
         a2a_router.route(
@@ -171,62 +239,80 @@ def build_lab_graph(
             payload={"task": task},
         )
 
-        # ── V6.0: Edge-RAG 动态检索最相关 SOP ── #
-        rag_context = ""
-        if skill_catalog and skill_catalog.count > 0:
-            retrieved = skill_catalog.retrieve_relevant_skills(task, top_k=1)
-            if retrieved:
-                hit = retrieved[0]
-                logger.info("")
-                logger.info("╔" + "═" * 60 + "╗")
+        # ── 根据 router 结果构建 SOP 上下文 ── #
+        skills_context = ""
+        if selected_skill and skill_catalog:
+            sop_context = skill_catalog.get_skill_context(selected_skill)
+            if sop_context:
                 logger.info(
-                    "║  🔍 Edge-RAG: 动态检索到相关知识                            ║",
+                    "[%s] 🧠 Planner: 注入 SOP '%s' 到提示词",
+                    lab_id, selected_skill,
                 )
-                logger.info("╚" + "═" * 60 + "╝")
-                logger.info(
-                    "[%s] 🔍 Edge-RAG: '%s' → '%s' (BM25 评分: %.4f)",
-                    lab_id, task[:30], hit["name"], hit["score"],
+                skills_context = (
+                    f"## 🧭 语义路由选中的操作程序\n\n{sop_context}"
                 )
-                logger.info(
-                    "[%s] 🔍 Edge-RAG: %s",
-                    lab_id, hit["description"],
-                )
-                logger.info("")
-
-                rag_context = (
-                    "## 🔍 Edge-RAG 检索到的最相关操作程序 (BM25 自动匹配)\n"
-                    f"匹配度: {hit['score']:.4f}\n\n"
-                    f"{hit['context']}"
-                )
-
                 # 追加 Macro 提示
                 if skill_catalog.registry is not None:
                     macro_hint = skill_catalog._build_macro_hint()
                     if macro_hint:
-                        rag_context += "\n\n" + macro_hint
-            else:
-                logger.info("[%s] 🔍 Edge-RAG: 未检索到相关知识", lab_id)
+                        skills_context += "\n\n" + macro_hint
 
         prompt = _PLANNER_PROMPT.format(
             tools_whitelist=tools_whitelist,
             tools_description=tools_desc,
-            skills_context=rag_context,
+            skills_context=skills_context,
             task=task,
         )
-        response = await llm.ainvoke(prompt)
-        raw_text = response.content if hasattr(response, "content") else str(response)
+
+        try:
+            response = await llm.ainvoke(
+                prompt,
+                max_tokens=_LLM_MAX_TOKENS,
+            )
+            raw_text = response.content if hasattr(response, "content") else str(response)
+        except Exception as exc:
+            logger.error("[%s] 🧠 Planner LLM 调用失败: %s", lab_id, exc)
+            return {
+                "plan": [],
+                "error_msg": f"Planner LLM 调用失败: {exc}",
+                "current_step_index": 0,
+                "current_step": None,
+                "fsm_feedback": None,
+                "execution_log": [],
+                "error_count": 0,
+                "final_result": {
+                    "status": "failed",
+                    "reason": f"Planner LLM 调用失败: {exc}",
+                },
+            }
 
         logger.info("[%s] 🧠 Planner LLM 输出:\n%s", lab_id, raw_text)
 
+        # ── 健壮 JSON 提取 + 优雅降级 ── #
         try:
             plan = _extract_json(raw_text)
             if not isinstance(plan, list):
                 plan = [plan]
-        except ValueError as exc:
-            logger.warning("[%s] Planner JSON 解析失败: %s", lab_id, exc)
-            plan = []
+        except ValueError:
+            logger.warning(
+                "[%s] 🧠 Planner: JSON 提取失败，LLM 可能拒绝了任务", lab_id,
+            )
+            # 优雅降级：将 LLM 自然语言输出存入 error_msg
+            return {
+                "plan": [],
+                "error_msg": raw_text[:500],
+                "current_step_index": 0,
+                "current_step": None,
+                "fsm_feedback": None,
+                "execution_log": [],
+                "error_count": 0,
+                "final_result": {
+                    "status": "failed",
+                    "reason": f"Planner 无法生成有效计划: {raw_text[:200]}",
+                },
+            }
 
-        # ── 后置校验：过滤不在白名单中的虚構工具 ── #
+        # ── 后置校验：过滤不在白名单中的工具 ── #
         validated_plan = []
         for step in plan:
             if isinstance(step, dict) and step.get("skill") in tool_name_set:
@@ -249,6 +335,7 @@ def build_lab_graph(
 
         return {
             "plan": plan,
+            "error_msg": None,
             "current_step_index": 0,
             "current_step": None,
             "fsm_feedback": None,
@@ -451,14 +538,17 @@ def build_lab_graph(
         return "done"
 
     # ================================================================== #
-    #  Build (未编译 — 调用方自行 compile)                                  #
+    #  Build (V6.2: router → planner → operator ⇄ execute)               #
     # ================================================================== #
 
     graph = StateGraph(LabGraphState)
+    graph.add_node("router_node", router_node)
     graph.add_node("planner_node", planner_node)
     graph.add_node("operator_node", operator_node)
     graph.add_node("execute_node", execute_node)
-    graph.set_entry_point("planner_node")
+
+    graph.set_entry_point("router_node")
+    graph.add_edge("router_node", "planner_node")
     graph.add_edge("planner_node", "operator_node")
     graph.add_conditional_edges(
         "operator_node",
