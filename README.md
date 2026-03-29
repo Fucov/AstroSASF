@@ -1,6 +1,6 @@
 # AstroSASF — Astro Scientific Agent Scheduling Framework
 
-> 面向太空实验室的科学智能体调度框架 · Edge-RAG + 抢占调度 + 正交联锁 + Guard + Macro + **DAG 双轨调度**
+> 面向太空实验室的科学智能体调度框架 · Edge-RAG + **硬件级抢占** + **动态优先级 Aging** + 正交联锁 + Guard + Macro + **DAG 双轨调度**
 
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
 [![LangGraph](https://img.shields.io/badge/LangGraph-StateGraph-orange.svg)](https://github.com/langchain-ai/langgraph)
@@ -13,9 +13,9 @@
 
 AstroSASF 是面向空间站科学实验柜的**多智能体协作调度框架**。核心矛盾：大模型推理的 _"概率性/高延迟"_ 与物理硬件控制的 _"确定性/硬实时"_ 之间的冲突。
 
-### V7.0 核心设计
+### V7.1 核心设计
 
-> **理论/实践双轨调度** + **DAG 依赖图** + **LLM 语义路由** + **优先级抢占** + **正交联锁** + **Guard** + **Macro**。
+> **理论/实践双轨调度** + **DAG 依赖图** + **LLM 语义路由** + **硬件级抢占** + **动态优先级 Aging** + **正交联锁** + **Guard** + **Macro**。
 
 | 概念 | 层级 | 本质 | 管理者 |
 |------|------|------|--------|
@@ -23,6 +23,8 @@ AstroSASF 是面向空间站科学实验柜的**多智能体协作调度框架**
 | **实践智能体 (Worker)** | 执行层 | 从 ReadyQueue 取节点，执行 MCP Tool | `orchestrator.py` |
 | **DAGNode** | 核心层 | 带依赖关系的可执行任务单元 | `models.py` |
 | **MCP Tools** | 中间件层 | 底层原子操作接口 + **Guard 声明式安全守卫** | `middleware/mcp_registry.py` |
+| **TelemetryBus** | 物理层 | 遥测数据存储 + **硬件报警监控** | `physics/telemetry_bus.py` |
+| **Hardware Interrupt** | 核心层 | 越过 LLM 层，直接注入 CRITICAL 逃生任务 | `orchestrator.py` |
 
 ---
 
@@ -42,6 +44,69 @@ AstroSASF 是面向空间站科学实验柜的**多智能体协作调度框架**
 | **Macro 绑定** | `mcp_registry.py` | `bind_macro("heat_50", "set_temperature", {"target": 50})` |
 | **正交联锁引擎** | `interlock_engine.py` | 子系统独立状态 + `ast` 安全求值 |
 | **HITL** | 应用层注入 | `graph.compile(checkpointer=MemorySaver())` |
+| **硬件级抢占 (V7.1)** | `telemetry_bus.py` | TelemetryBus 监测危险条件，注入 CRITICAL 逃生任务 |
+| **LLM Task Cancel (V7.1)** | `orchestrator.py` | 硬件中断时强行 Cancel 正在进行的 LLM 推理 |
+| **动态优先级 Aging (V7.1)** | `models.py` | 防止低优任务饿死，队列周期性重平衡 |
+
+---
+
+## V7.1 硬件级抢占机制
+
+### 架构图
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  TelemetryBus (V5.1) — 1553B 总线模拟                                 │
+│  ┌─────────────────────────────────────────────────────────────────┐│
+│  │  register_alarm(condition="temperature >= 80",                    ││
+│  │                 action="emergency_cooling")                      ││
+│  └─────────────────────────────────────────────────────────────────┘│
+│                              │                                          │
+│                              ▼ 报警触发回调                              │
+│  ┌─────────────────────────────────────────────────────────────────┐│
+│  │  Orchestrator._handle_hardware_interrupt()                        ││
+│  │  1. Cancel 所有 LLM Task (asyncio.Task.cancel())                ││
+│  │  2. 挂起当前运行中的 Worker 任务 (mark_skipped)                   ││
+│  │  3. 注入 CRITICAL 逃生任务到 ReadyQueue                         ││
+│  │  4. 唤醒 Worker 重新选择                                         ││
+│  └─────────────────────────────────────────────────────────────────┘│
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### 动态优先级 Aging 算法
+
+```python
+# 公式：Dynamic_Score = Base_Score - min(Aging_Boost, Max_Boost)
+# 其中 Aging_Boost = (Current_Time - Submit_Time) * Aging_Factor
+
+def compute_dynamic_priority(base_priority, submit_time, aging_factor=0.1, max_boost=10.0):
+    elapsed = time.monotonic() - submit_time
+    aging_boost = min(elapsed * aging_factor, max_boost)
+    return float(base_priority.value) - aging_boost
+```
+
+- **等待越久** → Aging_Boost 越大 → Dynamic_Score 越小 → **优先级越高**
+- 防止低优先级任务长期处于就绪队列导致"饿死"
+- 后台协程每 5 秒对 PriorityQueue 进行重排序
+
+### 使用示例
+
+```python
+# 注册硬件报警
+orchestrator.register_lab_hardware_alarm(
+    lab_id="Lab-Alpha",
+    alarm_id="temp_overheat",
+    condition_expr="temperature >= 80",
+    interrupt_action_skill="emergency_cooling",
+    interrupt_action_params={"mode": "rapid", "target": 25.0},
+    severity=TaskPriority.CRITICAL,
+)
+
+# 报警触发时，系统自动：
+# 1. Cancel 所有 LLM 推理
+# 2. 挂起当前任务
+# 3. 注入 emergency_cooling 逃生任务（CRITICAL 优先级）
+```
 
 ---
 
@@ -49,11 +114,12 @@ AstroSASF 是面向空间站科学实验柜的**多智能体协作调度框架**
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│  Core Layer — DAGOrchestrator (V7.0 Dual-Track Scheduler)          │
+│  Core Layer — DAGOrchestrator (V7.1 HW Preemption Scheduler)        │
 │                                                                      │
 │  ┌────────────────────────────────────────────────────────────────┐ │
 │  │  理论智能体 (Planner)                                            │ │
 │  │  LLM → 自然语言 → DAG 任务图 (带依赖关系)                         │ │
+│  │  ↑ LLM Task 可被硬件中断 Cancel                                  │ │
 │  └────────────────────────────────────────────────────────────────┘ │
 │                              │                                       │
 │                              ▼                                       │
@@ -66,7 +132,13 @@ AstroSASF 是面向空间站科学实验柜的**多智能体协作调度框架**
 │  └────────────────────────────────────────────────────────────────┘ │
 │                                                                      │
 │  ┌────────────────────────────────────────────────────────────────┐ │
-│  │ LaboratoryEnvironment (suspend_event checkpoint)               │ │
+│  │  硬件抢占层 (V7.1)                                               │ │
+│  │  TelemetryBus → 报警监控协程 → 回调 → Orchestrator              │ │
+│  │  HardwareInterruptTask → CRITICAL 逃生任务注入                    │ │
+│  └────────────────────────────────────────────────────────────────┘ │
+│                                                                      │
+│  ┌────────────────────────────────────────────────────────────────┐ │
+│  │ LaboratoryEnvironment (suspend_event checkpoint)                 │ │
 │  └────────────────────────────────────────────────────────────────┘ │
 │  (config.yaml 驱动 · Headless / HITL 可选)                          │
 ├─────────────────────────────────────────────────────────────────────┤
@@ -79,12 +151,12 @@ AstroSASF 是面向空间站科学实验柜的**多智能体协作调度框架**
 │  Middleware Layer ★ 核心资产                                        │
 │  ┌────────────────────────────────────────────────────────────────┐ │
 │  │ MCPToolRegistry ← @mcp_tool(Guard) + Macro                     │ │
-│  │ SpaceMCPCodec(自动握手) · SpaceWire · Gateway                  │ │
+│  │ SpaceMCPCodec(自动握手) · SpaceWire · Gateway                   │ │
 │  │ A2ARouter (Pub/Sub)                                           │ │
 │  └────────────────────────────────────────────────────────────────┘ │
 ├─────────────────────────────────────────────────────────────────────┤
-│  Physics Layer — InterlockEngine + TelemetryBus                     │
-│  (正交子系统状态 · 跨系统联锁规则 · ast 安全求值)                     │
+│  Physics Layer — InterlockEngine + TelemetryBus (V5.1)              │
+│  (正交子系统状态 · 跨系统联锁规则 · ast 安全求值 · 硬件报警监控)       │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 

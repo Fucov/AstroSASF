@@ -263,7 +263,7 @@ async def main() -> None:
     # ── 5) 展示初始化信息 ── #
     logger.info("")
     logger.info("╔" + "═" * 60 + "╗")
-    logger.info("║          📖 动态字典 (含 Macro + 多领域 Tools)              ║")
+    logger.info("║          📖 动态字典 (含 Macro + 多领域 Tools)             ║")
     logger.info("╚" + "═" * 60 + "╝")
     for word, tid in env.codec_dictionary.items():
         logger.info("    0x%02X  ←  '%s'", tid, word)
@@ -271,14 +271,14 @@ async def main() -> None:
 
     logger.info("")
     logger.info("╔" + "═" * 60 + "╗")
-    logger.info("║          📚 已加载 OpenAI Skills (多领域知识库)              ║")
+    logger.info("║          📚 已加载 OpenAI Skills (多领域知识库)             ║")
     logger.info("╚" + "═" * 60 + "╝")
     for s in env.loaded_skills:
         logger.info("    ✅ %-25s — %s", s["name"], s["description"])
 
     logger.info("")
     logger.info("╔" + "═" * 60 + "╗")
-    logger.info("║          🔗 已注册 Macro                                    ║")
+    logger.info("║          🔗 已注册 Macro                                   ║")
     logger.info("╚" + "═" * 60 + "╝")
     for name, info in env.registry.get_macros().items():
         logger.info("    🔗 %-20s → %s(%s)", name, info["target"], info["preset"])
@@ -292,7 +292,7 @@ async def main() -> None:
 
     logger.info("")
     logger.info("╔" + "═" * 60 + "╗")
-    logger.info("║     🧪 多领域 Edge-RAG 验证 (3 个不同领域任务)              ║")
+    logger.info("║     🧪 多领域 Edge-RAG 验证 (3 个不同领域任务)             ║")
     logger.info("╚" + "═" * 60 + "╝")
     for desc, prio in tasks:
         logger.info("    📋 [%s] %s", prio.name, desc)

@@ -48,6 +48,46 @@ class TaskPriority(IntEnum):
     LOW = 3        # 清理/待机
 
 
+# Aging 机制配置
+DEFAULT_AGING_FACTOR: float = 0.1  # 每秒提升的优先级分数（数值越小优先级越高）
+DEFAULT_REBALANCE_INTERVAL: float = 5.0  # 队列重平衡周期（秒）
+DEFAULT_MAX_AGING_BOOST: float = 10.0  # 单个任务最大 Aging 提升分数
+
+
+def compute_dynamic_priority(
+    base_priority: TaskPriority,
+    submit_time: float,
+    aging_factor: float = DEFAULT_AGING_FACTOR,
+    max_boost: float = DEFAULT_MAX_AGING_BOOST,
+) -> float:
+    """计算动态优先级（含 Aging 机制）。
+
+    算法：Dynamic_Score = Base_Score - min(Aging_Boost, Max_Boost)
+    其中 Aging_Boost = (Current_Time - Submit_Time) * Aging_Factor
+
+    等待越久的任务，Boost 越大，Dynamic_Score 越小，优先级越高。
+
+    Parameters
+    ----------
+    base_priority : TaskPriority
+        静态基础优先级
+    submit_time : float
+        任务入队时间（time.monotonic）
+    aging_factor : float
+        Aging 提升速率（默认 0.1，即每秒提升 0.1 分）
+    max_boost : float
+        最大 Aging 提升上限（默认 10.0）
+
+    Returns
+    -------
+    float
+        动态优先级分数（越小越优先）
+    """
+    elapsed = time.monotonic() - submit_time
+    aging_boost = min(elapsed * aging_factor, max_boost)
+    return float(base_priority.value) - aging_boost
+
+
 # --------------------------------------------------------------------------- #
 #  DAGNode                                                                    #
 # --------------------------------------------------------------------------- #
@@ -114,6 +154,10 @@ class DAGNode:
     error_msg: str | None = None
     lab_id: str = ""
 
+    # ── Aging 机制 ── #
+    _aging_factor: float = field(default=DEFAULT_AGING_FACTOR, init=False, repr=False)
+    _max_aging_boost: float = field(default=DEFAULT_MAX_AGING_BOOST, init=False, repr=False)
+
     def __post_init__(self) -> None:
         if not self.node_id:
             self.node_id = uuid.uuid4().hex[:12]
@@ -127,6 +171,20 @@ class DAGNode:
             return None
         end = self.end_time or time.monotonic()
         return end - self.start_time
+
+    @property
+    def dynamic_priority(self) -> float:
+        """计算动态优先级（含 Aging）。
+
+        公式：Dynamic_Score = Base_Score - min(Aging_Boost, Max_Boost)
+        等待越久的任务，优先级越高。
+        """
+        return compute_dynamic_priority(
+            base_priority=self.priority,
+            submit_time=self.submit_time,
+            aging_factor=self._aging_factor,
+            max_boost=self._max_aging_boost,
+        )
 
     @property
     def is_leaf(self) -> bool:
@@ -156,15 +214,21 @@ class DAGNode:
         self.status = NodeStatus.SKIPPED
         self.end_time = time.monotonic()
 
-    def get_ready_score(self) -> tuple[int, float]:
-        """计算就绪队列优先级得分。
+    def get_ready_score(self) -> tuple[float, float]:
+        """计算就绪队列优先级得分（使用动态优先级）。
 
         Returns
         -------
-        tuple[int, float]
-            (优先级数值, 提交时间) 用于 asyncio.PriorityQueue 排序
+        tuple[float, float]
+            (动态优先级分数, 提交时间) 用于 asyncio.PriorityQueue 排序
+            动态优先级越低越优先，相同时按提交时间排序
         """
-        return (self.priority.value, self.submit_time)
+        return (self.dynamic_priority, self.submit_time)
+
+    def set_aging_params(self, factor: float, max_boost: float) -> None:
+        """设置 Aging 参数。"""
+        self._aging_factor = factor
+        self._max_aging_boost = max_boost
 
     def to_dict(self) -> dict[str, Any]:
         """序列化为字典。"""
@@ -650,6 +714,71 @@ class DAGExecutionResult:
             "execution_levels": self.execution_levels,
             "node_results": self.node_results,
         }
+
+
+# --------------------------------------------------------------------------- #
+#  HardwareInterruptTask (硬实时逃生任务)                                       #
+# --------------------------------------------------------------------------- #
+
+@dataclass
+class HardwareInterruptTask:
+    """硬件级抢占任务 —— 来自 TelemetryBus 的紧急逃生指令。
+
+    当 TelemetryBus 检测到危险条件时，会绕过 LLM 规划层，
+    直接向调度器注入此类型的最高优先级任务。
+
+    Attributes
+    ----------
+    interrupt_id : str
+        中断唯一标识符
+    description : str
+        人类可读的中断描述（如 "温度超限：82℃ > 80℃"）
+    action_skill : str
+        逃生动作对应的 MCP Tool 名称
+    action_params : dict[str, Any]
+        逃生动作参数
+    lab_id : str
+        目标实验柜 ID
+    source_condition : str
+        触发的原始条件表达式
+    timestamp : float
+        中断触发时间戳
+    """
+    interrupt_id: str
+    description: str
+    action_skill: str
+    action_params: dict[str, Any] = field(default_factory=dict)
+    lab_id: str = "default"
+    source_condition: str = ""
+    timestamp: float = field(default_factory=time.monotonic)
+
+    def to_dag_node(self, priority: TaskPriority = TaskPriority.CRITICAL) -> DAGNode:
+        """转换为 DAGNode 用于调度执行。"""
+        return DAGNode(
+            node_id=f"INT-{self.interrupt_id}",
+            skill_name=self.action_skill,
+            params=self.action_params,
+            dependencies=[],
+            priority=priority,
+            description=f"[HARDWARE INTERRUPT] {self.description}",
+            lab_id=self.lab_id,
+        )
+
+
+@dataclass
+class HardwareAlarm:
+    """硬件报警注册条目。"""
+    alarm_id: str
+    condition_expr: str                    # 布尔表达式，如 "temperature >= 80"
+    interrupt_action_skill: str             # 触发时执行的 MCP Tool
+    interrupt_action_params: dict[str, Any] # 触发时执行的参数
+    severity: TaskPriority = TaskPriority.CRITICAL
+    enabled: bool = True
+    trigger_count: int = field(default=0, init=False)
+    last_trigger_time: float | None = field(default=None, init=False)
+
+    def __hash__(self) -> int:
+        return hash(self.alarm_id)
 
 
 # --------------------------------------------------------------------------- #
