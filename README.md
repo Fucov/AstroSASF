@@ -1,6 +1,6 @@
 # AstroSASF — Astro Scientific Agent Scheduling Framework
 
-> 面向太空实验室的科学智能体调度框架 · Edge-RAG + 抢占调度 + 正交联锁 + Guard + Macro
+> 面向太空实验室的科学智能体调度框架 · Edge-RAG + 抢占调度 + 正交联锁 + Guard + Macro + **DAG 双轨调度**
 
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
 [![LangGraph](https://img.shields.io/badge/LangGraph-StateGraph-orange.svg)](https://github.com/langchain-ai/langgraph)
@@ -13,16 +13,16 @@
 
 AstroSASF 是面向空间站科学实验柜的**多智能体协作调度框架**。核心矛盾：大模型推理的 _"概率性/高延迟"_ 与物理硬件控制的 _"确定性/硬实时"_ 之间的冲突。
 
-### V6.2 核心设计
+### V7.0 核心设计
 
-> **LLM 语义路由** + **优先级抢占调度** + **正交联锁** + **Guard** + **Macro**。
+> **理论/实践双轨调度** + **DAG 依赖图** + **LLM 语义路由** + **优先级抢占** + **正交联锁** + **Guard** + **Macro**。
 
 | 概念 | 层级 | 本质 | 管理者 |
 |------|------|------|--------|
+| **理论智能体 (Planner)** | 认知层 | LLM 将自然语言解析为 DAG 任务图 | `graph_builder.py` |
+| **实践智能体 (Worker)** | 执行层 | 从 ReadyQueue 取节点，执行 MCP Tool | `orchestrator.py` |
+| **DAGNode** | 核心层 | 带依赖关系的可执行任务单元 | `models.py` |
 | **MCP Tools** | 中间件层 | 底层原子操作接口 + **Guard 声明式安全守卫** | `middleware/mcp_registry.py` |
-| **Macro** | 中间件层 | 参数预绑定的快捷 Tool（类似 `functools.partial`） | `mcp_registry.bind_macro()` |
-| **OpenAI Skills** | 认知层 | 标准操作程序 SOP + **Macro 感知上下文** | `cognition/skill_loader.py` |
-| **InterlockEngine** | 物理层 | 正交子系统状态 + 跨系统联锁规则引擎 | `physics/interlock_engine.py` |
 
 ---
 
@@ -30,14 +30,17 @@ AstroSASF 是面向空间站科学实验柜的**多智能体协作调度框架**
 
 | 能力 | 模块 | 描述 |
 |------|------|------|
+| **DAG 双轨调度** | `orchestrator.py` | 理论智能体生成 DAG → 实践智能体执行 |
+| **依赖状态机** | `models.py` | PENDING → READY → RUNNING → COMPLETED/FAILED |
+| **Ready/Blocked 队列** | `orchestrator.py` | 无依赖入 ReadyQueue，有依赖入 BlockedQueue |
+| **结算依赖解除** | `orchestrator.py` | 节点完成后递归检查下游，移入 ReadyQueue |
+| **循环依赖检测** | `models.py` | Kahn 算法入度检测，拒绝非法 DAG |
 | **语义路由** | `graph_builder.py` | LLM router_node 意图分析，动态选择 SOP |
 | **多领域知识库** | `skills_catalog/` | 流体实验 / 生物培养 / 材料合成 |
 | **优先级调度** | `orchestrator.py` | PriorityQueue + Worker 池 + CRITICAL 抢占 |
 | **Guard 装饰器** | `mcp_registry.py` | `@mcp_tool(forbid_states=..., telemetry_rules=...)` |
 | **Macro 绑定** | `mcp_registry.py` | `bind_macro("heat_50", "set_temperature", {"target": 50})` |
 | **正交联锁引擎** | `interlock_engine.py` | 子系统独立状态 + `ast` 安全求值 |
-| **动态字典压缩** | `codec.py` | 自动握手含 Macro 名 |
-| **Macro 感知 SOP** | `skill_loader.py` | 自动引导 LLM 优先调用 Macro |
 | **HITL** | 应用层注入 | `graph.compile(checkpointer=MemorySaver())` |
 
 ---
@@ -45,30 +48,44 @@ AstroSASF 是面向空间站科学实验柜的**多智能体协作调度框架**
 ## 系统架构
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│  Core Layer — Orchestrator (V5.1 Priority Scheduler)        │
-│  PriorityQueue │ Worker Pool │ Preemption (asyncio.Event)   │
-│  ┌──────────────────────────────────────────────────────┐    │
-│  │ LaboratoryEnvironment (suspend_event checkpoint)     │    │
-│  └──────────────────────────────────────────────────────┘    │
-│  (config.yaml 驱动 · Headless / HITL 可选)                   │
-├─────────────────────────────────────────────────────────────┤
-│  Cognition Layer                                            │
-│  ┌──────────────────┐  ┌──────────────────────────────┐     │
-│  │ SkillLoader (V5)  │  │ LangGraph StateGraph + LLM   │     │
-│  │ Macro-aware SOP   │  │ (Ollama/DeepSeek/百炼)       │     │
-│  └──────────────────┘  └──────────────────────────────┘     │
-├──┬──────────────────────────────────────────────────────────┤
-│  │  Middleware Layer ★ 核心资产                              │
-│  │  ┌────────────────────────────────────────────────┐      │
-│  │  │ MCPToolRegistry ← @mcp_tool(Guard) + Macro    │      │
-│  │  │ SpaceMCPCodec(自动握手) · SpaceWire · Gateway  │      │
-│  │  │ A2ARouter (Pub/Sub)                            │      │
-│  │  └────────────────────────────────────────────────┘      │
-├──┴──────────────────────────────────────────────────────────┤
-│  Physics Layer — InterlockEngine + TelemetryBus             │
-│  (正交子系统状态 · 跨系统联锁规则 · ast 安全求值)             │
-└─────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────┐
+│  Core Layer — DAGOrchestrator (V7.0 Dual-Track Scheduler)          │
+│                                                                      │
+│  ┌────────────────────────────────────────────────────────────────┐ │
+│  │  理论智能体 (Planner)                                            │ │
+│  │  LLM → 自然语言 → DAG 任务图 (带依赖关系)                         │ │
+│  └────────────────────────────────────────────────────────────────┘ │
+│                              │                                       │
+│                              ▼                                       │
+│  ┌────────────────────────────────────────────────────────────────┐ │
+│  │  实践智能体 (Workers)                                            │ │
+│  │  ReadyQueue ← [节点A, 节点B] → 执行 → 结算 → 依赖解除            │ │
+│  │                          ↑                                      │ │
+│  │                    BlockedQueue                                  │ │
+│  │                    [节点C(依赖A), 节点D(依赖A,B)]                │ │
+│  └────────────────────────────────────────────────────────────────┘ │
+│                                                                      │
+│  ┌────────────────────────────────────────────────────────────────┐ │
+│  │ LaboratoryEnvironment (suspend_event checkpoint)               │ │
+│  └────────────────────────────────────────────────────────────────┘ │
+│  (config.yaml 驱动 · Headless / HITL 可选)                          │
+├─────────────────────────────────────────────────────────────────────┤
+│  Cognition Layer                                                    │
+│  ┌──────────────────┐  ┌───────────────────────────────────────┐   │
+│  │ SkillLoader (V5)  │  │ LangGraph StateGraph + LLM             │   │
+│  │ Macro-aware SOP   │  │ dag_planner_node (V7.0 DAG Generator) │   │
+│  └──────────────────┘  └───────────────────────────────────────┘   │
+├─────────────────────────────────────────────────────────────────────┤
+│  Middleware Layer ★ 核心资产                                        │
+│  ┌────────────────────────────────────────────────────────────────┐ │
+│  │ MCPToolRegistry ← @mcp_tool(Guard) + Macro                     │ │
+│  │ SpaceMCPCodec(自动握手) · SpaceWire · Gateway                  │ │
+│  │ A2ARouter (Pub/Sub)                                           │ │
+│  └────────────────────────────────────────────────────────────────┘ │
+├─────────────────────────────────────────────────────────────────────┤
+│  Physics Layer — InterlockEngine + TelemetryBus                     │
+│  (正交子系统状态 · 跨系统联锁规则 · ast 安全求值)                     │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -82,26 +99,31 @@ AstroSASF/
 ├── sasf/                           # 【核心框架包 — 零业务词汇】
 │   ├── core/
 │   │   ├── config_loader.py        # YAML 解析 + LLM 工厂
-│   │   ├── orchestrator.py         # 多实验柜编排器
+│   │   ├── models.py              # ★ V7.0 DAG 数据结构
+│   │   ├── orchestrator.py        # ★ V7.0 DAG 双轨调度器
 │   │   └── environment.py          # 5 步装配器 (Headless)
 │   ├── middleware/
 │   │   ├── mcp_registry.py         # @mcp_tool(Guard) + bind_macro()
 │   │   ├── a2a_protocol.py         # A2A Pub/Sub 消息路由
-│   │   ├── codec.py                # 动态字典 Space-MCP 编解码
+│   │   ├── codec.py               # 动态字典 Space-MCP 编解码
 │   │   ├── gateway.py              # 协议转换网关
-│   │   └── virtual_bus.py          # SpaceWire 总线模拟
+│   │   └── virtual_bus.py         # SpaceWire 总线模拟
 │   ├── cognition/
-│   │   ├── state.py                # LangGraph TypedDict
-│   │   ├── graph_builder.py        # StateGraph + 严格 Planner
+│   │   ├── state.py                # LangGraph TypedDict (V7.0)
+│   │   ├── graph_builder.py        # ★ V7.0 DAG Planner
 │   │   └── skill_loader.py         # SKILL.md SOP + Macro 感知
 │   └── physics/
 │       ├── interlock_engine.py     # 正交联锁引擎 (替代 FSM)
 │       └── telemetry_bus.py        # 遥测数据总线
 ├── skills_catalog/
-│   └── fluid_experiment/
+│   ├── fluid_experiment/
+│   │   └── SKILL.md
+│   ├── bio_culture/
+│   │   └── SKILL.md
+│   └── material_synthesis/
 │       └── SKILL.md
 └── examples/
-    └── space_station_demo.py       # V5 全链路演示
+    └── space_station_demo.py       # V7.0 全链路演示
 ```
 
 ---
@@ -114,9 +136,234 @@ pip install -r requirements.txt
 python examples/space_station_demo.py
 ```
 
-## V6.2 核心机制
+---
 
-### 〇、LLM 语义路由 (`cognition/graph_builder.py`)
+## V7.0 核心机制：理论/实践双轨调度
+
+### 概述
+
+V7.0 引入**双轨智能体概念**，将任务规划与任务执行解耦：
+
+| 轨道 | 智能体 | 职责 | 位置 |
+|------|--------|------|------|
+| **理论轨道** | Planner | LLM 生成 DAG 任务图 | `graph_builder.py` |
+| **实践轨道** | Worker | 从队列取节点，执行 MCP Tool | `orchestrator.py` |
+
+### DAG 状态机
+
+```
+PENDING ──┬── 依赖未满足 ──→ 保持在 BlockedQueue
+          │
+          └── 依赖已满足 ──→ READY ──→ 入 ReadyQueue
+                                              │
+READY ─────────────────────────────────────────┤
+    │                                         │
+    ▼                                         ▼
+RUNNING ←── Worker 取节点执行            COMPLETED
+    │                                         │
+    ├─── 执行成功 ──→ mark_completed() ──────┘
+    │                     │
+    │                     └──→ _settle_completed_node()
+    │                              │
+    └─── 执行失败 ──→ mark_failed() ──→ SKIPPED (下游节点)
+```
+
+### 三阶段调度流程
+
+#### 1. 提交阶段 (Submit Phase)
+
+```
+理论智能体 (Planner) 解析任务 → 生成 DAG 任务图
+                                         │
+                                         ▼
+                              ┌─────────────────────┐
+                              │ DAGTaskGraph.validate() │
+                              │  循环依赖检测 (Kahn)     │
+                              └─────────────────────┘
+                                         │
+                    ┌────────────────────┴────────────────────┐
+                    │                                         │
+                    ▼                                         ▼
+           depends_on == []                         depends_on != []
+                    │                                         │
+                    ▼                                         ▼
+           入 ReadyQueue                            入 BlockedQueue
+```
+
+#### 2. 执行阶段 (Execution Phase)
+
+```
+Worker 协程池
+     │
+     ├── Worker-0: 从 ReadyQueue 取节点 → 执行 → mark_completed()
+     ├── Worker-1: 从 ReadyQueue 取节点 → 执行 → mark_completed()
+     └── Worker-N: ...
+```
+
+#### 3. 结算阶段 (Settlement Phase)
+
+```
+节点 A 完成 → _settle_completed_node(A)
+                    │
+                    ▼
+           遍历 BlockedQueue
+                    │
+                    ├── 节点 B (依赖 [A]) → A 已完成 → 移入 ReadyQueue
+                    ├── 节点 C (依赖 [A, D]) → D 未完成 → 保持 Blocked
+                    └── 节点 D (依赖 []) → 无依赖 → 移入 ReadyQueue
+```
+
+### 核心数据结构
+
+#### DAGNode
+
+```python
+@dataclass
+class DAGNode:
+    node_id: str              # 节点唯一标识
+    skill_name: str          # MCP Tool 名称
+    params: dict             # 工具参数
+    dependencies: list[str]   # 依赖节点 ID 列表
+    status: NodeStatus       # PENDING/READY/RUNNING/COMPLETED/FAILED
+    priority: TaskPriority    # CRITICAL/HIGH/NORMAL/LOW
+    graph_id: str            # 所属 DAG 图 ID
+    lab_id: str              # 实验柜 ID
+```
+
+#### DAGTaskGraph
+
+```python
+@dataclass
+class DAGTaskGraph:
+    graph_id: str
+    name: str
+    nodes: dict[str, DAGNode]  # 节点映射
+
+    def validate(self) -> bool:
+        """Kahn 算法检测循环依赖"""
+
+    def get_ready_nodes(self) -> list[DAGNode]:
+        """获取所有就绪节点（依赖已满足）"""
+
+    def topological_sort(self) -> list[DAGNode]:
+        """拓扑排序"""
+
+    def get_execution_levels(self) -> list[list[DAGNode]]:
+        """获取执行层级（同一层可并行）"""
+```
+
+### LLM DAG 生成 Prompt
+
+```python
+DAG_PLANNER_PROMPT_TEMPLATE = '''你是太空实验柜的**理论智能体 (Planner)**，
+负责将用户的自然语言任务解析为**有向无环图 (DAG)** 结构。
+
+## 核心任务
+将用户的任务指令拆解为多个 MCP Tool 原子调用，
+并明确标注它们之间的**前后依赖关系**。
+
+## 输出格式
+[
+  {
+    "id": "唯一标识符",
+    "skill": "白名单中的工具名称",
+    "params": {工具调用参数},
+    "depends_on": ["前置节点ID列表"],
+    "description": "步骤描述"
+  },
+  ...
+]
+
+## 重要约束
+- `depends_on` 为空表示无前置依赖
+- 多个依赖表示 AND 关系（全部完成后才执行）
+- **禁止创建循环依赖**
+'''
+```
+
+### 并发锁机制
+
+```python
+async def _settle_completed_node(self, completed_node, dag_graph):
+    """结算完成的节点，解除下游依赖"""
+    async with self._lock:  # ★ 关键：并发安全
+        still_blocked = []
+        for blocked_node in self._blocked_queue:
+            deps_satisfied = all(
+                dag_graph.nodes[dep_id].status == NodeStatus.COMPLETED
+                for dep_id in blocked_node.dependencies
+            )
+            if deps_satisfied:
+                await self._enqueue_ready_node(blocked_node)
+            else:
+                still_blocked.append(blocked_node)
+        self._blocked_queue = still_blocked
+```
+
+### 循环依赖检测
+
+```python
+def validate(self) -> bool:
+    """Kahn 算法检测循环依赖"""
+    in_degree = {nid: 0 for nid in self.nodes}
+    adj_list = {nid: [] for nid in self.nodes}
+
+    for node_id, node in self.nodes.items():
+        for dep_id in node.dependencies:
+            adj_list[dep_id].append(node_id)
+            in_degree[node_id] += 1
+
+    queue = deque([nid for nid, deg in in_degree.items() if deg == 0])
+    count = 0
+
+    while queue:
+        node_id = queue.popleft()
+        count += 1
+        for neighbor in adj_list[node_id]:
+            in_degree[neighbor] -= 1
+            if in_degree[neighbor] == 0:
+                queue.append(neighbor)
+
+    if count != len(self.nodes):
+        cycle_nodes = [nid for nid in self.nodes if in_degree[nid] > 0]
+        raise ValueError(f"检测到循环依赖！循环节点: {cycle_nodes}")
+```
+
+### DAG 执行示例
+
+```python
+from sasf.core.orchestrator import DAGOrchestrator
+from sasf.core.models import DAGTaskGraph, DAGNode, TaskPriority
+
+# 初始化 DAG 调度器
+orchestrator = DAGOrchestrator(config=config, max_workers=4)
+await orchestrator.start()
+
+# 理论智能体生成 DAG
+dag_plan = [
+    {"id": "init", "skill": "incubator_init", "params": {}, "depends_on": []},
+    {"id": "heat", "skill": "set_temperature", "params": {"target": 37}, "depends_on": ["init"]},
+    {"id": "observe", "skill": "camera_capture", "params": {}, "depends_on": ["init"]},
+    {"id": "analyze", "skill": "ml_analyze", "params": {}, "depends_on": ["heat", "observe"]},
+]
+
+# 构建 DAG 图
+dag_graph = DAGTaskGraph.from_llm_output(dag_plan, lab_id="bio_lab_01")
+
+# 提交执行
+await orchestrator.submit_dag(dag_graph)
+
+# 等待完成
+result = await orchestrator.run_dag(dag_graph)
+print(f"DAG 状态: {result.status}")
+print(f"完成节点: {result.completed_nodes}/{result.total_nodes}")
+```
+
+---
+
+## V6.2 核心机制（向后兼容）
+
+### LLM 语义路由 (`cognition/graph_builder.py`)
 
 **问题**：BM25 等传统 NLP 算法无法处理中文语义，边缘场景下评分全为 0。
 
@@ -128,6 +375,7 @@ LangGraph V6.2 节点流:
 ```
 
 #### Router 工作流
+
 ```
 1. router_node 收到任务 "开始进行太空生物细胞培养"
 2. 构造 Router Prompt：列出所有 SOP name + description
@@ -137,51 +385,19 @@ LangGraph V6.2 节点流:
 ```
 
 #### 异常容错
+
 - JSON 提取失败 → `plan=[]`, `error_msg=LLM原文`, `final_result.status="failed"`
 - LLM 拒绝执行 → 优雅结束，不抛异常
 - 四层 JSON 防护：代码块剥离 → 直接解析 → 正则提取 → ast.literal_eval
 
-#### 多领域知识库
-| 领域 | SKILL.md | 关键工具 |
-|------|----------|----------|
-| 流体实验 | `fluid_experiment` | set_temperature, vacuum, arm |
-| 生物培养 | `bio_culture` | set_temperature(37℃), inject_nutrient |
-| 材料合成 | `material_synthesis` | vacuum, turn_on_laser, set_temperature |
-
 ---
 
-### 〇、优先级抢占式调度内核 (`core/orchestrator.py`)
-
-**问题**：`asyncio.gather` 仅支持同级并发，无法区分任务优先级，更无法在紧急异常时抢占资源。
-
-**方案**：`PriorityQueue` + Worker 协程池 + `asyncio.Event` 抢占/挂起。
-
-```
-优先级枚举:
-  CRITICAL = 0   (紧急异常响应 — 最高)
-  HIGH     = 1   (核心科学任务)
-  NORMAL   = 2   (常规任务)
-  LOW      = 3   (清理/待机)
-```
-
-#### 抢占序列
-
-```
-时刻 T=0    提交 NORMAL 任务 → Worker-0 取出 → 开始执行
-               ┌──────────────────────────────────┐
-时刻 T=2    │ 🚨 CRITICAL 任务入队               │
-               │ → Orchestrator._preempt()        │
-               │ → NORMAL 任务 event.clear() 挂起  │
-               └──────────────────────────────────┘
-            Worker-1 取出 CRITICAL → 执行紧急安全复位
-
-时刻 T=T₁   CRITICAL 完成 → _resume_suspended_tasks()
-            → NORMAL 任务 event.set() 恢复 → 继续执行
-```
-
-#### API
+## V5.1 优先级抢占式调度（向后兼容）
 
 ```python
+# V5.1 API 仍然可用
+from sasf.core.orchestrator import Orchestrator, TaskPriority
+
 scheduler = Orchestrator(config=config, max_workers=2)
 env = scheduler.spawn_laboratory(lab_id="Lab-01", engine=engine, ...)
 
@@ -193,7 +409,7 @@ await scheduler.shutdown()
 
 ---
 
-### 一、正交联锁引擎 (`physics/interlock_engine.py`)
+## 一、正交联锁引擎 (`physics/interlock_engine.py`)
 
 **问题**：单体 FSM 状态数 = 子系统1状态数 × 子系统2 × ... → 状态爆炸。
 
@@ -213,28 +429,24 @@ interlocks:
     message: "温度过高，安全停机"
 ```
 
-联锁表达式通过 `ast.parse()` → 白名单 AST 节点验证 → 安全求值，**不使用 `eval()`**。
-
 ---
 
-### 二、Guard 装饰器 (`middleware/mcp_registry.py`)
+## 二、Guard 装饰器 (`middleware/mcp_registry.py`)
 
 ```python
 @registry.mcp_tool(
     require_states={"thermal": "IDLE"},    # 前提：thermal 必须 IDLE
     forbid_states={"vacuum": "ACTIVE"},    # 禁止：vacuum 不能 ACTIVE
-    telemetry_rules=["temperature < 80"],  # 遥测：温度必须 < 80℃
+    telemetry_rules=["temperature < 80"],   # 遥测：温度必须 < 80℃
 )
 async def set_temperature(ctx: MCPToolContext, target: float) -> dict:
     """设置舱内温度目标值（℃）"""
     ...
 ```
 
-`invoke()` 自动在执行前检查所有 Guard 条件，不满足则抛出 `SecurityGuardrailException`。
-
 ---
 
-### 三、Macro 参数预绑定
+## 三、Macro 参数预绑定
 
 ```python
 registry.bind_macro("heat_to_50", "set_temperature", {"target": 50.0},
@@ -244,37 +456,6 @@ registry.bind_macro("heat_to_50", "set_temperature", {"target": 50.0},
 - Macro 注册为独立 Tool，对 LLM **零参数或少参数**调用
 - Codec 词表**自动包含** Macro 名
 - SkillLoader 在 Prompt 中**自动引导** LLM 优先调用 Macro
-
----
-
-### 四、Codec 词表自动握手
-
-```
-1. MCPToolRegistry 注册 Tools + bind_macro()
-2. registry.all_vocabulary() 返回完整词汇表（含 Macro 名）
-3. SpaceMCPCodec 按字母序自动分配 Token ID
-
-   0x01 ← 'activate'
-   0x02 ← 'arm_home'          ← Macro!
-   0x03 ← 'arm_to_dock'       ← Macro!
-   ...
-```
-
-**零代码维护**：新增 Tool 或 Macro → 词表自动更新。
-
----
-
-### 五、Macro 感知 SOP (`cognition/skill_loader.py`)
-
-SkillLoader 接收 Registry 引用，在 `get_all_skills_context()` 中自动追加：
-
-```
-## 🔗 可用宏指令 (Macro)
-- `heat_to_50` → set_temperature({"target": 50.0}) — 快速加热到 50℃
-- `arm_to_observation` → move_robotic_arm({"target_angle": 45.0}) — 观测位
-```
-
-LLM 可直接调用 `heat_to_50` 而非 `set_temperature(target=50)`。
 
 ---
 
@@ -289,6 +470,18 @@ LLM 可直接调用 `heat_to_50` 而非 `set_temperature(target=50)`。
 | 安全求值 | ast.parse + 白名单节点遍历 |
 | 二进制编码 | struct (标准库) |
 | 并发 | asyncio (标准库) |
+| DAG 调度 | asyncio.PriorityQueue + asyncio.Lock |
+
+---
+
+## 版本历史
+
+| 版本 | 日期 | 变化 |
+|------|------|------|
+| V7.0 | 2026-03 | **双轨调度**：DAG 依赖图 + 理论/实践智能体分离 |
+| V6.2 | 2026-01 | **语义路由**：LLM router_node 替代 BM25 |
+| V5.1 | 2025-10 | **优先级调度**：PriorityQueue + 抢占机制 |
+| V5.0 | 2025-08 | **正交联锁**：FSM → InterlockEngine |
 
 ---
 

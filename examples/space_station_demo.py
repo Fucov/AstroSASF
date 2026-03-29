@@ -24,7 +24,8 @@ if str(root_dir) not in sys.path:
     sys.path.insert(0, str(root_dir))
 # ---------------------------------------
 from sasf.core.config_loader import load_config
-from sasf.core.orchestrator import Orchestrator, TaskPriority
+from sasf.core.orchestrator import DAGOrchestrator, TaskPriority
+from sasf.core.models import DAGTaskGraph, DAGNode, NodeStatus
 from sasf.middleware.mcp_registry import MCPToolContext, MCPToolRegistry
 from sasf.physics.interlock_engine import InterlockEngine
 from sasf.physics.telemetry_bus import TelemetryBus
@@ -232,8 +233,8 @@ async def main() -> None:
 ║    ██║  ██║███████║   ██║   ██║  ██║╚██████╔╝                ║
 ║    ╚═╝  ╚═╝╚══════╝   ╚═╝   ╚═╝  ╚═╝ ╚═════╝                 ║
 ║                                                              ║
-║    S A S F  v6.0  ·  Lightweight Edge-RAG                    ║
-║    BM25-lite (Zero Deps) + Multi-Domain Knowledge            ║
+║    S A S F  v7.0  ·  Dual-Track DAG Scheduling               ║
+║    Theory Agent (Planner) + Practice Agent (Worker)          ║
 ║                                                              ║
 ╚══════════════════════════════════════════════════════════════╝
 """)
@@ -248,7 +249,7 @@ async def main() -> None:
     )
 
     # ── 3) 创建调度器 ── #
-    scheduler = Orchestrator(config=config, max_workers=1)
+    scheduler = DAGOrchestrator(config=config, max_workers=1)
 
     # ── 4) 创建实验柜 ── #
     env = scheduler.spawn_laboratory(
@@ -296,26 +297,32 @@ async def main() -> None:
     for desc, prio in tasks:
         logger.info("    📋 [%s] %s", prio.name, desc)
 
-    # ── 7) 启动调度器 + 提交任务 ── #
-    await scheduler.start()
-
-    for desc, prio in tasks:
-        await scheduler.submit_task(
+    # ── 7) 构建 DAG 图 + 提交任务 ── #
+    import uuid
+    dag_graph = DAGTaskGraph(
+        graph_id=str(uuid.uuid4()),
+        name="Space-Station-Multi-Domain"
+    )
+    for i, (desc, prio) in enumerate(tasks):
+        node = DAGNode(
+            node_id=f"task-{i}",
+            skill_name=desc,
             lab_id="Lab-Alpha",
-            description=desc,
             priority=prio,
         )
+        dag_graph.add_node(node)
 
-    # ── 8) 等待完成 ── #
-    await scheduler._queue.join()
-    completed = await scheduler.shutdown()
+    await scheduler.submit_dag(dag_graph)
+
+    # ── 8) DAG 执行 (等待完成) ── #
+    result = await scheduler.run_dag(dag_graph)
 
     # ── 9) 结果汇总 ── #
     final_telemetry = await env.get_telemetry()
 
     logger.info("")
     logger.info("╔" + "═" * 60 + "╗")
-    logger.info("║     📊 AstroSASF V6.0 结果汇总                             ║")
+    logger.info("║     📊 AstroSASF V7.0 DAG 执行结果                           ║")
     logger.info("╚" + "═" * 60 + "╝")
     logger.info("")
 
@@ -335,23 +342,21 @@ async def main() -> None:
     )
     logger.info("  │")
 
-    logger.info("  │  📋 调度统计:")
-    logger.info("  │     总完成任务    : %d", len(completed))
-    for t in completed:
-        logger.info(
-            "  │     [%s] %-8s %s → %s",
-            t.task_id[:8],
-            t.priority.name,
-            t.description[:25],
-            t.status,
-        )
+    logger.info("  │  📋 DAG 执行统计:")
+    logger.info("  │     图 ID         : %s", result.graph_id)
+    logger.info("  │     状态          : %s", result.status)
+    logger.info("  │     总节点数      : %d", result.total_nodes)
+    logger.info("  │     完成节点数    : %d", result.completed_nodes)
+    logger.info("  │     失败节点数    : %d", result.failed_nodes)
+    logger.info("  │     总耗时        : %.2fs", result.total_time)
+    logger.info("  │     执行层级      : %d", result.execution_levels)
     logger.info("  │")
 
     logger.info("  │  📨 A2A: %s", env.a2a_stats)
     logger.info("  └──────────────────────────────────────────────────")
 
     logger.info("")
-    logger.info("AstroSASF V6.0 运行完毕。🚀")
+    logger.info("AstroSASF V7.0 运行完毕。🚀")
 
 
 if __name__ == "__main__":

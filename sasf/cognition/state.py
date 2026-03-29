@@ -1,22 +1,26 @@
 """
-AstroSASF · Cognition · State (V6.2)
+AstroSASF · Cognition · State (V7.0)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 LangGraph 状态定义。
 
-V6.2 变化：
-- 新增 ``selected_skill`` 字段（router_node 写入，planner_node 读取）
-- 新增 ``error_msg`` 字段（LLM 拒绝/无法解析时存储自然语言说明）
+V7.0 变化：
+- 新增 ``dag_graph`` 字段（dag_planner_node 生成）
+- 新增 ``dag_error`` 字段（DAG 生成/验证失败说明）
 """
 
 from __future__ import annotations
 
 from typing import Any, TypedDict
 
+from sasf.core.models import DAGTaskGraph
+
 
 class SkillStep(TypedDict):
     """单个 Skill 调用步骤。"""
+    id: str
     skill: str
     params: dict[str, Any]
+    depends_on: list[str]
 
 
 class ExecutionLogEntry(TypedDict, total=False):
@@ -30,7 +34,7 @@ class ExecutionLogEntry(TypedDict, total=False):
 
 
 class LabGraphState(TypedDict, total=False):
-    """LangGraph 状态图的完整状态 (V6.2)。"""
+    """LangGraph 状态图的完整状态 (V7.0)。"""
     original_task: str
     selected_skill: str | None       # V6.2: router_node 选中的 SOP 名称
     plan: list[SkillStep]
@@ -41,3 +45,6 @@ class LabGraphState(TypedDict, total=False):
     error_count: int
     error_msg: str | None             # V6.2: LLM 拒绝/解析失败时的说明
     final_result: dict[str, Any] | None
+    # V7.0: DAG 模式
+    dag_graph: DAGTaskGraph | None
+    dag_error: str | None

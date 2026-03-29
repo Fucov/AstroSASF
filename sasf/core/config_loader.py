@@ -52,6 +52,7 @@ class MiddlewareConfig:
 class OrchestratorConfig:
     """编排器配置。"""
     max_concurrent_labs: int
+    dag_execution_timeout: float = 3600.0  # DAG 执行超时（秒）
 
 
 @dataclass(frozen=True)
@@ -108,6 +109,7 @@ def load_config(path: str | Path | None = None) -> SASFConfig:
         ),
         orchestrator=OrchestratorConfig(
             max_concurrent_labs=orch_raw.get("max_concurrent_labs", 3),
+            dag_execution_timeout=orch_raw.get("dag_execution_timeout", 3600.0),
         ),
     )
 
@@ -128,6 +130,7 @@ def _default_config() -> SASFConfig:
         ),
         orchestrator=OrchestratorConfig(
             max_concurrent_labs=3,
+            dag_execution_timeout=3600.0,
         ),
     )
 
