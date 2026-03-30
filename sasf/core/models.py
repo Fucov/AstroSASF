@@ -1,7 +1,10 @@
 """
-AstroSASF · Core · Models (V7.0 — Dual-Track DAG Scheduling)
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+AstroSASF · Core · Models (V7.1 — Dual-Track DAG Scheduling + LLM Instrumentation)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 理论/实践双轨调度机制的核心数据结构。
+
+V7.1 新增：
+- LLM 算力埋点字段：planner_llm_calls, planner_time_ms, worker_llm_calls
 
 核心概念：
 - DAGNode: DAG 图中的单个节点，代表一个可执行的任务单元
@@ -9,7 +12,7 @@ AstroSASF · Core · Models (V7.0 — Dual-Track DAG Scheduling)
 - 状态机: PENDING → READY → RUNNING → COMPLETED/FAILED
 
 Author: AstroSASF Team
-Version: 7.0
+Version: 7.1
 """
 
 from __future__ import annotations
@@ -693,7 +696,13 @@ class DAGTaskGraph:
 
 @dataclass
 class DAGExecutionResult:
-    """DAG 执行结果摘要。"""
+    """DAG 执行结果摘要 (V7.1)。
+
+    V7.1 新增埋点字段：
+    - planner_llm_calls: 理论智能体调用大模型的次数
+    - planner_time_ms: 生成 DAG 的纯规划耗时（毫秒）
+    - worker_llm_calls: 实践智能体调用大模型的次数（通常为 0）
+    """
     graph_id: str
     status: str  # "completed", "failed", "partial"
     total_nodes: int
@@ -702,6 +711,10 @@ class DAGExecutionResult:
     total_time: float
     execution_levels: int
     node_results: list[dict[str, Any]] = field(default_factory=list)
+    # V7.1: LLM 算力埋点
+    planner_llm_calls: int = 0      # 理论智能体调用大模型的次数
+    planner_time_ms: float = 0.0    # 生成 DAG 的纯规划耗时（毫秒）
+    worker_llm_calls: int = 0       # 实践智能体调用大模型的次数（强控为 0）
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -713,6 +726,10 @@ class DAGExecutionResult:
             "total_time": self.total_time,
             "execution_levels": self.execution_levels,
             "node_results": self.node_results,
+            # V7.1: LLM 埋点
+            "planner_llm_calls": self.planner_llm_calls,
+            "planner_time_ms": self.planner_time_ms,
+            "worker_llm_calls": self.worker_llm_calls,
         }
 
 

@@ -1,7 +1,10 @@
 """
-AstroSASF · Cognition · GraphBuilder (V7.0 — Dual-Track DAG Scheduling)
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+AstroSASF · Cognition · GraphBuilder (V7.1 — Dual-Track DAG Scheduling + LLM Instrumentation)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 LangGraph 状态图工作流构建器，支持理论/实践双轨调度。
+
+V7.1 核心变化：
+- 新增 LLM 算力埋点：planner_llm_calls, planner_time_ms
 
 V7.0 核心变化：
 - 新增 ``dag_planner_node``：LLM 生成 DAG 任务图（带依赖关系）
@@ -16,6 +19,7 @@ import ast as _ast
 import json
 import logging
 import re
+import time
 from typing import Any
 
 from langgraph.graph import END, StateGraph
@@ -319,7 +323,11 @@ def build_lab_graph(
     # ================================================================== #
 
     async def dag_planner_node(state: LabGraphState) -> dict[str, Any]:
-        """理论智能体：生成带依赖关系的 DAG 任务图。"""
+        """理论智能体：生成带依赖关系的 DAG 任务图。
+
+        V7.1 新增埋点：在 LLM 请求前后使用 time.perf_counter() 记录耗时，
+        并在返回的 State 中累加 planner_llm_calls = 1。
+        """
         task = state["original_task"]
         selected_skill = state.get("selected_skill")
 
@@ -360,11 +368,19 @@ def build_lab_graph(
             task=task,
         )
 
+        # ── V7.1: LLM 算力埋点 ── #
+        planner_llm_calls = 1  # 理论智能体每次调用 LLM 一次
+        t0 = time.perf_counter()
+
         try:
             response = await llm.ainvoke(prompt)
             raw_text = response.content if hasattr(response, "content") else str(response)
         except Exception as exc:
-            logger.error("[%s] 🧠 DAG Planner LLM 调用失败: %s", lab_id, exc)
+            elapsed_ms = (time.perf_counter() - t0) * 1000
+            logger.error(
+                "[%s] 🧠 DAG Planner LLM 调用失败: %s (耗时: %.2fms)",
+                lab_id, exc, elapsed_ms,
+            )
             return {
                 "dag_graph": None,
                 "dag_error": f"DAG Planner LLM 调用失败: {exc}",
@@ -373,8 +389,13 @@ def build_lab_graph(
                     "status": "failed",
                     "reason": f"DAG Planner LLM 调用失败: {exc}",
                 },
+                # V7.1 埋点
+                "planner_llm_calls": planner_llm_calls,
+                "planner_time_ms": elapsed_ms,
             }
 
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+        logger.info("[%s] 🧠 DAG Planner LLM 调用完成 (耗时: %.2fms)", lab_id, elapsed_ms)
         logger.info("[%s] 🧠 DAG Planner LLM 输出:\n%s", lab_id, raw_text)
 
         # ── JSON 提取 ── #
@@ -390,6 +411,9 @@ def build_lab_graph(
                     "status": "failed",
                     "reason": f"DAG Planner 无法生成有效计划: {raw_text[:200]}",
                 },
+                # V7.1 埋点
+                "planner_llm_calls": planner_llm_calls,
+                "planner_time_ms": elapsed_ms,
             }
 
         if not isinstance(dag_plan, list):
@@ -407,6 +431,9 @@ def build_lab_graph(
                     "status": "failed",
                     "reason": f"DAG 结构验证失败: {issues}",
                 },
+                # V7.1 埋点
+                "planner_llm_calls": planner_llm_calls,
+                "planner_time_ms": elapsed_ms,
             }
 
         # ── 循环依赖检测 ── #
@@ -421,6 +448,9 @@ def build_lab_graph(
                     "status": "failed",
                     "reason": f"检测到循环依赖: {cycle_nodes}",
                 },
+                # V7.1 埋点
+                "planner_llm_calls": planner_llm_calls,
+                "planner_time_ms": elapsed_ms,
             }
 
         # ── 构建 DAGTaskGraph ── #
@@ -445,6 +475,9 @@ def build_lab_graph(
                     "status": "failed",
                     "reason": f"DAG 图构建失败: {exc}",
                 },
+                # V7.1 埋点
+                "planner_llm_calls": planner_llm_calls,
+                "planner_time_ms": elapsed_ms,
             }
 
         a2a_router.route(
@@ -460,11 +493,20 @@ def build_lab_graph(
         # 打印 DAG 结构
         _log_dag_structure(lab_id, dag_graph)
 
+        # V7.1: 打印 LLM 埋点统计
+        logger.info(
+            "[%s] 🧠 DAG Planner 埋点统计: planner_llm_calls=%d, planner_time_ms=%.2f",
+            lab_id, planner_llm_calls, elapsed_ms,
+        )
+
         return {
             "dag_graph": dag_graph,
             "dag_error": None,
             "plan": dag_plan,
             "final_result": None,
+            # V7.1 埋点
+            "planner_llm_calls": planner_llm_calls,
+            "planner_time_ms": elapsed_ms,
         }
 
     # ================================================================== #

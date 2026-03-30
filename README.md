@@ -1,6 +1,6 @@
 # AstroSASF — Astro Scientific Agent Scheduling Framework
 
-> 面向太空实验室的科学智能体调度框架 · Edge-RAG + **硬件级抢占** + **动态优先级 Aging** + 正交联锁 + Guard + Macro + **DAG 双轨调度**
+> 面向太空实验室的科学智能体调度框架 · Edge-RAG + **硬件级抢占** + **动态优先级 Aging** + **LLM 算力埋点** + 正交联锁 + Guard + Macro + **DAG 双轨调度**
 
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
 [![LangGraph](https://img.shields.io/badge/LangGraph-StateGraph-orange.svg)](https://github.com/langchain-ai/langgraph)
@@ -16,7 +16,7 @@ AstroSASF 是面向空间站科学实验柜的**多智能体协作调度框架**
 
 ### V7.1 核心设计
 
-> **理论/实践双轨调度** + **DAG 依赖图** + **LLM 语义路由** + **硬件级抢占** + **动态优先级 Aging** + **正交联锁** + **Guard** + **Macro**。
+> **理论/实践双轨调度** + **DAG 依赖图** + **LLM 语义路由** + **LLM 算力埋点** + **硬件级抢占** + **动态优先级 Aging** + **正交联锁** + **Guard** + **Macro**。
 
 | 概念 | 层级 | 本质 | 管理者 |
 |------|------|------|--------|
@@ -48,6 +48,7 @@ AstroSASF 是面向空间站科学实验柜的**多智能体协作调度框架**
 | **硬件级抢占 (V7.1)** | `telemetry_bus.py` | TelemetryBus 监测危险条件，注入 CRITICAL 逃生任务 |
 | **LLM Task Cancel (V7.1)** | `orchestrator.py` | 硬件中断时强行 Cancel 正在进行的 LLM 推理 |
 | **动态优先级 Aging (V7.1)** | `models.py` | 防止低优任务饿死，队列周期性重平衡 |
+| **LLM 算力埋点 (V7.1)** | `graph_builder.py` | 统计 planner_llm_calls、planner_time_ms 等指标 |
 
 ---
 
@@ -193,7 +194,11 @@ AstroSASF/
 │   │   └── SKILL.md
 │   ├── bio_culture/
 │   │   └── SKILL.md
-│   └── material_synthesis/
+│   ├── material_synthesis/
+│   │   └── SKILL.md
+│   ├── emergency_fire_response/     # V7.1 新增：火情应急响应
+│   │   └── SKILL.md
+│   └── plant_growth_monitor/        # V7.1 新增：植物生长监测
 │       └── SKILL.md
 └── examples/
     └── space_station_demo.py       # V7.0 全链路演示
@@ -208,6 +213,110 @@ ollama serve && ollama pull qwen2.5:7b
 pip install -r requirements.txt
 python examples/space_station_demo.py
 ```
+
+---
+
+## V7.1 LLM 算力埋点机制
+
+### 设计背景
+
+在大规模数据集评测中，需要精确统计 LLM 推理的开销，以证明 DAG-OS 极大地节省了 LLM 推理成本。
+
+### 核心字段
+
+```python
+@dataclass
+class DAGExecutionResult:
+    graph_id: str
+    status: str
+    total_nodes: int
+    completed_nodes: int
+    failed_nodes: int
+    total_time: float
+    execution_levels: int
+    node_results: list[dict]
+    # V7.1: LLM 算力埋点
+    planner_llm_calls: int = 0      # 理论智能体调用大模型的次数
+    planner_time_ms: float = 0.0    # 生成 DAG 的纯规划耗时（毫秒）
+    worker_llm_calls: int = 0       # 实践智能体调用大模型的次数（强控为 0）
+```
+
+### 埋点实现
+
+#### 1. `LabGraphState` 埋点字段
+
+```python
+class LabGraphState(TypedDict, total=False):
+    # ... 原有字段 ...
+    # V7.1: LLM 算力埋点
+    planner_llm_calls: int            # 理论智能体调用大模型的次数
+    planner_time_ms: float            # 生成 DAG 的纯规划耗时（毫秒）
+```
+
+#### 2. `dag_planner_node` 埋点代码
+
+```python
+async def dag_planner_node(state: LabGraphState) -> dict[str, Any]:
+    # V7.1: LLM 算力埋点
+    planner_llm_calls = 1  # 理论智能体每次调用 LLM 一次
+    t0 = time.perf_counter()
+
+    response = await llm.ainvoke(prompt)
+    elapsed_ms = (time.perf_counter() - t0) * 1000
+
+    return {
+        # ... 原有字段 ...
+        # V7.1 埋点
+        "planner_llm_calls": planner_llm_calls,
+        "planner_time_ms": elapsed_ms,
+    }
+```
+
+#### 3. `run_dag` 封装埋点数据
+
+```python
+async def run_dag(
+    self,
+    dag_graph: DAGTaskGraph,
+    planner_llm_calls: int = 0,
+    planner_time_ms: float = 0.0,
+) -> DAGExecutionResult:
+    # ... 执行 DAG ...
+    result.planner_llm_calls = planner_llm_calls
+    result.planner_time_ms = planner_time_ms
+    result.worker_llm_calls = 0  # 实践智能体强控为 0
+
+    logger.info(
+        "[DAG调度器] V7.1 LLM 埋点统计: graph_id=%s, "
+        "planner_llm_calls=%d, planner_time_ms=%.2f, worker_llm_calls=%d",
+        result.graph_id, result.planner_llm_calls, result.planner_time_ms, result.worker_llm_calls,
+    )
+    return result
+```
+
+### 使用示例
+
+```python
+# V7.1: 从 LangGraph 最终状态提取埋点数据
+result = await orchestrator.run_dag(
+    dag_graph=dag_graph,
+    planner_llm_calls=state.get("planner_llm_calls", 0),
+    planner_time_ms=state.get("planner_time_ms", 0.0),
+)
+
+print(f"LLM 调用次数: {result.planner_llm_calls}")
+print(f"LLM 规划耗时: {result.planner_time_ms:.2f}ms")
+print(f"实践智能体 LLM 调用: {result.worker_llm_calls}")
+```
+
+### 理论分析
+
+| 模式 | planner_llm_calls | worker_llm_calls | 总 LLM 调用 |
+|------|------------------|------------------|-------------|
+| V6.2 线性模式 | N 个步骤 × 1 次修正 = N+1 | 0 | N+1 |
+| V7.0 DAG 模式 | 1 次 DAG 生成 | 0 | 1 |
+
+> **结论**：V7.0 DAG 模式将 LLM 调用从 O(N) 降低到 O(1)，其中 N 为任务步骤数。
 
 ---
 
@@ -551,6 +660,7 @@ registry.bind_macro("heat_to_50", "set_temperature", {"target": 50.0},
 
 | 版本 | 日期 | 变化 |
 |------|------|------|
+| V7.1 | 2026-03 | **LLM 算力埋点**：planner_llm_calls、planner_time_ms、worker_llm_calls |
 | V7.0 | 2026-03 | **双轨调度**：DAG 依赖图 + 理论/实践智能体分离 |
 | V6.2 | 2026-01 | **语义路由**：LLM router_node 替代 BM25 |
 | V5.1 | 2025-10 | **优先级调度**：PriorityQueue + 抢占机制 |

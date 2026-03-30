@@ -728,8 +728,18 @@ class DAGOrchestrator:
     #  便捷方法                                                                  #
     # --------------------------------------------------------------------------- #
 
-    async def run_dag(self, dag_graph: DAGTaskGraph) -> DAGExecutionResult:
-        """一站式执行 DAG 图：启动 → 提交 → 等待完成 → 关闭。"""
+    async def run_dag(
+        self,
+        dag_graph: DAGTaskGraph,
+        planner_llm_calls: int = 0,
+        planner_time_ms: float = 0.0,
+    ) -> DAGExecutionResult:
+        """一站式执行 DAG 图：启动 → 提交 → 等待完成 → 关闭。
+
+        V7.1 新增参数：
+        - planner_llm_calls: 理论智能体调用大模型的次数（来自 LangGraph state）
+        - planner_time_ms: 生成 DAG 的纯规划耗时（来自 LangGraph state）
+        """
         await self.start()
         await self.submit_dag(dag_graph)
 
@@ -746,10 +756,23 @@ class DAGOrchestrator:
             )
 
         results = await self.shutdown()
-        return results[0] if results else self._build_dag_result(dag_graph)
+        result = results[0] if results else self._build_dag_result(dag_graph)
+
+        # V7.1: 封装 LLM 埋点数据
+        result.planner_llm_calls = planner_llm_calls
+        result.planner_time_ms = planner_time_ms
+        result.worker_llm_calls = 0  # 实践智能体强控为 0
+
+        logger.info(
+            "[DAG调度器] V7.1 LLM 埋点统计: graph_id=%s, "
+            "planner_llm_calls=%d, planner_time_ms=%.2f, worker_llm_calls=%d",
+            result.graph_id, result.planner_llm_calls, result.planner_time_ms, result.worker_llm_calls,
+        )
+
+        return result
 
     def _build_dag_result(self, dag_graph: DAGTaskGraph) -> DAGExecutionResult:
-        """构建 DAG 执行结果。"""
+        """构建 DAG 执行结果（不含埋点数据，埋点由 run_dag 注入）。"""
         total_time = (
             max(n.end_time or 0 for n in dag_graph.nodes.values()) -
             dag_graph.created_at

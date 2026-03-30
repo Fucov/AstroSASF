@@ -1,7 +1,11 @@
 """
-AstroSASF · Cognition · State (V7.0)
+AstroSASF · Cognition · State (V7.1)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 LangGraph 状态定义。
+
+V7.1 变化：
+- 新增 ``planner_llm_calls`` 字段（理论智能体调用大模型的次数）
+- 新增 ``planner_time_ms`` 字段（生成 DAG 的纯规划耗时）
 
 V7.0 变化：
 - 新增 ``dag_graph`` 字段（dag_planner_node 生成）
@@ -34,7 +38,12 @@ class ExecutionLogEntry(TypedDict, total=False):
 
 
 class LabGraphState(TypedDict, total=False):
-    """LangGraph 状态图的完整状态 (V7.0)。"""
+    """LangGraph 状态图的完整状态 (V7.1)。
+
+    V7.1 新增埋点字段：
+    - planner_llm_calls: 理论智能体调用大模型的次数
+    - planner_time_ms: 生成 DAG 的纯规划耗时（毫秒）
+    """
     original_task: str
     selected_skill: str | None       # V6.2: router_node 选中的 SOP 名称
     plan: list[SkillStep]
@@ -48,3 +57,6 @@ class LabGraphState(TypedDict, total=False):
     # V7.0: DAG 模式
     dag_graph: DAGTaskGraph | None
     dag_error: str | None
+    # V7.1: LLM 算力与耗时埋点
+    planner_llm_calls: int            # 理论智能体调用大模型的次数
+    planner_time_ms: float            # 生成 DAG 的纯规划耗时（毫秒）
