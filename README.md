@@ -200,6 +200,13 @@ AstroSASF/
 │   │   └── SKILL.md
 │   └── plant_growth_monitor/        # V7.1 新增：植物生长监测
 │       └── SKILL.md
+├── datasets/                         # V7.1 新增：评测数据集
+│   └── astro_bench.jsonl             # 50 条标准化测试数据
+├── tools/                             # V7.1 新增：工具脚本
+│   └── generate_dataset.py           # 数据集生成器
+├── benchmarks/                        # V7.1 新增：基准测试
+│   ├── run_dataset_eval.py           # 数据集评测运行器
+│   └── dataset_report.json           # 评测报告输出
 └── examples/
     └── space_station_demo.py       # V7.0 全链路演示
 ```
@@ -641,6 +648,82 @@ registry.bind_macro("heat_to_50", "set_temperature", {"target": 50.0},
 
 ---
 
+## V7.1 数据集与基准测试
+
+### 数据集结构
+
+```python
+class ChaosEvent(BaseModel):
+    trigger_time_sec: float      # 触发时间（秒）
+    type: str                    # "hardware_delay" 或 "telemetry_alarm"
+    target_tool: str | None      # 目标工具
+    delay_multiplier: float | None  # 延迟倍数
+    telemetry_key: str | None    # 遥测键名
+    override_value: float | None  # 遥测覆盖值
+
+class BenchmarkEpisode(BaseModel):
+    episode_id: str              # bench-YYYYMMDD-XXXXXX
+    difficulty: str              # Easy / Medium / Hard
+    description: str              # 场景描述
+    astronaut_prompts: list[str]  # 并发指令
+    initial_telemetry: dict      # 初始遥测状态
+    chaos_events: list[ChaosEvent]  # 混沌事件
+```
+
+### 数据集生成
+
+```bash
+# 生成 50 条评测数据
+python tools/generate_dataset.py
+```
+
+### 难度分布
+
+| 难度 | 数量 | Prompt 数 | 冲突 | Chaos |
+|------|------|-----------|------|-------|
+| **Easy** | 15 条 | 2-3 个 | 无冲突 | 无 |
+| **Medium** | 20 条 | 3-4 个 | 强资源冲突 | hardware_delay（2.5-4x） |
+| **Hard** | 15 条 | 4-5 个 | 极限并发 | hardware_delay + telemetry_alarm（5-8s 触发） |
+
+### Ablation Study 对比测试
+
+```bash
+# 运行完整评测
+python benchmarks/run_dataset_eval.py
+```
+
+#### Baseline 组配置
+```python
+num_workers = 1          # 单 Worker 串行
+enable_chaos = False     # 不注入混沌事件
+enable_preemption = False # 不启用抢占
+```
+
+#### DAG-OS 组配置
+```python
+num_workers = 4           # 多 Worker 并发
+enable_chaos = True      # 注入混沌事件
+enable_preemption = True # 启用硬件级抢占
+```
+
+### 输出报告
+
+```
+benchmarks/dataset_report.json  # 详细报告（JSON 格式）
+终端 Markdown 表格              # 汇总对比
+```
+
+### 核心指标
+
+| 指标 | 说明 |
+|------|------|
+| Average Makespan | 平均总耗时（秒） |
+| Overall LLM Calls | 总大模型调用次数 |
+| Hard Survival Rate | Hard 级别无死锁且成功逃生的百分比 |
+| Avg Preemption Latency | 平均抢占延迟（毫秒，仅 DAG-OS） |
+
+---
+
 ## 技术栈
 
 | 组件 | 技术 |
@@ -660,7 +743,7 @@ registry.bind_macro("heat_to_50", "set_temperature", {"target": 50.0},
 
 | 版本 | 日期 | 变化 |
 |------|------|------|
-| V7.1 | 2026-03 | **LLM 算力埋点**：planner_llm_calls、planner_time_ms、worker_llm_calls |
+| V7.1 | 2026-03 | **数据集与基准测试**：astro_bench.jsonl + run_dataset_eval.py + LLM 算力埋点 |
 | V7.0 | 2026-03 | **双轨调度**：DAG 依赖图 + 理论/实践智能体分离 |
 | V6.2 | 2026-01 | **语义路由**：LLM router_node 替代 BM25 |
 | V5.1 | 2025-10 | **优先级调度**：PriorityQueue + 抢占机制 |
