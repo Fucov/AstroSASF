@@ -112,6 +112,97 @@ orchestrator.register_lab_hardware_alarm(
 
 ---
 
+## V7.1 物理模拟层
+
+### 设计背景
+
+在真实的硬件控制场景中，物理操作需要真实的耗时。V7.0 版本的 MCP Tools 缺乏真实的物理耗时模拟，导致报警触发时任务已经结束。
+
+### 核心机制
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  MCP Tools (V7.1 物理模拟)                                            │
+│                                                                      │
+│  ┌────────────────────────────────────────────────────────────────┐ │
+│  │  move_robotic_arm(target_angle)                                  │ │
+│  │  • 速度限制: 15.0 度/秒                                          │ │
+│  │  • 耗时计算: abs(target - current) / 15.0                       │ │
+│  │  • try: await asyncio.sleep(duration)                           │ │
+│  │  • except asyncio.CancelledError: 记录中断位置                    │ │
+│  └────────────────────────────────────────────────────────────────┘ │
+│                              │                                       │
+│  ┌────────────────────────────────────────────────────────────────┐ │
+│  │  set_temperature(target)                                         │ │
+│  │  • 升/降温速率: 2.0℃/秒                                           │ │
+│  │  • 耗时计算: abs(target - current) / 2.0                         │ │
+│  └────────────────────────────────────────────────────────────────┘ │
+│                              │                                       │
+│  ┌────────────────────────────────────────────────────────────────┐ │
+│  │  inject_nutrient(volume_ml)                                     │ │
+│  │  • 泵速: 20.0 mL/秒                                               │ │
+│  │  • 耗时计算: volume_ml / 20.0                                   │ │
+│  └────────────────────────────────────────────────────────────────┘ │
+│                              │                                       │
+│  ┌────────────────────────────────────────────────────────────────┐ │
+│  │  toggle_vacuum_pump(activate)                                   │ │
+│  │  • 固定耗时: 4.0 秒                                               │ │
+│  └────────────────────────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### 紧急制动处理
+
+当硬件报警触发时，正在执行的物理操作会被 `asyncio.CancelledError` 中断：
+
+```python
+async def move_robotic_arm(ctx, target_angle):
+    await ctx.engine.set_subsystem_state("arm", "MOVING")
+
+    try:
+        await asyncio.sleep(duration)  # 物理运动耗时
+        await ctx.bus.write("robotic_arm_angle", target_angle)
+    except asyncio.CancelledError:
+        # ★ 关键：计算并记录中断瞬间的实际位置
+        elapsed = current_time - start_time
+        actual_angle = current_angle + (target - current_angle) * (elapsed / duration)
+        await ctx.bus.write("robotic_arm_angle", actual_angle)  # 停在半途
+        raise
+    finally:
+        await ctx.engine.set_subsystem_state("arm", "IDLE")
+```
+
+### 新增子系统
+
+| 子系统 | 状态 | 说明 |
+|-------|------|------|
+| `life_support` | IDLE, VENTILATING | 通风/除碳系统 |
+| `safety` | NORMAL, ALERT | 安全监控状态 |
+| `greenhouse` | IDLE, WATERING, LIGHTING | 温室种植系统 |
+
+### 新增联锁规则
+
+| 条件 | 消息 | 作用域 |
+|-----|------|--------|
+| `co2_level >= 1000.0` | 禁止燃烧实验（激光/加热） | turn_on_laser, set_temperature |
+| `smoke_level > 0.1` | 烟雾检测到，强制停机 | move_robotic_arm |
+| `flame_detected == 1` | 火焰检测到，强制停机 | 全局 |
+| `co2_level >= 800.0 and life_support == 'IDLE'` | CO2 过高，生命支持应切换 VENTILATING | - |
+| `temperature >= 60 and arm == 'MOVING'` | 高温环境下禁止精密操作 | move_robotic_arm |
+
+### 新增遥测变量
+
+| 变量 | 类型 | 说明 |
+|-----|------|------|
+| `co2_level` | float | CO2 浓度 (ppm) |
+| `smoke_level` | float | 烟雾浓度 (0-1) |
+| `flame_detected` | int | 火焰检测 (0/1) |
+| `soil_moisture` | float | 土壤湿度 (%) |
+| `grow_light_active` | bool | 生长灯状态 |
+| `ventilation_active` | bool | 通风系统状态 |
+
+---
+
 ## 系统架构
 
 ```
@@ -743,7 +834,7 @@ benchmarks/dataset_report.json  # 详细报告（JSON 格式）
 
 | 版本 | 日期 | 变化 |
 |------|------|------|
-| V7.1 | 2026-03 | **数据集与基准测试**：astro_bench.jsonl + run_dataset_eval.py + LLM 算力埋点 |
+| V7.1 | 2026-03 | **数据集与基准测试**：astro_bench.jsonl + run_dataset_eval.py + LLM 算力埋点 + **物理模拟层** |
 | V7.0 | 2026-03 | **双轨调度**：DAG 依赖图 + 理论/实践智能体分离 |
 | V6.2 | 2026-01 | **语义路由**：LLM router_node 替代 BM25 |
 | V5.1 | 2025-10 | **优先级调度**：PriorityQueue + 抢占机制 |
