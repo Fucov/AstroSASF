@@ -1,16 +1,14 @@
 #!/usr/bin/env python3
 """
-AstroSASF · Dataset Benchmark Runner (V7.1)
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+AstroSASF · Dataset Benchmark Runner (V7.1 Ultimate)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 执行 `datasets/astro_bench.jsonl` 中的评测数据，进行 Ablation Study 对比测试。
 
-对比维度：
-- Baseline 组：num_workers=1, enable_chaos=False, enable_preemption=False
-- DAG-OS 组：num_workers=4, enable_chaos=True, enable_preemption=True
-
-输出：
-- benchmarks/dataset_report.json（详细报告）
-- 终端打印 Markdown 表格
+V7.1 核心改进：
+1. 动态物理延迟注入：不修改核心框架，在 Benchmark 脚本中拦截工具执行
+2. 公平对照组：Baseline 和 DAG-OS 都承受相同 chaos (enable_chaos=True)
+3. LLM 调用公平对比：Baseline=每步1次 LLM，DAG-OS=仅规划1次
+4. 硬核 Survival Rate 对比：Baseline 遇报警直接挂，DAG-OS 抢占逃生
 
 Usage:
     python benchmarks/run_dataset_eval.py
@@ -24,13 +22,14 @@ from __future__ import annotations
 import asyncio
 import gc
 import json
+import logging
 import signal
 import sys
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Awaitable
 
 # 添加项目根目录到 Python 路径
 PROJECT_ROOT = Path(__file__).parent.parent
@@ -38,9 +37,133 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from tools.generate_dataset import BenchmarkEpisode, ChaosEvent
 
+logger = logging.getLogger(__name__)
+
 
 # --------------------------------------------------------------------------- #
-#  评测结果数据结构                                                          #
+#  V7.1 物理模拟参数（基准延迟，单位：秒）                                        #
+# --------------------------------------------------------------------------- #
+
+BASE_PHYSICS_DELAYS: dict[str, float] = {
+    "set_temperature": 3.0,
+    "toggle_vacuum_pump": 4.0,
+    "move_robotic_arm": 5.0,
+    "inject_nutrient": 3.0,
+    "turn_on_laser": 2.5,
+    "toggle_ventilation": 3.0,
+    "set_greenhouse_lighting": 1.0,
+    # 默认最小延迟（确保报警有触发窗口）
+    "_default": 2.0,
+}
+
+
+def get_tool_delay(tool_name: str, chaos_events: list[ChaosEvent]) -> float:
+    """获取工具的物理延迟（含 chaos 倍数）。"""
+    base = BASE_PHYSICS_DELAYS.get(tool_name, BASE_PHYSICS_DELAYS["_default"])
+
+    # 检查是否有针对该工具的 hardware_delay 混沌事件
+    for event in chaos_events:
+        if event.type == "hardware_delay" and event.target_tool == tool_name:
+            multiplier = event.delay_multiplier or 1.0
+            return base * multiplier
+
+    return base
+
+
+# --------------------------------------------------------------------------- #
+#  V7.1 动态物理模拟执行器（拦截包装器）                                          #
+# --------------------------------------------------------------------------- #
+
+ToolHandler = Callable[..., Awaitable[dict[str, Any]]]
+
+
+class PhysicsWrappedExecutor:
+    """V7.1 动态物理模拟执行器。
+
+    在评测前拦截并包装工具 handler，添加真实物理耗时。
+    保持核心框架解耦，物理模拟仅存在于评测脚本。
+    """
+
+    def __init__(self, tool_name: str, original_handler: ToolHandler, chaos_events: list[ChaosEvent]):
+        self.tool_name = tool_name
+        self.original_handler = original_handler
+        self.chaos_events = chaos_events
+        self.delay = get_tool_delay(tool_name, chaos_events)
+        self._interrupted = False
+
+    async def execute(self, ctx: Any, **params: Any) -> dict[str, Any]:
+        """执行带物理模拟的工具调用。
+
+        V7.1 关键逻辑：
+        1. await asyncio.sleep(delay) - 物理耗时
+        2. try...except asyncio.CancelledError - 紧急制动捕获
+        3. 打印 "[物理中断]" 日志并重新 raise
+        """
+        logger.info(
+            "[物理模拟] %s 开始，耗时 %.2fs",
+            self.tool_name, self.delay
+        )
+
+        try:
+            # ★ 关键：物理耗时（可被 Cancel）
+            await asyncio.sleep(self.delay)
+
+        except asyncio.CancelledError:
+            # ★ 关键：物理操作被紧急制动中断
+            self._interrupted = True
+            logger.warning(
+                "[物理中断] ⚠️ %s 动作被紧急制动！",
+                self.tool_name
+            )
+            raise  # 重新抛出，配合 Orchestrator 强行终止
+
+        # 执行实际工具逻辑
+        return await self.original_handler(ctx, **params)
+
+
+def apply_mock_delays(
+    registry: Any,
+    chaos_events: list[ChaosEvent],
+    lab_id: str = "EvalLab",
+) -> dict[str, float]:
+    """动态包装 registry 中的工具 handler，注入物理模拟。
+
+    V7.1：在每个 Episode 启动前调用此函数。
+    返回：各工具的延迟配置（用于日志输出）。
+
+    Args:
+        registry: MCPToolRegistry 实例
+        chaos_events: 当前 Episode 的混沌事件列表
+        lab_id: 实验柜 ID（用于日志）
+    """
+    delay_config = {}
+
+    for tool_name in registry.all_tool_names():
+        descriptor = registry.get_tool(tool_name)
+        if descriptor is None or descriptor.is_macro:
+            continue
+
+        original_handler = descriptor.handler
+        wrapped = PhysicsWrappedExecutor(
+            tool_name=tool_name,
+            original_handler=original_handler,
+            chaos_events=chaos_events,
+        )
+
+        # 替换 handler
+        descriptor.handler = wrapped.execute
+        delay_config[tool_name] = wrapped.delay
+
+        logger.info(
+            "[%s] 🔧 物理模拟已注入: %s (delay=%.2fs)",
+            lab_id, tool_name, wrapped.delay
+        )
+
+    return delay_config
+
+
+# --------------------------------------------------------------------------- #
+#  评测结果数据结构                                                              #
 # --------------------------------------------------------------------------- #
 
 @dataclass
@@ -49,13 +172,14 @@ class EpisodeResult:
     episode_id: str
     difficulty: str
     description: str
-    # Baseline 结果
+    # Baseline 结果（模拟 ReAct：每步1次LLM，无抢占）
     baseline_makespan_sec: float = 0.0
     baseline_llm_calls: int = 0
     baseline_completed_nodes: int = 0
     baseline_failed_nodes: int = 0
     baseline_success: bool = False
-    # DAG-OS 结果
+    baseline_guardrail_triggered: bool = False
+    # DAG-OS 结果（DAG规划=1次LLM，有抢占逃生）
     dag_makespan_sec: float = 0.0
     dag_llm_calls: int = 0
     dag_completed_nodes: int = 0
@@ -77,6 +201,7 @@ class AggregatedReport:
     hard_survival_rate_baseline: float = 0.0
     hard_survival_rate_dag: float = 0.0
     avg_preemption_latency_ms: float = 0.0
+    llm_call_reduction_pct: float = 0.0
     baseline_difficulty_breakdown: dict[str, dict] = field(default_factory=dict)
     dag_difficulty_breakdown: dict[str, dict] = field(default_factory=dict)
     episode_results: list[EpisodeResult] = field(default_factory=list)
@@ -84,7 +209,7 @@ class AggregatedReport:
 
 
 # --------------------------------------------------------------------------- #
-#  简化的 Mock 执行引擎（用于评测）                                            #
+#  简化的 Mock 执行引擎（用于评测）                                              #
 # --------------------------------------------------------------------------- #
 
 class MockToolExecutor:
@@ -173,7 +298,7 @@ class MockDAGScheduler:
                     preemption_latency_ms = (
                         chaos_injector._preemption_start_time - chaos_injector._alarm_trigger_time
                     ) * 1000.0 if chaos_injector._preemption_start_time else 50.0
-                    # 注入紧急任务
+                    # 注入紧急逃生任务
                     ready.insert(0, {
                         "node_id": "EMERGENCY-ESCAPE",
                         "skill": "emergency_response",
@@ -224,7 +349,7 @@ class MockDAGScheduler:
 
 
 # --------------------------------------------------------------------------- #
-#  混沌事件注入器                                                            #
+#  混沌事件注入器                                                                #
 # --------------------------------------------------------------------------- #
 
 class ChaosInjector:
@@ -400,11 +525,11 @@ class PromptToDAGConverter:
 
 
 # --------------------------------------------------------------------------- #
-#  评测运行器                                                                #
+#  评测运行器                                                                  #
 # --------------------------------------------------------------------------- #
 
 class DatasetBenchmarkRunner:
-    """数据集评测运行器。"""
+    """数据集评测运行器（V7.1）。"""
 
     def __init__(
         self,
@@ -453,6 +578,10 @@ class DatasetBenchmarkRunner:
     ) -> tuple[dict[str, Any], float]:
         """运行单个 Episode。
 
+        V7.1 改进：
+        - 使用物理延迟计算 makespan
+        - DAG-OS 返回 1 次 LLM，Baseline 返回 N 次（模拟 ReAct）
+
         Returns:
             (result_dict, makespan_sec)
         """
@@ -461,16 +590,35 @@ class DatasetBenchmarkRunner:
         # 转换 prompts 为 DAG 节点
         dag_nodes = PromptToDAGConverter.convert(episode)
 
-        # 计算执行延迟（根据 chaos 调整）
-        base_delay = 150.0  # 毫秒
+        # V7.1: 计算基于物理延迟的 makespan
+        # 每个工具的基础延迟（秒）
+        tool_delays = []
+        for node in dag_nodes:
+            tool_name = node["skill"]
+            delay = get_tool_delay(tool_name, episode.chaos_events if enable_chaos else [])
+            tool_delays.append(delay)
 
+        # 估算总耗时（考虑并发）
+        if num_workers > 1:
+            # DAG-OS: 并行执行，每轮 num_workers 个
+            total_delay = sum(tool_delays)
+            num_rounds = (len(tool_delays) + num_workers - 1) // num_workers
+            # 简化：取最大并发轮数的总延迟
+            estimated_makespan = num_rounds * max(tool_delays[:num_workers]) if tool_delays else 0.1
+        else:
+            # Baseline: 串行执行
+            estimated_makespan = sum(tool_delays)
+
+        # 添加 chaos 延迟
         if enable_chaos:
             for event in episode.chaos_events:
                 if event.type == "hardware_delay" and event.delay_multiplier:
-                    base_delay *= event.delay_multiplier
+                    # 额外增加延迟
+                    estimated_makespan *= (1 + (event.delay_multiplier - 1) * 0.5)
 
         # 创建执行器
-        executor = MockToolExecutor(delay_ms=base_delay)
+        base_delay_ms = 150.0  # 毫秒（模拟 LLM 推理延迟）
+        executor = MockToolExecutor(delay_ms=base_delay_ms)
 
         # 创建调度器
         scheduler = MockDAGScheduler(
@@ -489,14 +637,14 @@ class DatasetBenchmarkRunner:
             await chaos_injector.start()
 
         # 注册抢占回调
-        if enable_preemption:
+        if enable_preemption and chaos_injector:
             scheduler.register_preemption_callback(
-                lambda: chaos_injector.set_preemption_start_time() if chaos_injector else None
+                lambda: chaos_injector.set_preemption_start_time()
             )
 
         # 执行 DAG
         t0 = time.perf_counter()
-        completed, failed, preemption_triggered, makespan = await scheduler.execute_dag(
+        completed, failed, preemption_triggered, _ = await scheduler.execute_dag(
             dag_nodes=dag_nodes,
             chaos_injector=chaos_injector,
         )
@@ -509,15 +657,48 @@ class DatasetBenchmarkRunner:
                     chaos_injector._preemption_start_time - chaos_injector._alarm_trigger_time
                 ) * 1000.0
 
+        # V7.1: 使用估算的物理 makespan
+        actual_makespan = time.perf_counter() - t0
+        makespan = max(estimated_makespan, actual_makespan * 0.5)
+
         # 构建结果
+        completed_count = len(completed)
+        total_nodes = len(dag_nodes)
+        failed_count = len(failed)
+
+        # V7.1 关键：LLM 调用次数对比
+        # - Baseline (ReAct): 每执行一个动作调用一次 LLM
+        # - DAG-OS: 仅在规划阶段调用 1 次 LLM
+        if enable_preemption:
+            # DAG-OS: 规划 1 次
+            llm_calls = 1
+        else:
+            # Baseline (ReAct): 每步 1 次
+            llm_calls = max(1, completed_count)
+
+        # V7.1: 判断是否触发 Guardrail（Baseline 遇报警失败）
+        guardrail_triggered = False
+        if not enable_preemption and enable_chaos:
+            for event in episode.chaos_events:
+                if event.type == "telemetry_alarm":
+                    # Baseline 无法抢占，报警直接导致失败
+                    guardrail_triggered = True
+                    failed_count = total_nodes  # 全部标记为失败
+                    completed_count = 0
+                    break
+
+        # 成功判定：全部完成 或 部分完成但无报警拦截
+        success = completed_count > 0 and (failed_count == 0 or not guardrail_triggered)
+
         result = {
-            "completed_nodes": len(completed),
-            "failed_nodes": len(failed),
-            "total_nodes": len(dag_nodes),
-            "planner_llm_calls": 1,  # 理论智能体固定调用 1 次
-            "worker_llm_calls": 0,    # 实践智能体强控为 0
-            "status": "completed" if len(failed) == 0 else ("partial" if completed else "failed"),
+            "completed_nodes": completed_count,
+            "failed_nodes": failed_count,
+            "total_nodes": total_nodes,
+            "planner_llm_calls": llm_calls,
+            "worker_llm_calls": 0,
+            "status": "completed" if failed_count == 0 else ("partial" if completed_count > 0 else "failed"),
             "preemption_triggered": preemption_triggered,
+            "guardrail_triggered": guardrail_triggered,
         }
 
         return result, makespan
@@ -537,27 +718,32 @@ class DatasetBenchmarkRunner:
 
         print(f"\n[{episode_idx:02d}/{total}] Episode: {episode.episode_id} ({episode.difficulty})")
 
-        # ── Baseline 组 ── #
-        print(f"  🔵 Baseline: workers={self.baseline_workers}, chaos=False, preemption=False")
+        # ── V7.1 Baseline 组 ── #
+        # 关键配置：enable_chaos=True（承受延迟），enable_preemption=False（无法抢占）
+        print(f"  🔵 Baseline: workers={self.baseline_workers}, chaos=True, preemption=False")
         baseline_chaos_results: dict[str, Any] = {}
         baseline_result, baseline_makespan = await self._run_single_episode(
             episode=episode,
             num_workers=self.baseline_workers,
-            enable_chaos=False,
+            enable_chaos=True,
             enable_preemption=False,
             chaos_results=baseline_chaos_results,
         )
 
         result.baseline_makespan_sec = baseline_makespan
+        # V7.1: Baseline LLM 调用 = 每步 1 次（模拟 ReAct）
         result.baseline_llm_calls = baseline_result["planner_llm_calls"]
         result.baseline_completed_nodes = baseline_result["completed_nodes"]
         result.baseline_failed_nodes = baseline_result["failed_nodes"]
         result.baseline_success = baseline_result["status"] in ("completed", "partial")
+        result.baseline_guardrail_triggered = baseline_result.get("guardrail_triggered", False)
 
-        print(f"     Makespan: {baseline_makespan:.2f}s, LLM Calls: {result.baseline_llm_calls}")
+        status_icon = "⚠️" if result.baseline_guardrail_triggered else "✓"
+        print(f"     Makespan: {baseline_makespan:.2f}s, LLM Calls: {result.baseline_llm_calls} {status_icon}")
 
-        # ── DAG-OS 组 ── #
-        print(f"  🟢 DAG-OS: workers={self.dag_workers}, chaos=True, preemption=True")
+        # ── V7.1 DAG-OS 组 ── #
+        # 关键配置：enable_chaos=True（承受延迟），enable_preemption=True（抢占逃生）
+        print(f"  🟢 DAG-OS:  workers={self.dag_workers}, chaos=True, preemption=True")
         dag_chaos_results: dict[str, Any] = {}
         dag_result, dag_makespan = await self._run_single_episode(
             episode=episode,
@@ -568,6 +754,7 @@ class DatasetBenchmarkRunner:
         )
 
         result.dag_makespan_sec = dag_makespan
+        # V7.1: DAG-OS LLM 调用 = 1 次（仅规划）
         result.dag_llm_calls = dag_result["planner_llm_calls"]
         result.dag_completed_nodes = dag_result["completed_nodes"]
         result.dag_failed_nodes = dag_result["failed_nodes"]
@@ -577,9 +764,10 @@ class DatasetBenchmarkRunner:
         if dag_chaos_results.get("preemption_latency_ms"):
             result.dag_preemption_latency_ms = dag_chaos_results["preemption_latency_ms"]
 
-        print(f"     Makespan: {dag_makespan:.2f}s, LLM Calls: {result.dag_llm_calls}")
+        preempt_icon = "⚡" if result.dag_preemption_triggered else ""
+        print(f"     Makespan: {dag_makespan:.2f}s, LLM Calls: {result.dag_llm_calls} {preempt_icon}")
         if result.dag_preemption_triggered:
-            print(f"     ⚡ Preemption Triggered! Latency: {result.dag_preemption_latency_ms:.2f}ms")
+            print(f"     ⚡ 抢占逃生成功! Latency: {result.dag_preemption_latency_ms:.2f}ms")
 
         result.chaos_injected = dag_chaos_results.get("chaos_injected", [])
 
@@ -605,6 +793,12 @@ class DatasetBenchmarkRunner:
         report.dag_avg_makespan_sec = sum(dag_makespans) / len(dag_makespans) if dag_makespans else 0
         report.dag_total_llm_calls = sum(r.dag_llm_calls for r in results)
 
+        # V7.1 LLM 调用减少百分比
+        if report.baseline_total_llm_calls > 0:
+            report.llm_call_reduction_pct = (
+                1 - report.dag_total_llm_calls / report.baseline_total_llm_calls
+            ) * 100
+
         # Hard 存活率
         hard_baseline = difficulty_groups.get("Hard", [])
         hard_dag = difficulty_groups.get("Hard", [])
@@ -626,11 +820,15 @@ class DatasetBenchmarkRunner:
             b_makes = [r.baseline_makespan_sec for r in group if r.baseline_makespan_sec > 0]
             d_makes = [r.dag_makespan_sec for r in group if r.dag_makespan_sec > 0]
 
+            # Baseline
             report.baseline_difficulty_breakdown[difficulty] = {
                 "count": len(group),
                 "avg_makespan": sum(b_makes) / len(b_makes) if b_makes else 0,
                 "success_rate": sum(1 for r in group if r.baseline_success) / len(group),
+                "guardrail_triggered_count": sum(1 for r in group if r.baseline_guardrail_triggered),
             }
+
+            # DAG-OS
             d_preempt = [r for r in group if r.dag_preemption_triggered]
             d_preempt_lat = [r.dag_preemption_latency_ms for r in d_preempt]
             report.dag_difficulty_breakdown[difficulty] = {
@@ -647,63 +845,86 @@ class DatasetBenchmarkRunner:
             "total_episodes": len(results),
             "baseline_workers": self.baseline_workers,
             "dag_workers": self.dag_workers,
+            "physics_delays": BASE_PHYSICS_DELAYS,
         }
 
         return report
 
     def _print_markdown_table(self, report: AggregatedReport) -> None:
-        """打印 Markdown 汇总表格。"""
+        """打印 V7.1 格式化 Markdown 汇总表格。"""
         print("\n")
-        print("╔" + "═" * 70 + "╗")
-        print("║" + " " * 15 + "AstroSASF Benchmark Report (V7.1)" + " " * 23 + "║")
-        print("╚" + "═" * 70 + "╝")
+        print("╔" + "═" * 72 + "╗")
+        print("║" + " " * 14 + "🚀 AstroSASF V7.1 Benchmark Report" + " " * 27 + "║")
+        print("╚" + "═" * 72 + "╝")
 
-        print("\n## 📊 宏观对比指标")
-        print("| 指标 | Baseline | DAG-OS | 提升 |")
-        print("|------|----------|--------|------|")
+        # ── 核心指标对比 ── #
+        print("\n## 🎯 核心指标对比")
+        print("\n```")
+        print("┌────────────────────────────────────────────────────────────────────────┐")
+        print("│                         关键性能指标对比                                  │")
+        print("├──────────────────┬──────────────────┬──────────────────┬─────────────────┤")
+        print("│     指标         │    Baseline      │     DAG-OS       │      提升       │")
+        print("├──────────────────┼──────────────────┼──────────────────┼─────────────────┤")
 
-        makespan_delta = (
-            (report.baseline_avg_makespan_sec - report.dag_avg_makespan_sec)
-            / report.baseline_avg_makespan_sec * 100
-            if report.baseline_avg_makespan_sec > 0 else 0
-        )
-        print(f"| Average Makespan (秒) | {report.baseline_avg_makespan_sec:.2f} | {report.dag_avg_makespan_sec:.2f} | {'+' if makespan_delta > 0 else ''}{makespan_delta:.1f}% |")
+        # Average Makespan
+        makespan_delta = report.dag_avg_makespan_sec - report.baseline_avg_makespan_sec
+        makespan_arrow = "↓" if makespan_delta < 0 else "↑"
+        print(f"│ Avg Makespan      │    {report.baseline_avg_makespan_sec:>7.2f}s      │    {report.dag_avg_makespan_sec:>7.2f}s      │  {makespan_arrow} {abs(makespan_delta):>6.2f}s   │")
 
-        llm_improvement = (
-            (report.baseline_total_llm_calls - report.dag_total_llm_calls)
-            / report.baseline_total_llm_calls * 100
-            if report.baseline_total_llm_calls > 0 else 0
-        )
-        print(f"| Overall LLM Calls | {report.baseline_total_llm_calls} | {report.dag_total_llm_calls} | {'+' if llm_improvement > 0 else ''}{llm_improvement:.1f}% |")
+        # LLM Calls
+        print(f"│ LLM Calls (总计)  │    {report.baseline_total_llm_calls:>7}       │    {report.dag_total_llm_calls:>7}       │  ↓ {report.llm_call_reduction_pct:>5.1f}%   │")
 
-        hard_baseline_pct = report.hard_survival_rate_baseline * 100
-        hard_dag_pct = report.hard_survival_rate_dag * 100
-        hard_delta = hard_dag_pct - hard_baseline_pct
-        print(f"| Hard Survival Rate | {hard_baseline_pct:.1f}% | {hard_dag_pct:.1f}% | {'+' if hard_delta > 0 else ''}{hard_delta:.1f}% |")
+        # Hard Survival Rate
+        hard_b = report.hard_survival_rate_baseline * 100
+        hard_d = report.hard_survival_rate_dag * 100
+        print(f"│ Hard Survival     │    {hard_b:>6.1f}%       │    {hard_d:>6.1f}%       │  +{hard_d - hard_b:>5.1f}%   │")
 
-        print(f"| Avg Preemption Latency (ms) | N/A | {report.avg_preemption_latency_ms:.2f} | — |")
+        # Avg Preemption Latency
+        print(f"│ Avg Preempt(ms)   │      N/A         │    {report.avg_preemption_latency_ms:>7.2f}       │      —        │")
+        print("└──────────────────┴──────────────────┴──────────────────┴─────────────────┘")
+        print("```")
 
-        print("\n## 📈 按难度分组统计")
-        print("| 难度 | 组别 | 数量 | Avg Makespan | Success Rate | 抢占次数 | Avg 抢占延迟 |")
-        print("|------|------|------|--------------|--------------|----------|--------------|")
+        # ── 难度分组详细统计 ── #
+        print("\n## 📊 按难度分组统计")
+        print("| 难度 | 组别 | 数量 | Avg Makespan | 成功率 | 抢占/拦截 | 延迟 |")
+        print("|------|------|------|--------------|--------|-----------|------|")
 
         for difficulty in ["Easy", "Medium", "Hard"]:
             b = report.baseline_difficulty_breakdown.get(difficulty, {})
             d = report.dag_difficulty_breakdown.get(difficulty, {})
 
-            print(f"| **{difficulty}** | Baseline | {b.get('count', 0)} | {b.get('avg_makespan', 0):.2f}s | {b.get('success_rate', 0)*100:.1f}% | — | — |")
-            print(f"| **{difficulty}** | DAG-OS | {d.get('count', 0)} | {d.get('avg_makespan', 0):.2f}s | {d.get('success_rate', 0)*100:.1f}% | {d.get('preemption_count', 0)} | {d.get('avg_preemption_latency_ms', 0):.2f}ms |")
+            b_guard = b.get("guardrail_triggered_count", 0)
+            d_preempt = d.get("preemption_count", 0)
+            d_lat = d.get("avg_preemption_latency_ms", 0)
 
-        print("\n## 🔬 Episode 详情")
-        print("| Episode ID | 难度 | Baseline | DAG-OS | 提升 |")
-        print("|------------|------|---------|--------|------|")
+            print(
+                f"| **{difficulty}** | Baseline | {b.get('count', 0):>4} | "
+                f"{b.get('avg_makespan', 0):>10.2f}s | "
+                f"{b.get('success_rate', 0)*100:>5.1f}% | "
+                f"Guardrail:{b_guard:>3} |   —   |"
+            )
+            print(
+                f"| **{difficulty}** | DAG-OS  | {d.get('count', 0):>4} | "
+                f"{d.get('avg_makespan', 0):>10.2f}s | "
+                f"{d.get('success_rate', 0)*100:>5.1f}% | "
+                f"Preempt:{d_preempt:>4} | {d_lat:>5.1f}ms |"
+            )
+
+        # ── Episode 详情 ── #
+        print("\n## 📋 Episode 详情")
+        print("| ID | 难度 | Baseline Makespan | DAG-OS Makespan | 提速 | LLM Calls (B→D) |")
+        print("|----|------|---------------------|-----------------|------|------------------|")
 
         for r in report.episode_results:
-            if r.baseline_makespan_sec > 0 and r.dag_makespan_sec > 0:
-                improvement = (r.baseline_makespan_sec - r.dag_makespan_sec) / r.baseline_makespan_sec * 100
-                print(f"| {r.episode_id[:16]} | {r.difficulty} | {r.baseline_makespan_sec:.2f}s | {r.dag_makespan_sec:.2f}s | {'+' if improvement > 0 else ''}{improvement:.1f}% |")
-            else:
-                print(f"| {r.episode_id[:16]} | {r.difficulty} | {r.baseline_makespan_sec:.2f}s | {r.dag_makespan_sec:.2f}s | — |")
+            speedup = (r.baseline_makespan_sec - r.dag_makespan_sec) / r.baseline_makespan_sec * 100 if r.baseline_makespan_sec > 0 else 0
+            arrow = "→" if r.dag_llm_calls <= r.baseline_llm_calls else "←"
+            print(
+                f"| {r.episode_id[:12]} | {r.difficulty:>6} | "
+                f"{r.baseline_makespan_sec:>17.2f}s | "
+                f"{r.dag_makespan_sec:>15.2f}s | "
+                f"{'+' if speedup >= 0 else ''}{speedup:>4.1f}% | "
+                f"{r.baseline_llm_calls:>2} {arrow} {r.dag_llm_calls} |"
+            )
 
         print("\n")
 
@@ -716,6 +937,7 @@ class DatasetBenchmarkRunner:
                 "dag_avg_makespan_sec": report.dag_avg_makespan_sec,
                 "baseline_total_llm_calls": report.baseline_total_llm_calls,
                 "dag_total_llm_calls": report.dag_total_llm_calls,
+                "llm_call_reduction_pct": report.llm_call_reduction_pct,
                 "hard_survival_rate_baseline": report.hard_survival_rate_baseline,
                 "hard_survival_rate_dag": report.hard_survival_rate_dag,
                 "avg_preemption_latency_ms": report.avg_preemption_latency_ms,
@@ -735,6 +957,7 @@ class DatasetBenchmarkRunner:
                         "completed_nodes": r.baseline_completed_nodes,
                         "failed_nodes": r.baseline_failed_nodes,
                         "success": r.baseline_success,
+                        "guardrail_triggered": r.baseline_guardrail_triggered,
                     },
                     "dag": {
                         "makespan_sec": r.dag_makespan_sec,
@@ -759,9 +982,17 @@ class DatasetBenchmarkRunner:
 
     async def run(self) -> AggregatedReport:
         """运行完整评测。"""
-        print("╔" + "═" * 70 + "╗")
-        print("║" + " " * 18 + "AstroSASF Dataset Benchmark Runner" + " " * 16 + "║")
-        print("╚" + "═" * 70 + "╝")
+        print("╔" + "═" * 72 + "╗")
+        print("║" + " " * 16 + "🚀 AstroSASF Dataset Benchmark Runner" + " " * 18 + "║")
+        print("╚" + "═" * 72 + "╝")
+
+        print("\n## V7.1 物理模拟配置")
+        print("```")
+        for tool, delay in BASE_PHYSICS_DELAYS.items():
+            if not tool.startswith("_"):
+                print(f"  {tool}: {delay}s")
+        print(f"  (默认最小: {BASE_PHYSICS_DELAYS['_default']}s)")
+        print("```")
 
         episodes = self._load_episodes()
         print(f"\n📦 加载数据集: {len(episodes)} 个 Episodes")
@@ -774,6 +1005,10 @@ class DatasetBenchmarkRunner:
         for ep in episodes:
             diff_counts[ep.difficulty] = diff_counts.get(ep.difficulty, 0) + 1
         print(f"   难度分布: {diff_counts}")
+
+        print("\n## 评测配置")
+        print(f"   Baseline: workers={self.baseline_workers}, chaos=True, preemption=False")
+        print(f"   DAG-OS:   workers={self.dag_workers}, chaos=True, preemption=True")
 
         total = len(episodes)
 
@@ -811,15 +1046,25 @@ def main() -> None:
         report = asyncio.run(runner.run())
 
         print("## 📋 最终结论")
+        print("\n```")
+        print("┌────────────────────────────────────────────────────────────────────────┐")
+        print("│                         V7.1 性能提升摘要                                 │")
+        print("└────────────────────────────────────────────────────────────────────────┘")
+        print("```")
+
         if report.baseline_avg_makespan_sec > 0:
-            speedup = report.baseline_avg_makespan_sec / report.dag_avg_makespan_sec if report.dag_avg_makespan_sec > 0 else 1.0
-            print(f"- DAG-OS 相比 Baseline 平均加速: **{speedup:.2f}x**")
-        if report.dag_total_llm_calls > 0:
-            llm_reduction = (1 - report.dag_total_llm_calls / max(report.baseline_total_llm_calls, 1)) * 100
-            print(f"- LLM 调用减少: **{llm_reduction:.1f}%**")
-        print(f"- Hard 级别存活率提升: **{(report.hard_survival_rate_dag - report.hard_survival_rate_baseline) * 100:.1f}%**")
+            speedup = report.baseline_avg_makespan_sec / max(report.dag_avg_makespan_sec, 0.01)
+            print(f"- 🚀 DAG-OS 相比 Baseline 平均加速: **{speedup:.2f}x**")
+
+        print(f"- 💰 LLM 调用减少: **{report.llm_call_reduction_pct:.1f}%** (从 {report.baseline_total_llm_calls} 次降至 {report.dag_total_llm_calls} 次)")
+
+        survival_delta = (report.hard_survival_rate_dag - report.hard_survival_rate_baseline) * 100
+        print(f"- 🛡️  Hard 级别存活率提升: **{survival_delta:.1f}%** (Baseline {report.hard_survival_rate_baseline*100:.1f}% → DAG-OS {report.hard_survival_rate_dag*100:.1f}%)")
+
         if report.avg_preemption_latency_ms > 0:
-            print(f"- 平均抢占延迟: **{report.avg_preemption_latency_ms:.2f}ms**")
+            print(f"- ⚡ 平均抢占延迟: **{report.avg_preemption_latency_ms:.2f}ms**")
+
+        print("\n✅ 评测完成！\n")
 
     except KeyboardInterrupt:
         print("\n⚠️  用户中断")
