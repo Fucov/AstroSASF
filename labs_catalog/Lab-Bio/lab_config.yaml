@@ -1,0 +1,59 @@
+# Lab-Bio 流体实验舱配置
+
+name: Lab-Bio
+description: 生物实验舱 — 用于细胞培养和微生物实验
+
+subsystems:
+  heater:
+    - IDLE
+    - HEATING
+    - COOLING
+  vacuum:
+    - IDLE
+    - ACTIVE
+  arm:
+    - IDLE
+    - MOVING
+  fan:
+    - OFF
+    - LOW
+    - HIGH
+  uv_lamp:
+    - OFF
+    - STERILIZING
+
+initial_states:
+  heater: IDLE
+  vacuum: IDLE
+  arm: IDLE
+  fan: OFF
+  uv_lamp: OFF
+
+interlocks:
+  # 真空激活时禁止移动机械臂
+  - condition: "vacuum == 'ACTIVE' and arm == 'MOVING'"
+    message: "真空激活时禁止移动机械臂"
+    scope: move_robotic_arm
+
+  # 灭菌时禁止开门
+  - condition: "uv_lamp == 'STERILIZING'"
+    message: "灭菌灯激活时禁止开门"
+    scope: open_chamber_door
+
+macros:
+  quick_measure:
+    target: read_sensor
+    preset:
+      channel: 1
+    description: "快速测量 1 号传感器"
+
+  cell_culture_temp:
+    target: control_heater
+    preset:
+      temperature: 37.0
+      duration: 3600
+    description: "设置细胞培养温度 37°C"
+
+skills:
+  - bio_culture
+  - emergency_fire_response

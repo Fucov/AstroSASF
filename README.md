@@ -1,12 +1,68 @@
 # AstroSASF — Astro Scientific Agent Scheduling Framework
 
-> 面向太空实验室的科学智能体调度框架 · Edge-RAG + **硬件级抢占** + **动态优先级 Aging** + **LLM 算力埋点** + 正交联锁 + Guard + Macro + **DAG 双轨调度**
+> 面向太空实验室的科学智能体调度框架 · **C/S 服务化架构** + **硬件级抢占** + **动态优先级 Aging** + **LLM 算力埋点** + 正交联锁 + Guard + Macro + **DAG 双轨调度**
 
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
 [![LangGraph](https://img.shields.io/badge/LangGraph-StateGraph-orange.svg)](https://github.com/langchain-ai/langgraph)
-[![Ollama](https://img.shields.io/badge/Ollama-Qwen2.5-green.svg)](https://ollama.com/)
+[![FastAPI](https://img.shields.io/badge/FastAPI-REST%20API-blue.svg)](https://fastapi.tiangolo.com/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/Fucov/AstroSASF)
+---
+
+## C/S 架构概览
+
+AstroSASF 服务端采用 **FastAPI** 框架，外部多智能体系统作为 HTTP 客户端通过 RESTful API 接入。
+
+### 架构图
+
+```
++-------------------+         +--------------------------------+
+|   外部多智能体系统  |  HTTP   |      AstroSASF 服务端            |
+|   (Client)         |<------>|      (Server)                   |
+|                   |  REST   |                                |
+|  - LLM 推理规划   |  API    |  - 工具发现 (Discovery)         |
+|  - 任务调度决策    |         |  - FSM + Guard 安全校验         |
+|  - 状态管理        |         |  - LLM 算力池                    |
+|  - 硬件报警处理    |         |  - 硬件级抢占                   |
++-------------------+         +--------------------------------+
+
+服务端 API 端点：
+  GET  /api/v1/labs                   - 列出所有实验舱
+  GET  /api/v1/labs/{lab_id}/meta    - 获取舱体完整元数据
+  POST /api/v1/labs/{lab_id}/execute - 执行工具调用
+  POST /api/v1/llm/chat              - LLM 推理接口
+```
+
+### 快速开始
+
+**终端 1 - 启动服务端：**
+```bash
+ollama serve && ollama pull qwen2.5:7b
+uvicorn server:app --reload --host 0.0.0.0 --port 8000
+```
+
+**终端 2 - 运行客户端演示：**
+```bash
+python demo_integration.py
+```
+
+### labs_catalog 目录结构
+
+```
+labs_catalog/
+├── shared/                    # 公共工具
+│   └── shared_tools.py
+├── Lab-Bio/                  # 生物实验舱
+│   ├── lab_config.yaml        # FSM 配置、宏定义
+│   └── custom_tools.py        # 专属工具
+└── Lab-Fluid/                # 流体实验舱
+    ├── lab_config.yaml
+    └── custom_tools.py
+```
+
+---
+
+
 [![zread](https://img.shields.io/badge/Ask_Zread-_.svg?style=flat&color=00b0aa&labelColor=000000&logo=data%3Aimage%2Fsvg%2Bxml%3Bbase64%2CPHN2ZyB3aWR0aD0iMTYiIGhlaWdodD0iMTYiIHZpZXdCb3g9IjAgMCAxNiAxNiIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KPHBhdGggZD0iTTQuOTYxNTYgMS42MDAxSDIuMjQxNTZDMS44ODgxIDEuNjAwMSAxLjYwMTU2IDEuODg2NjQgMS42MDE1NiAyLjI0MDFWNC45NjAxQzEuNjAxNTYgNS4zMTM1NiAxLjg4ODEgNS42MDAxIDIuMjQxNTYgNS42MDAxSDQuOTYxNTZDNS4zMTUwMiA1LjYwMDEgNS42MDE1NiA1LjMxMzU2IDUuNjAxNTYgNC45NjAxVjIuMjQwMUM1LjYwMTU2IDEuODg2NjQgNS4zMTUwMiAxLjYwMDEgNC45NjE1NiAxLjYwMDFaIiBmaWxsPSIjZmZmIi8%2BCjxwYXRoIGQ9Ik00Ljk2MTU2IDEwLjM5OTlIMi4yNDE1NkMxLjg4ODEgMTAuMzk5OSAxLjYwMTU2IDEwLjY4NjQgMS42MDE1NiAxMS4wMzk5VjEzLjc1OTlDMS42MDE1NiAxNC4xMTM0IDEuODg4MSAxNC4zOTk5IDIuMjQxNTYgMTQuMzk5OUg0Ljk2MTU2QzUuMzE1MDIgMTQuMzk5OSA1LjYwMTU2IDE0LjExMzQgNS42MDE1NiAxMy43NTk5VjExLjAzOTlDNS42MDE1NiAxMC42ODY0IDUuMzE1MDIgMTAuMzk5OSA0Ljk2MTU2IDEwLjM5OTlaIiBmaWxsPSIjZmZmIi8%2BCjxwYXRoIGQ9Ik0xMy43NTg0IDEuNjAwMUgxMS4wMzg0QzEwLjY4NSAxLjYwMDEgMTAuMzk4NCAxLjg4NjY0IDEwLjM5ODQgMi4yNDAxVjQuOTYwMUMxMC4zOTg0IDUuMzEzNTYgMTAuNjg1IDUuNjAwMSAxMS4wMzg0IDUuNjAwMUgxMy43NTg0QzE0LjExMTkgNS42MDAxIDE0LjM5ODQgNS4zMTM1NiAxNC4zOTg0IDQuOTYwMVYyLjI0MDFDMTQuMzk4NCAxLjg4NjY0IDE0LjExMTkgMS42MDAxIDEzLjc1ODQgMS42MDAxWiIgZmlsbD0iI2ZmZiIvPgo8cGF0aCBkPSJNNCAxMkwxMiA0TDQgMTJaIiBmaWxsPSIjZmZmIi8%2BCjxwYXRoIGQ9Ik00IDEyTDEyIDQiIHN0cm9rZT0iI2ZmZiIgc3Ryb2tlLXdpZHRoPSIxLjUiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIvPgo8L3N2Zz4K&logoColor=ffffff)](https://zread.ai/Fucov/AstroSASF)
 ---
 

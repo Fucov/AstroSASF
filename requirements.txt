@@ -14,6 +14,8 @@ langgraph>=0.2.0
 # ── 配置 ──
 pyyaml>=6.0
 
-# ── Runtime ──
-# 以下为标准库，无需额外安装：
-# asyncio, struct, json, logging, dataclasses, enum, typing, abc, re, copy, time, pathlib
+# ── FastAPI 服务端 (V7.1 C/S 架构) ──
+fastapi>=0.100.0
+uvicorn[standard]>=0.23.0
+httpx>=0.24.0
+pydantic>=2.0.0
