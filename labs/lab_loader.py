@@ -131,8 +131,6 @@ class LabLoader:
 
     def __post_init__(self) -> None:
         self.catalog_dir = Path(self.catalog_dir)
-        if not self.catalog_dir.exists():
-            raise LabLoaderError(f"实验室目录不存在: {self.catalog_dir}")
 
     # --------------------------------------------------------------------------- #
     #  发现阶段 (Discovery)                                                        #
@@ -147,10 +145,13 @@ class LabLoader:
             lab_id → LabDescriptor 映射
         """
         self._discovered_labs.clear()
-        labs_path = self.catalog_dir / "labs_catalog"
-
+        # 支持两种调用方式：
+        #   create_loader("labs_catalog")              → 扫描 labs_catalog/
+        #   create_loader("demo/assets/labs")         → 扫描 demo/assets/labs/
+        #   create_loader("demo/assets/labs/DemoBio")  → 只加载 DemoBio
+        labs_path = self.catalog_dir
         if not labs_path.exists():
-            labs_path = self.catalog_dir
+            raise LabLoaderError(f"实验室目录不存在: {labs_path}")
 
         for entry in labs_path.iterdir():
             if not entry.is_dir():

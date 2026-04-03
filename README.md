@@ -46,7 +46,6 @@ uv run python demo/demo_mission.py --lab DemoBio --mission "将培养舱温度�
 AstroSASF/
 │
 ├── config.yaml                     # LLM 服务 + 中间件全局配置
-├── fsm_rules.yaml                 # 联锁安全规则（顶层公共规则）
 ├── pyproject.toml                 # Python 项目配置
 │
 ├── infra/                        # ===== 内核基础设施层 =====
@@ -112,12 +111,8 @@ AstroSASF/
 │       ├── lab_config.yaml
 │       └── custom_tools.py
 │
-├── sasf/                        # 【V7.1 旧代码 — 已废弃，V7.3 移除】
-│   └── (旧版代码，保留用于参考)
-│
 ├── datasets/                     # 评测数据集
-├── benchmarks/                  # 基准测试
-└── examples/                    # 示例代码
+└── benchmarks/                  # 基准测试
 ```
 
 ### 目录分层设计哲学
@@ -338,8 +333,8 @@ python demo/demo_mission.py --catalog ./my_labs --skills ./my_skills
 | **V7.1** | 2026-03 | 数据集评测 + LLM 算力埋点 + 物理模拟层 |
 | **V7.0** | 2026-03 | DAG 双轨调度 + 理论/实践智能体分离 |
 | **V6.2** | 2026-01 | LLM 语义路由替代 BM25 |
-| **V5.1** | 2025-10 | 优先级抢占式调度 |
-| **V5.0** | 2025-08 | 正交联锁引擎替代单体 FSM |
+| **V5.1** | 2026-01 | 优先级抢占式调度 |
+| **V5.0** | 2026-01 | 正交联锁引擎替代单体 FSM |
 
 ---
 

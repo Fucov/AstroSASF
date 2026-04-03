@@ -340,7 +340,7 @@ class PrefixAwareLoadBalancer:
     # ------------------------------------------------------------------------ #
 
     def _on_instance_status_change(self, url: str, old_status: InstanceStatus, new_status: InstanceStatus) -> None:
-        """实例状态变更回调。当实例变为 UNHEALTHY 时，清除该实例的所有亲和路由记录。"""
+        """实例状态变更回调（同步）。当实例变为 UNHEALTHY 时，清除该实例的所有亲和路由记录。"""
         if new_status == InstanceStatus.UNHEALTHY:
             affected_hashes = []
             with self._lock:

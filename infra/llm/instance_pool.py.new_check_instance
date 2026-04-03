@@ -1,0 +1,66 @@
+    async def _check_instance(self, url: str) -> None:
+        """Check single instance health (HTTP I/O outside lock to avoid blocking)."""
+        if not self._http_client:
+            return
+
+        metrics = self.instances.get(url)
+        if not metrics:
+            return
+
+        # Step 1: HTTP I/O (outside lock)
+        health_ok = False
+        vram_ratio = 0.0
+        vram_used = 0.0
+
+        try:
+            resp = await self._http_client.get(f"{url}/health", timeout=httpx.Timeout(5.0))
+            health_ok = resp.status_code == 200
+        except Exception:
+            pass
+
+        try:
+            mem_resp = await self._http_client.get(f"{url}/memory", timeout=httpx.Timeout(5.0))
+            if mem_resp.status_code == 200:
+                data = mem_resp.json()
+                if "mem_used" in data and "mem_total" in data:
+                    vram_used = data["mem_used"] / (1024 ** 3)
+                    vram_total = data["mem_total"] / (1024 ** 3)
+                    vram_ratio = vram_used / vram_total if vram_total > 0 else 0.0
+        except Exception:
+            pass
+
+        # Step 2: compute new status (outside lock)
+        if not health_ok:
+            new_status = InstanceStatus.UNHEALTHY
+        elif vram_ratio >= VRAM_HIGH_WATERMARK:
+            new_status = InstanceStatus.DEGRADED
+        else:
+            new_status = InstanceStatus.HEALTHY
+
+        # Step 3: update state (inside lock) + fire callbacks (outside lock, avoid deadlock)
+        old_status = metrics.status
+
+        async with self._lock:
+            metrics.vram_ratio = vram_ratio
+            metrics.vram_used_gb = vram_used
+            metrics.last_check_time = time.monotonic()
+
+            if health_ok:
+                metrics.consecutive_failures = 0
+                metrics.last_success_time = time.monotonic()
+            else:
+                metrics.consecutive_failures += 1
+                if metrics.consecutive_failures >= DEFAULT_UNHEALTHY_THRESHOLD:
+                    new_status = InstanceStatus.UNHEALTHY
+
+            metrics.status = new_status
+            metrics.updated_at = time.monotonic()
+
+        # Callbacks OUTSIDE lock to prevent deadlock
+        if old_status != new_status:
+            logger.warning(
+                "[InstancePool] Instance state changed: %s %s -> %s (VRAM: %.1f%%)",
+                url, old_status.name, new_status.name, vram_ratio * 100
+            )
+            self._notify_status_change(url, old_status, new_status)
+

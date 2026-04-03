@@ -4,7 +4,7 @@ AstroSASF · Interface · FastAPI Server
 北向 API 网关 — 将 AstroSASF 暴露为 RESTful Web 服务。
 
 V7.2 重构自 server.py，整合了：
-- 分布式 LLM 网关路由
+- 分布式 LLM 网关路由（PrefixBalancer + VRAMBreaker）
 - 实验室管理 API
 - MCP Tool 执行 API
 
@@ -28,7 +28,7 @@ if str(_ROOT) not in sys.path:
 import logging
 from contextlib import asynccontextmanager
 from typing import Any
-import time  # 仅用于 HealthResponse.timestamp
+import time
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -40,6 +40,10 @@ from interface.state import AppState, state  # 全局状态（单例）
 
 logger = logging.getLogger(__name__)
 
+
+# --------------------------------------------------------------------------- #
+#  Pydantic Models                                                            #
+# --------------------------------------------------------------------------- #
 
 class ExecuteRequest(BaseModel):
     """工具调用请求。"""
@@ -93,6 +97,10 @@ class HealthResponse(BaseModel):
     loaded_labs: list[str]
 
 
+# --------------------------------------------------------------------------- #
+#  Lifespan — 启动 / 关闭顺序                                                   #
+# --------------------------------------------------------------------------- #
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """应用生命周期管理。"""
@@ -109,23 +117,64 @@ async def lifespan(app: FastAPI):
         state.config = load_config(config_path)
         logger.info("[Server] 配置加载完成: %s", config_path)
 
-        state.loader = create_loader(str(_ROOT / "labs_catalog"))
+        # ── 1. 加载实验舱（使用 demo 专用 labs 目录）── #
+        demo_labs_dir = str(_ROOT / "demo" / "assets" / "labs")
+        state.loader = create_loader(demo_labs_dir)
         loaded_labs = await state.loader.discover_and_load()
+        logger.info("[Server] 实验舱加载完成: %s", list(loaded_labs.keys()))
 
-        # 初始化 API Facade（不依赖 LLM Gateway，运行在 demo 模式）
+        # ── 2. 初始化分布式 LLM 网关（PrefixBalancer + VRAMBreaker）── #
+        from infra.llm.instance_pool import LLMInstancePool, LLMInstanceConfig
+        from infra.routing.prefix_balancer import PrefixAwareLoadBalancer
+        from infra.routing.vram_breaker import VRAMWatermarkBreaker
+        from infra.gateway.proxy import GatewayProxy
+
+        pool = LLMInstancePool()
+
+        # 从 config.yaml 读取 LLM 地址，注册为默认实例
+        llm_cfg = state.config.llm
+        pool.register_instance(LLMInstanceConfig(
+            url=llm_cfg.base_url,
+            weight=1,
+            model_name=llm_cfg.model_name,
+            tags=["default"],
+        ))
+        logger.info(
+            "[Server] LLM 实例注册: %s (%s)",
+            llm_cfg.base_url, llm_cfg.model_name,
+        )
+
+        lb = PrefixAwareLoadBalancer(instance_pool=pool)
+        breaker = VRAMWatermarkBreaker(instance_pool=pool)
+        state.gateway_proxy = GatewayProxy(
+            instance_pool=pool,
+            load_balancer=lb,
+            watermark_breaker=breaker,
+        )
+        await state.gateway_proxy.start()
+        logger.info("[Server] LLM GatewayProxy 启动完成（PrefixBalancer + VRAMBreaker）")
+
+        # ── 3. 初始化 API Facade ── #
         from interface.facade import APIFacade
-        state.facade = APIFacade(lab_loader=state.loader, gateway_proxy=None, scheduler=None)
+        state.facade = APIFacade(
+            lab_loader=state.loader,
+            gateway_proxy=state.gateway_proxy,
+            scheduler=None,
+        )
 
         logger.info("")
         logger.info("╔" + "═" * 70 + "╗")
         logger.info("║  ✅ AstroSASF V7.2 服务已就绪                                   ║")
         logger.info(f"║  API 文档: http://localhost:8000/docs                         ║")
+        logger.info(f"║  LLM:      {llm_cfg.provider} @ {llm_cfg.base_url} ({llm_cfg.model_name})     ║")
         logger.info("╚" + "═" * 70 + "╝")
 
         yield
 
     finally:
         logger.info("[Server] 正在关闭...")
+        if state.gateway_proxy:
+            await state.gateway_proxy.stop()
         if state.facade:
             await state.facade.shutdown()
         logger.info("[Server] 已关闭 ✓")
@@ -146,6 +195,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+# --------------------------------------------------------------------------- #
+#  API Endpoints                                                               #
+# --------------------------------------------------------------------------- #
 
 @app.get("/health", response_model=HealthResponse, tags=["System"])
 async def health_check() -> HealthResponse:
@@ -226,35 +279,71 @@ async def execute_tool(lab_id: str, request: ExecuteRequest) -> dict[str, Any]:
 
 @app.post("/api/v1/llm/chat", response_model=LLMChatResponse, tags=["LLM"])
 async def llm_chat(request: LLMChatRequest) -> dict[str, Any]:
-    """调用底层 LLM 进行推理。"""
-    if state.facade is None:
-        raise HTTPException(status_code=503, detail="服务未初始化")
+    """调用底层 LLM 进行推理（经分布式网关 Proxy → PrefixBalancer → VRAMBreaker → LLM 实例）。"""
+    if state.gateway_proxy is None:
+        raise HTTPException(status_code=503, detail="LLM 网关未初始化，请先启动框架服务")
+
+    from infra.gateway.proxy import GatewayRequest
+    priority_map = {0: "CRITICAL", 1: "HIGH", 2: "NORMAL", 3: "LOW"}
+    priority = priority_map.get(request.priority, "NORMAL")
+    model_name = state.config.llm.model_name if state.config else "qwen2.5:7b"
+
+    gw_request = GatewayRequest(
+        messages=request.messages,
+        model=model_name,
+        temperature=request.temperature or 0.1,
+        max_tokens=request.max_tokens or 2048,
+        priority=priority,
+    )
 
     try:
-        response = await state.facade.chat_completion(
-            messages=request.messages,
-            agent_id=request.agent_id,
-            temperature=request.temperature,
-            max_tokens=request.max_tokens,
-        )
+        response = await state.gateway_proxy.chat(gw_request)
+
+        # 处理错误响应
+        if isinstance(response, Exception):
+            err = str(response)
+            logger.warning("[API] LLM 网关异常: %s", err)
+            return LLMChatResponse(
+                content="[LLM ERROR] " + err,
+                task_id=getattr(response, "request_id", "unknown") or "unknown",
+                elapsed_ms=getattr(response, "latency_ms", 0) or 0,
+                model=model_name,
+                error=err,
+            )
+
+        # 检查是否是 GatewayError
+        from infra.gateway.proxy import GatewayError as GWError
+        if isinstance(response, GWError):
+            logger.warning("[API] LLM 网关返回错误: %s [%s]", response.error, response.error_code)
+            return LLMChatResponse(
+                content="[LLM ERROR] " + response.error,
+                task_id=response.request_id or "unknown",
+                elapsed_ms=response.latency_ms if hasattr(response, "latency_ms") else 0,
+                model=model_name,
+                error=response.error,
+            )
 
         return LLMChatResponse(
-            content=response.get("content", ""),
-            task_id=response.get("task_id", ""),
-            elapsed_ms=response.get("elapsed_ms", 0),
-            model=response.get("model", "qwen2.5:7b"),
+            content=response.content or "",
+            task_id=response.request_id or "unknown",
+            elapsed_ms=response.latency_ms or 0,
+            model=response.model or model_name,
         )
 
     except Exception as exc:
         logger.exception("[API] LLM 调用失败: %s", exc)
         return LLMChatResponse(
-            content="",
-            task_id="",
+            content="[LLM ERROR] " + str(exc),
+            task_id="error",
             elapsed_ms=0,
-            model="qwen2.5:7b",
+            model=model_name,
             error=str(exc),
         )
 
+
+# --------------------------------------------------------------------------- #
+#  Error Handlers                                                             #
+# --------------------------------------------------------------------------- #
 
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request, exc: HTTPException):

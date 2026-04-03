@@ -3,7 +3,7 @@ AstroSASF · Interface · Global State
 ====================================
 全局应用状态 — 由 FastAPI lifespan 管理生命周期。
 
-所有需要访问 loader/facade/config 的模块应从本模块导入 state。
+所有需要访问 loader/facade/config/gateway 的模块应从本模块导入 state。
 
 Author: AstroSASF Team
 Version: 7.2
@@ -22,6 +22,7 @@ class AppState:
     facade: Any = field(default=None)
     loader: Any = field(default=None)
     config: Any = field(default=None)
+    gateway_proxy: Any = field(default=None)   # infra.gateway.proxy.GatewayProxy
     startup_time: float = field(default_factory=time.time)
 
 

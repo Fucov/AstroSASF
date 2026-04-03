@@ -361,7 +361,8 @@ class LLMInstancePool:
                 metrics.updated_at = time.monotonic()
 
                 if old_status != metrics.status:
-                    self._notify_status_change(url, old_status, metrics.status)
+                    _old, _new = old_status, metrics.status
+                    self._notify_status_change(url, _old, _new)
                     logger.warning(
                         "[InstancePool] 实例状态变更: %s %s -> %s (VRAM: %.1f%%)",
                         url, old_status.name, metrics.status.name, vram_ratio * 100
@@ -427,7 +428,7 @@ class LLMInstancePool:
         self._on_status_change.append(callback)
 
     def _notify_status_change(self, url: str, old_status: InstanceStatus, new_status: InstanceStatus) -> None:
-        """通知所有状态变更回调。"""
+        """通知所有状态变更回调（在锁外执行以避免重入）。"""
         for callback in self._on_status_change:
             try:
                 callback(url, old_status, new_status)

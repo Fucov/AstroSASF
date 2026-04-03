@@ -76,7 +76,6 @@ class APIFacade:
         self._gateway_proxy = gateway_proxy
         self._scheduler = scheduler
         self._running = True
-        self._a2a_router = Any  # A2A 路由，由 LabContext 提供
 
     # --------------------------------------------------------------------------- #
     #  生命周期                                                                    #
@@ -197,7 +196,7 @@ class APIFacade:
         temperature: float | None = None,
         max_tokens: int | None = None,
     ) -> dict[str, Any]:
-        """调用 LLM Gateway 完成对话补全。
+        """调用 LLM Gateway 完成对话补全（经 Proxy → PrefixBalancer → VRAMBreaker → LLM 实例）。
 
         Parameters
         ----------
@@ -217,29 +216,53 @@ class APIFacade:
         """
         if self._gateway_proxy is None:
             return {
-                "content": "[FACADE] LLM Gateway 未配置（demo 模式）",
+                "content": "[FACADE] LLM Gateway 未配置",
                 "task_id": uuid.uuid4().hex[:12],
                 "elapsed_ms": 0.0,
                 "model": "mock",
             }
 
+        from infra.gateway.proxy import GatewayRequest
         task_id = uuid.uuid4().hex[:12]
         t0 = time.monotonic()
 
+        gw_request = GatewayRequest(
+            messages=messages,
+            model="qwen2.5:7b",
+            temperature=temperature or 0.1,
+            max_tokens=max_tokens or 2048,
+            priority="NORMAL",
+        )
+
         try:
-            response = await self._gateway_proxy.chat(
-                messages=messages,
-                agent_id=agent_id,
-                temperature=temperature,
-                max_tokens=max_tokens,
-            )
+            response = await self._gateway_proxy.chat(gw_request)
             elapsed_ms = (time.monotonic() - t0) * 1000
+
+            # 处理错误响应
+            if isinstance(response, Exception):
+                return {
+                    "content": f"[ERROR] LLM 调用失败: {response}",
+                    "task_id": task_id,
+                    "elapsed_ms": elapsed_ms,
+                    "model": "qwen2.5:7b",
+                }
+
+            from infra.gateway.proxy import GatewayError as GWErr
+            if isinstance(response, GWErr):
+                return {
+                    "content": f"[ERROR] LLM 网关错误: {response.error}",
+                    "task_id": response.request_id or task_id,
+                    "elapsed_ms": elapsed_ms,
+                    "model": "qwen2.5:7b",
+                }
+
             return {
-                "content": response.get("content", ""),
-                "task_id": task_id,
+                "content": response.content or "",
+                "task_id": response.request_id or task_id,
                 "elapsed_ms": elapsed_ms,
-                "model": response.get("model", "qwen2.5:7b"),
+                "model": response.model or "qwen2.5:7b",
             }
+
         except Exception as exc:
             elapsed_ms = (time.monotonic() - t0) * 1000
             logger.warning("[APIFacade] LLM 调用失败 [%s]: %s", agent_id, exc)
