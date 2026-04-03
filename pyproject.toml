@@ -1,17 +1,18 @@
 [project]
 name = "AstroSASF"
-version = "4.0.0"
+version = "7.2.0"
 description = "Astro Scientific Agent Scheduling Framework — 面向太空实验室的科学智能体调度框架"
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.10"
 dependencies = [
-    "langchain-core>=0.3.0",
-    "langchain-ollama>=0.3.0",
-    "langchain-openai>=0.3.0",
-    "langgraph>=0.2.0",
+    "fastapi>=0.110.0",
+    "httpx>=0.27.0",
     "pyyaml>=6.0",
+    "uvicorn[standard]>=0.30.0",
 ]
 
 [project.scripts]
-astrosasf-demo = "examples.space_station_demo:main"
+astrosasf-demo = "demo.demo_mission:main"
+astrosasf-server = "interface.server:app"
+
