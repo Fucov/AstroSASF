@@ -4,9 +4,11 @@
 # ============================================================================ #
 
 # ---------------------------------------------------------------------------- #
-#  Gateway 配置（V7.2 分布式 LLM 网关）
+#  Gateway 配置（V7.2 分布式 LLM 网关 + V7.5 异构算力调度）
 #  — AstroSASF 不管理 LLM 进程，只通过 HTTP 连接已运行的远端推理服务
 #  — 支持多个后端实例，负载均衡 + VRAM 熔断 + 前缀感知路由
+#  — V7.5 新增：异构算力池（compute_class: heavy/light）+
+#              意图感知路由 + 动态降级机制
 # ---------------------------------------------------------------------------- #
 gateway:
   # VRAM 水线（V100-32G，默认值，可按节点覆盖）
@@ -14,30 +16,51 @@ gateway:
   vram_critical_watermark: 0.92   # ≥92%：熔断禁入
   vram_low_watermark: 0.60       # <60%：完全健康
 
+  # V7.5 新增：异构算力路由规则
+  # compute_class: 实例运行的模型大小级别
+  #   heavy  — 大显存卡 7B+ 模型（Planner Agent 复杂 DAG 规划专用）
+  #   light  — 小显存卡 1.5B 模型（Executor Agent 极速 Tool Calling）
+  # intent_routing: 基于 agent_id / tags 的意图感知路由
+  #   planner_*  → heavy（强制）
+  #   executor_* → light（优先）
+  #   qa_*       → light（降级兜底）
+  #   default    → heavy（默认大模型）
+  intent_routing:
+    default_compute_class: "heavy"
+    allow_downgrade: true          # 降级开关（高算力实例满载时自动透明降级到低算力）
+    downgrade_model_map:          # 降级后的模型替代关系
+      "qwen2.5:7b"     : "qwen2.5:1.5b"
+      "qwen2.5-7b"     : "qwen2.5-1.5b"
+      "deepseek-7b"    : "deepseek-1.5b"
+      "qwen2.5-7b-instruct" : "qwen2.5-1.5b-instruct"
+
   # 后端实例列表（按 weight 加权路由，weight 越高分到越多请求）
   backends:
-    # ── 本地 Ollama（fallback / 开发用）────────────────────────────── #
+    # ── 低算力极速实例（1.5B 轻量模型）────────────────────────────────── #
     - url: "http://localhost:11434"
       provider: "ollama"
-      model_name: "qwen2.5:7b"
-      weight: 1
-      tags: ["local", "fallback", "cpu"]
+      model_name: "qwen2.5:1.5b"
+      compute_class: "light"       # ★ V7.5 异构核心：低算力极速实例
+      weight: 3
+      tags: ["local", "fallback", "cpu", "1.5b"]
       enabled: true
 
-    # ── 远端 SGLang 推理节点（GPU 集群主节点）─────────────────────── #
-    # - url: "http://10.244.37.59:8000"
-    #   provider: "vllm"
-    #   model_name: "DeepSeek-R1-0528-Qwen3-8B"
-    #   weight: 3
-    #   tags: ["v100", "node-1", "gpu"]
-    #   enabled: true
+    # ── 高算力大模型实例（7B+ 模型）────────────────────────────────────── #
+    - url: "http://10.244.37.59:8000"
+      provider: "sglang"
+      model_name: "qwen2.5:7b"
+      compute_class: "heavy"       # ★ V7.5 异构核心：高算力大模型实例
+      weight: 2
+      tags: ["v100", "node-1", "gpu", "7b"]
+      enabled: true
 
-    # ── 远端 vLLM 推理节点（备节点）───────────────────────────────── #
+    # ── 高算力备机（降级兜底）─────────────────────────────────────────── #
     # - url: "http://192.168.1.11:8000"
     #   provider: "vllm"
     #   model_name: "qwen2.5-7b-instruct"
+    #   compute_class: "heavy"
     #   weight: 2
-    #   tags: ["a100", "node-2", "gpu"]
+    #   tags: ["a100", "node-2", "gpu", "7b"]
     #   enabled: true
 
 # ---------------------------------------------------------------------------- #

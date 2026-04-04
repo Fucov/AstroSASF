@@ -40,25 +40,50 @@ _DEFAULT_CONFIG_PATH = _PROJECT_ROOT / "config.yaml"
 
 @dataclass(frozen=True)
 class GatewayBackendConfig:
-    """LLM 推理后端配置（对应 config.yaml 中的一个 backend 条目）。"""
+    """LLM 推理后端配置（对应 config.yaml 中的一个 backend 条目）。
+
+    V7.5 新增字段：
+    - compute_class: 算力分级，"heavy"（7B+ 大模型）或 "light"（1.5B 轻量模型）
+    """
     url: str                            # e.g. "http://192.168.1.10:8000"
     provider: str = "ollama"            # "ollama" | "sglang" | "vllm"
     model_name: str = "qwen2.5:7b"     # 推理部署的模型名称
     weight: int = 1                     # 路由权重（weight 越高分到越多请求）
     tags: list[str] = field(default_factory=list)  # 标签（如 ["v100", "node-1"]）
     enabled: bool = True                # 是否启用（False 则跳过注册）
+    # V7.5 新增：算力分级标签（"heavy" 或 "light"，决定异构路由策略）
+    compute_class: str = "heavy"
     # 可选的 VRAM 水线覆盖（留空则使用 GatewayConfig 的全局值）
     vram_high_watermark: float | None = None
     vram_critical_watermark: float | None = None
 
 
 @dataclass(frozen=True)
+class IntentRoutingConfig:
+    """V7.5 新增：意图感知路由配置。
+
+    基于 agent_id / tags 识别请求类型，将 Planner/Executor/QA Agent
+    的请求分发到对应算力池，实现算力解耦与并发暴增。
+    """
+    default_compute_class: str = "heavy"     # 默认算力级别
+    allow_downgrade: bool = True             # 高算力满载时是否允许透明降级
+    # 降级时的模型替代映射表（key = 原始模型，value = 降级后模型）
+    downgrade_model_map: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class GatewayConfig:
-    """分布式 LLM 网关配置。"""
+    """分布式 LLM 网关配置。
+
+    V7.5 新增：
+    - intent_routing: 意图感知路由规则
+    """
     backends: list[GatewayBackendConfig] = field(default_factory=list)
     vram_high_watermark: float = 0.85
     vram_critical_watermark: float = 0.92
     vram_low_watermark: float = 0.60
+    # V7.5 新增：异构算力意图路由
+    intent_routing: IntentRoutingConfig = field(default_factory=IntentRoutingConfig)
 
 
 @dataclass(frozen=True)
@@ -130,15 +155,26 @@ def load_config(path: str | Path | None = None) -> SASFConfig:
             weight=b.get("weight", 1),
             tags=b.get("tags", []),
             enabled=b.get("enabled", True),
+            # V7.5 新增：算力分级（默认为 heavy）
+            compute_class=b.get("compute_class", "heavy"),
             vram_high_watermark=b.get("vram_high_watermark"),
             vram_critical_watermark=b.get("vram_critical_watermark"),
         ))
+
+    # ── Gateway Intent Routing（V7.5 新增）────────────────────────────── #
+    intent_raw: dict[str, Any] = gw_raw.get("intent_routing", {})
+    intent_cfg = IntentRoutingConfig(
+        default_compute_class=intent_raw.get("default_compute_class", "heavy"),
+        allow_downgrade=intent_raw.get("allow_downgrade", True),
+        downgrade_model_map=intent_raw.get("downgrade_model_map", {}),
+    )
 
     gateway_cfg = GatewayConfig(
         backends=backends,
         vram_high_watermark=gw_global,
         vram_critical_watermark=gw_critical,
         vram_low_watermark=gw_low,
+        intent_routing=intent_cfg,
     )
 
     # ── Middleware ──────────────────────────────────────────────────────────── #
@@ -162,8 +198,8 @@ def load_config(path: str | Path | None = None) -> SASFConfig:
     )
     for b in backends:
         logger.info(
-            "  · %s (%s, model=%s, weight=%d, tags=%s)",
-            b.url, b.provider, b.model_name, b.weight, b.tags,
+            "  · %s (%s, model=%s, weight=%d, compute_class=%s, tags=%s)",
+            b.url, b.provider, b.model_name, b.weight, b.compute_class, b.tags,
         )
 
     return SASFConfig(

@@ -258,7 +258,102 @@ SpaceWire 总线令牌桶按 `spacewire_bandwidth_kbps` 发放令牌（Byte/s）
 
 **wait_for_condition** 让 Worker 通过 `await Future` 让出控制权，后台遥测流 `batch_write` 时通过 `future.set_result()` 瞬间唤醒，零轮询开销。
 
-### 10. 动态子图挂载（V7.4）
+### 15. 异构计算调度 — 意图感知模型路由（V7.5 核心新增）
+
+太空环境的算力极度不对等：大显存卡跑 7B+ 模型做复杂规划，小卡跑 1.5B 模型做极速 Tool Calling。V7.5 引入**异构算力池**和**意图感知路由**，彻底解决算力碎片与浪费问题。
+
+#### 核心概念
+
+| 概念 | 说明 |
+|------|------|
+| `compute_class` | 后端实例的算力分级标签：`heavy`（7B+ 大模型）或 `light`（1.5B 轻量模型） |
+| `AgentIntent` | Agent 意图枚举：`PLANNER`（复杂规划）/ `EXECUTOR`（工具调用）/ `QA`（问答） |
+| 意图检测 | 根据 `agent_id` 前缀或 `tags` 自动识别 Agent 类型，决定分发算力池 |
+| 动态降级 | heavy 实例 VRAM/Active Connections 超限 → 透明降级到 light 实例 + Header 标记 |
+
+#### 路由决策流
+
+```
+Agent 请求（带 agent_id / tags）
+    │
+    ▼
+┌──────────────────────────────────────────┐
+│  1. 意图检测 (detect_agent_intent)         │
+│     agent_id 前缀匹配                      │
+│     "planner_*" → PLANNER → heavy         │
+│     "executor_*" / "worker_*" → EXECUTOR → light │
+│     "qa_*" / tags 含 "qa" → QA → light    │
+│     默认 → FALLBACK → heavy               │
+└──────────────────────────────────────────┘
+    │
+    ▼
+┌──────────────────────────────────────────┐
+│  2. 亲和路由（Prefix Hash + compute_class 过滤）│
+│     Hash 命中 AND 实例 compute_class 匹配   │
+│     AND 实例 VRAM < High Watermark        │
+│     → 直连历史实例（KV-Cache 复用）         │
+│     （不匹配 → 跳过，进入意图降级路由）       │
+└──────────────────────────────────────────┘
+    │
+    ▼
+┌──────────────────────────────────────────┐
+│  3. 意图降级路由（V7.5 核心）               │
+│     heavy 请求但 heavy 实例满载             │
+│     → 自动降级到 light 实例                │
+│     透明重写 model_name（查降级映射表）      │
+│     响应标记 downgraded: true              │
+└──────────────────────────────────────────┘
+    │
+    ▼
+┌──────────────────────────────────────────┐
+│  4. 兜底路由（Least-Connections）          │
+│     按 compute_class 过滤后最少连接选择     │
+└──────────────────────────────────────────┘
+```
+
+#### 降级模型映射（config.yaml）
+
+```yaml
+intent_routing:
+  default_compute_class: "heavy"
+  allow_downgrade: true
+  downgrade_model_map:         # 降级后使用的替代模型
+    "qwen2.5:7b"              : "qwen2.5:1.5b"
+    "qwen2.5-7b-instruct"    : "qwen2.5-1.5b-instruct"
+    "deepseek-7b"             : "deepseek-1.5b"
+```
+
+#### 透明降级示例
+
+当 Normal 优先级的 QA 查询请求 `qwen2.5:7b` 但 heavy 实例 VRAM 超 85% 时：
+
+```python
+# 请求（上层 Agent 无需感知降级）
+GatewayRequest(
+    model="qwen2.5:7b",
+    agent_id="qa_agent_01",   # → 意图检测为 QA → light 优先
+    priority="NORMAL",
+)
+
+# 响应（含降级元信息，上层 Agent 可见）
+GatewayResponse(
+    model="qwen2.5:1.5b",     # 自动替换为轻量替代模型
+    compute_class="light",      # 实际分发的算力级别
+    downgraded=True,            # 透明降级标记
+    downgrade_reason="算力降级: qwen2.5:7b → qwen2.5:1.5b (高算力实例满载)",
+    ...
+)
+```
+
+#### 异构计算指标埋点（V7.5）
+
+- `compute_downgrade_count`：触发算力降级的总次数
+- `light_model_routed_count`：成功分发给低算力小模型的极速请求次数
+- `heavy_model_routed_count`：分发给高算力大模型的请求次数
+- `light_model_routed_rate`：`light / (light + heavy)` 分发比率
+- `downgrade_rate`：`compute_downgrade / total_requests` 降级触发率
+
+### 16. 动态子图挂载（V7.4）
 
 `DAGTaskGraph.mount_sub_dag(parent_node_id, sub_dag)` 在某节点完成后动态注入子图，支持 Planner 的"空闲算力投机预计算"。自动分配节点 ID 前缀（`parent::`）、重建 Kahn 拓扑排序、检测循环依赖。
 
@@ -284,14 +379,18 @@ SpaceWire 总线令牌桶按 `spacewire_bandwidth_kbps` 发放令牌（Byte/s）
 │  ┌─────────────────────────────────────────────────────────────────────┐  │
 │  │              分布式 LLM 网关 (infra/gateway/)                          │  │
 │  │                                                                         │  │
+│  │  ┌─────────────────────────────────────────────────────────────────┐  │  │
+│  │  │  意图检测 (agent_id/tags) → 异构算力路由                            │  │  │
+│  │  │  Planner Agent ──→ heavy (7B+)  │  Executor/QA ──→ light (1.5B)  │  │  │
+│  │  └─────────────────────────────────────────────────────────────────┘  │  │
 │  │  PrefixAwareLoadBalancer ──→ VRAMWatermarkBreaker ──→ LLMInstancePool │  │
-│  │       (前缀哈希路由)              (优先级准入)           (多节点管理)       │  │
+│  │       (前缀哈希路由)              (优先级准入+动态降级)     (异构节点池)   │  │
 │  │                                                                         │  │
-│  │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐                 │  │
-│  │  │  Backend 1   │  │  Backend 2   │  │  Backend N   │  ← config.yaml   │  │
-│  │  │  Ollama      │  │  SGLang     │  │  vLLM       │                 │  │
-│  │  │  localhost   │  │  192.168.x  │  │  192.168.x  │                 │  │
-│  │  └──────────────┘  └──────────────┘  └──────────────┘                 │  │
+│  │  ┌────────────────────┐  ┌────────────────────┐                       │  │
+│  │  │  heavy 实例 (7B+)   │  │  light 实例 (1.5B) │  ← config.yaml        │  │
+│  │  │  SGLang / vLLM     │  │  Ollama / 小卡      │                       │  │
+│  │  │  localhost:11434   │  │  10.244.37.59:8000 │                       │  │
+│  │  └────────────────────┘  └────────────────────┘                       │  │
 │  └─────────────────────────────────────────────────────────────────────┘  │
 │                               │                                            │
 │                               ▼                                            │
@@ -315,25 +414,38 @@ SpaceWire 总线令牌桶按 `spacewire_bandwidth_kbps` 发放令牌（Byte/s）
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### config.yaml 示例（多后端配置）
+### config.yaml 示例（V7.5 异构算力池配置）
 
 ```yaml
 gateway:
-  vram_high_watermark: 0.85      # 高水位（限流）
-  vram_critical_watermark: 0.92  # 熔断线
+  vram_high_watermark: 0.85       # 高水位（限流）
+  vram_critical_watermark: 0.92   # 熔断线
+  vram_low_watermark: 0.60       # 完全健康
+
+  # V7.5 新增：意图感知路由配置
+  intent_routing:
+    default_compute_class: "heavy"
+    allow_downgrade: true
+    downgrade_model_map:
+      "qwen2.5:7b"            : "qwen2.5:1.5b"
+      "qwen2.5-7b-instruct"   : "qwen2.5-1.5b-instruct"
 
   backends:
-    - url: "http://localhost:11434"        # 本地 Ollama（fallback）
+    # ── 低算力极速实例（1.5B）───────────────────────────────────── #
+    - url: "http://localhost:11434"
       provider: "ollama"
-      model_name: "qwen2.5:7b"
-      weight: 1
-      tags: ["local", "fallback"]
-
-    - url: "http://192.168.1.10:8000"     # SGLang GPU 节点
-      provider: "sglang"
-      model_name: "qwen2.5-7b-instruct"
+      model_name: "qwen2.5:1.5b"
+      compute_class: "light"       # ★ V7.5 异构核心
       weight: 3
-      tags: ["v100", "node-1"]
+      tags: ["local", "fallback", "1.5b"]
+
+    # ── 高算力大模型实例（7B+）────────────────────────────────── #
+    - url: "http://10.244.37.59:8000"
+      provider: "sglang"
+      model_name: "qwen2.5:7b"
+      compute_class: "heavy"       # ★ V7.5 异构核心
+      weight: 2
+      tags: ["v100", "node-1", "7b"]
 ```
 
 ### API 端点
@@ -409,7 +521,7 @@ python demo/demo_mission.py --catalog ./my_labs --skills ./my_skills
 
 | 版本 | 日期 | 核心变化 |
 |------|------|----------|
-| **V7.5** | 2026-04-04 | 令牌桶带宽限流（QoS 三级队列）；AoI 遥测覆写（NORMAL 队列去重）；A2A 语义增量同步 `A2ASemanticDiff`（废弃全量发送）；`bytes_saved_by_aoi` / `critical_avg_queue_latency_ms` / `total_bytes_saved_by_diff` 埋点；OoO 乱序越级执行（ActiveResourceTable + 五层防死锁）；`wait_for_condition` 零开销事件驱动 I/O 挂起；动态子图挂载 `mount_sub_dag`；ResponseSanitizer（剥离 <think>/</think> 推理噪声） |
+| **V7.5** | 2026-04-04 | 令牌桶带宽限流（QoS 三级队列）；AoI 遥测覆写（NORMAL 队列去重）；A2A 语义增量同步 `A2ASemanticDiff`（废弃全量发送）；`bytes_saved_by_aoi` / `critical_avg_queue_latency_ms` / `total_bytes_saved_by_diff` 埋点；OoO 乱序越级执行（ActiveResourceTable + 五层防死锁）；`wait_for_condition` 零开销事件驱动 I/O 挂起；动态子图挂载 `mount_sub_dag`；ResponseSanitizer（剥离 <think>/</think> 推理噪声）；**异构计算调度**（意图感知模型路由 Planner→heavy / Executor→light + compute_class 算力分级 + 动态透明降级 `compute_downgrade_count` / `light_model_routed_count` 指标） |
 | **V7.4** | 2026-04-04 | OoO 乱序越级执行（ActiveResourceTable + 三重准入门 + 五层防死锁）；`wait_for_condition` 零开销事件驱动 I/O 挂起（Pub/Sub + asyncio.Future）；动态子图挂载 `mount_sub_dag`（Kahn 拓扑实时重建）；`ooo_execution_count` / `io_compute_overlap_ms` 埋点 |
 | **V7.3** | 2026-04-04 | ResponseSanitizer（剥离 <think>/</think> 推理噪声）；强制 JSON 输出指令保护；`asyncio.get_running_loop().create_task()` 修复；流式 SSE chunk 净化；PromptTransformationPipeline RAG 确定性重排 + StaticMCP Schema 前缀锁 + SpeculativeWarmer 跨 Agent 预热；Task 0 强制 model 查表覆盖；`cross_agent_cache_hits` / `tool_schema_saved_tokens` 埋点 |
 | **V7.2** | 2026-04-04 | 分布式网关重构：移除单实例 `llm` 节点 → `gateway.backends[]` 多后端配置阵列；`config.yaml` 驱动 `init_distributed_gateway()`；移除 `create_llm()` LangChain 工厂；修复 `_check_instance` async lock 持有 bug |

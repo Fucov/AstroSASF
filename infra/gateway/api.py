@@ -83,6 +83,8 @@ class InstanceRegisterRequest(BaseModel):
     weight: int = Field(default=1, ge=1, description="路由权重")
     model_name: str = Field(default="qwen2.5-7b", description="模型名称")
     tags: list[str] = Field(default_factory=list, description="标签")
+    # V7.5 新增：算力分级
+    compute_class: str = Field(default="heavy", description="算力分级: heavy (7B+) 或 light (1.5B)")
 
 
 class InstanceInfo(BaseModel):
@@ -91,6 +93,8 @@ class InstanceInfo(BaseModel):
     weight: int
     model_name: str
     tags: list[str]
+    # V7.5 新增
+    compute_class: str = "heavy"
     status: str
     vram_ratio: float
     vram_used_gb: float
@@ -100,12 +104,18 @@ class InstanceInfo(BaseModel):
 
 
 class GatewayStatsResponse(BaseModel):
-    """网关统计响应。"""
+    """网关统计响应（含 V7.5 异构算力指标）。"""
     total_requests: int
     successful_requests: int
     failed_requests: int
     success_rate: str
     prefix_cached_rate: str
+    # V7.5 异构算力指标
+    compute_downgrade_count: int = 0
+    light_model_routed_count: int = 0
+    heavy_model_routed_count: int = 0
+    light_model_routed_rate: str = "0.0%"
+    downgrade_rate: str = "0.0%"
     instance_count: int
     healthy_instance_count: int
     routing_table_size: int
@@ -169,13 +179,15 @@ async def init_distributed_gateway(
             weight=backend.weight,
             model_name=backend.model_name,
             tags=backend.tags,
+            # V7.5 新增：算力分级
+            compute_class=backend.compute_class,
         )
         gateway_state.pool.register_instance(inst_config)
 
         logger.info(
-            "[DistributedGateway] 注册 LLM 节点: %s (%s, model=%s, weight=%d, tags=%s)",
+            "[DistributedGateway] 注册 LLM 节点: %s (%s, model=%s, weight=%d, compute_class=%s, tags=%s)",
             backend.url, backend.provider, backend.model_name,
-            backend.weight, backend.tags,
+            backend.weight, backend.compute_class, backend.tags,
         )
 
     # 4. 创建子组件（load_balancer / breaker / proxy）
@@ -185,10 +197,12 @@ async def init_distributed_gateway(
     gateway_state.breaker = VRAMWatermarkBreaker(
         instance_pool=gateway_state.pool,
     )
+    # V7.5：注入完整 config 以支持 intent_routing 配置
     gateway_state.proxy = GatewayProxy(
         instance_pool=gateway_state.pool,
         load_balancer=gateway_state.load_balancer,
         watermark_breaker=gateway_state.breaker,
+        config=config,  # V7.5 新增：传递 intent_routing 配置
     )
 
     # 5. 启动网关
@@ -248,6 +262,7 @@ def register_gateway_routes(app: FastAPI) -> None:
         """分布式 LLM Chat 接口。
 
         支持：
+        - V7.5 异构算力路由（意图感知 + 动态降级）
         - 前缀感知路由（KV-Cache 复用，支持 SGLang RadixAttention）
         - VRAM 水线熔断
         - 优先级感知准入控制
@@ -264,6 +279,8 @@ def register_gateway_routes(app: FastAPI) -> None:
             stream=request.stream,
             priority=request.priority,
             tags=request.tags,
+            # V7.5 新增：意图感知（agent_id 用于识别 Planner/Executor/QA）
+            agent_id=request.agent_id,
         )
 
         response = await gateway_state.proxy.chat(gw_request)
@@ -278,6 +295,7 @@ def register_gateway_routes(app: FastAPI) -> None:
                 },
             )
 
+        # V7.5：响应中包含异构降级元信息
         return {
             "content": response.content,
             "model": response.model,
@@ -289,6 +307,10 @@ def register_gateway_routes(app: FastAPI) -> None:
             "prefix_hash": response.prefix_hash,
             "latency_ms": response.latency_ms,
             "streamed": response.streamed,
+            # V7.5 异构降级标记
+            "downgraded": response.downgraded,
+            "compute_class": response.compute_class,
+            "downgrade_reason": response.downgrade_reason,
         }
 
     @app.post(
@@ -350,6 +372,13 @@ def register_gateway_routes(app: FastAPI) -> None:
             "failed_requests": stats["gateway"]["failed_requests"],
             "success_rate": stats["gateway"]["success_rate"],
             "prefix_cached_rate": stats["gateway"]["prefix_cached_rate"],
+            # V7.5 异构算力指标
+            "compute_downgrade_count": stats["gateway"]["compute_downgrade_count"],
+            "light_model_routed_count": stats["gateway"]["light_model_routed_count"],
+            "heavy_model_routed_count": stats["gateway"]["heavy_model_routed_count"],
+            "light_model_routed_rate": stats["gateway"]["light_model_routed_rate"],
+            "downgrade_rate": stats["gateway"]["downgrade_rate"],
+            # 基础指标
             "instance_count": stats["instance_pool"]["total_instances"],
             "healthy_instance_count": stats["instance_pool"]["healthy_instances"],
             "routing_table_size": stats["load_balancer"]["routing_table_size"],
@@ -377,6 +406,8 @@ def register_gateway_routes(app: FastAPI) -> None:
                 "weight": config.weight if config else 1,
                 "model_name": config.model_name if config else "",
                 "tags": config.tags if config else [],
+                # V7.5 新增
+                "compute_class": inst_stats.get("compute_class", "heavy"),
                 "status": inst_stats["status"],
                 "vram_ratio": float(inst_stats["vram_ratio"].replace("%", "")) / 100,
                 "vram_used_gb": float(inst_stats["vram_used_gb"]),
@@ -395,7 +426,7 @@ def register_gateway_routes(app: FastAPI) -> None:
         summary="注册新实例",
     )
     async def register_instance(req: InstanceRegisterRequest) -> dict[str, Any]:
-        """注册一个新的 LLM 实例。"""
+        """注册一个新的 LLM 实例（V7.5 支持 compute_class）。"""
         if not gateway_state._initialized:
             await init_distributed_gateway()
 
@@ -404,12 +435,14 @@ def register_gateway_routes(app: FastAPI) -> None:
             weight=req.weight,
             model_name=req.model_name,
             tags=req.tags,
+            # V7.5 新增：算力分级
+            compute_class=req.compute_class,
         )
 
         gateway_state.pool.register_instance(config)
         logger.info(
-            "[Admin] 注册实例: %s (weight=%d, model=%s, tags=%s)",
-            req.url, req.weight, req.model_name, req.tags
+            "[Admin] 注册实例: %s (weight=%d, model=%s, compute_class=%s, tags=%s)",
+            req.url, req.weight, req.model_name, req.compute_class, req.tags,
         )
 
         inst = gateway_state.proxy.instance_pool.get_instance(req.url)
@@ -418,6 +451,7 @@ def register_gateway_routes(app: FastAPI) -> None:
             "weight": req.weight,
             "model_name": req.model_name,
             "tags": req.tags,
+            "compute_class": req.compute_class,   # V7.5 新增
             "status": inst.status.name if inst else "UNKNOWN",
             "vram_ratio": inst.vram_ratio if inst else 0.0,
             "vram_used_gb": inst.vram_used_gb if inst else 0.0,

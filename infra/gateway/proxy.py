@@ -1,20 +1,16 @@
 """
-AstroSASF · Infra · Distributed Gateway Proxy (Kernel)
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+AstroSASF · Infra · Gateway Proxy (Kernel)
+==========================================
 分布式 LLM 网关反向代理。
 
-整合 LLMInstancePool、PrefixAwareLoadBalancer、VRAMWatermarkBreaker，
-实现对 AstroSASF 原单机 /api/v1/llm/chat 请求的反向代理。
-
-核心功能：
-1. **请求拦截**：拦截 /api/v1/llm/* 请求
-2. **前缀感知路由**：计算 Prompt 前缀哈希，复用 KV-Cache（支持 SGLang RadixAttention）
-3. **显存熔断**：结合优先级进行准入控制
-4. **流式响应透传**：将 SGLang/vLLM 的流式响应原样透传给客户端
-5. **透明集成**：对上层多智能体完全透明
+V7.5 核心新增：
+- 意图感知异构模型路由（Planner → heavy / Executor → light）
+- 算力超载动态降级：VRAMWatermarkBreaker 高负载时透明降级到 1.5B 模型
+- compute_downgrade_count / light_model_routed_count 异构指标埋点
+- GatewayResponse.downgraded / GatewayResponse.compute_class 透明降级标记
 
 Author: AstroSASF Team
-Version: 7.3
+Version: 7.5
 """
 
 from __future__ import annotations
@@ -29,16 +25,18 @@ from typing import Any, AsyncGenerator
 
 import httpx
 
-from infra.llm.instance_pool import (
+from infra.llm.config_loader import (
+    GatewayConfig,
+    GatewayBackendConfig,
+    IntentRoutingConfig,
     LLMInstanceConfig,
-    LLMInstancePool,
+    load_gateway_config,
 )
-from infra.routing.prefix_balancer import (
+from infra.llm.instance_pool import LLMInstancePool
+from infra.routing import (
     PrefixAwareLoadBalancer,
-    RoutingDecision,
     RoutingStrategy,
-)
-from infra.routing.vram_breaker import (
+    RoutingDecision,
     VRAMWatermarkBreaker,
     AdmissionResult,
 )
@@ -46,54 +44,117 @@ from infra.gateway.transform_pipeline import (
     PromptTransformationPipeline,
     RAGReorderMiddleware,
     StaticMCPMiddleware,
-    SpeculativeWarmer,
     PrefixBuilder,
-    ResponseSanitizer,
+    SpeculativeWarmer,
 )
 
 logger = logging.getLogger(__name__)
 
 
 # --------------------------------------------------------------------------- #
-#  Request/Response Models                                                     #
+#  Gateway Data Models                                                         #
 # --------------------------------------------------------------------------- #
 
 @dataclass
 class GatewayRequest:
-    """网关请求。"""
-    messages: list[dict[str, str]]   # [{"role": "user", "content": "..."}]
-    model: str = ""                  # 模型名称
-    temperature: float = 0.1
+    """LLM 网关请求（V7.5 增强：agent_id 字段用于意图检测）。"""
+    model: str | None = None
+    messages: list[dict[str, str]] = field(default_factory=list)
+    temperature: float = 0.7
     max_tokens: int = 2048
-    stream: bool = False
-    priority: str = "NORMAL"         # NORMAL | HIGH | CRITICAL | LOW
+    request_id: str | None = None
+    priority: str = "NORMAL"
     tags: list[str] = field(default_factory=list)
-    request_id: str = ""
-    arrival_time: float = field(default_factory=time.monotonic)
+    # V7.5 新增：Agent 标识符（用于意图感知路由）
+    agent_id: str | None = None
 
 
 @dataclass
 class GatewayResponse:
-    """网关响应。"""
-    content: str | None    # 非流式响应的内容
+    """LLM 网关响应（V7.5 增强：异构降级标记）。"""
+    content: str
     model: str
-    usage: dict[str, int] | None
-    finish_reason: str | None
+    usage: dict | None = None
+    finish_reason: str | None = None
     request_id: str
     routed_to: str
     routing_strategy: str
     prefix_hash: str
     latency_ms: float
     streamed: bool = False
+    # V7.5 新增：异构算力降级标记
+    downgraded: bool = False                       # 是否经历透明算力降级
+    compute_class: str = "heavy"                  # 实际分发的算力级别
+    downgrade_reason: str | None = None            # 降级原因描述
 
 
 @dataclass
 class GatewayError:
-    """网关错误。"""
     error: str
     error_code: str
-    routed_to: str | None = None
     retry_after: float | None = None
+
+
+# --------------------------------------------------------------------------- #
+#  Response Sanitizer                                                          #
+# --------------------------------------------------------------------------- #
+
+class ResponseSanitizer:
+    """LLM 响应净化器。
+
+    剥离 DeepSeek-R1 等蒸馏模型的 <think>...</think> 推理噪声，
+    防止上层 Planner/Executor Agent 的 JSON 解析器崩溃。
+    """
+
+    THINK_OPEN = "<think>"
+    THINK_CLOSE = "</think>"
+
+    def sanitize(self, content: str) -> str:
+        """一次性净化响应内容。"""
+        result = content
+        result = result.replace(self.THINK_OPEN, "")
+        result = result.replace(self.THINK_CLOSE, "")
+        result = result.strip()
+        return result
+
+    def stream_sanitize_chunk(self, chunk_json: str) -> str | None:
+        """流式净化单个 SSE chunk。"""
+        try:
+            data = json.loads(chunk_json)
+        except json.JSONDecodeError:
+            return chunk_json
+
+        content = (
+            data.get("choices", [{}])[0]
+            .get("delta", {})
+            .get("content", "")
+        )
+
+        has_open = self.THINK_OPEN in content
+        has_close = self.THINK_CLOSE in content
+
+        if has_open and not has_close:
+            return None  # 不完整的开标签 → 丢弃
+
+        if has_close and not content.startswith(self.THINK_OPEN):
+            idx = content.find(self.THINK_CLOSE)
+            return json.dumps({
+                "choices": [{
+                    "delta": {"content": content[idx + len(self.THINK_CLOSE):]},
+                    "finish_reason": data.get("choices", [{}])[0].get("finish_reason"),
+                }]
+            })
+
+        cleaned = content.replace(self.THINK_OPEN, "").replace(self.THINK_CLOSE, "")
+        if cleaned != content:
+            return json.dumps({
+                "choices": [{
+                    "delta": {"content": cleaned},
+                    "finish_reason": data.get("choices", [{}])[0].get("finish_reason"),
+                }]
+            })
+
+        return chunk_json
 
 
 # --------------------------------------------------------------------------- #
@@ -102,46 +163,46 @@ class GatewayError:
 
 @dataclass
 class GatewayProxy:
-    """分布式 LLM 网关反向代理（内核模块）。
+    """分布式 LLM 网关代理（V7.5 异构计算感知版）。
 
-    整合三层组件：
-    - LLMInstancePool：实例管理
-    - PrefixAwareLoadBalancer：前缀感知路由（SGLang RadixAttention KV-Cache 复用）
-    - VRAMWatermarkBreaker：优先级感知准入控制
-
-    请求流程：
-    1. 路由决策 → load_balancer.route()
-    2. 准入检查 → watermark_breaker.check_admission()
-       2a. 熔断拒绝 → _try_fallback_routing()
-       2b. VRAM 拒绝 → _try_fallback_routing()
-    3. 记录连接 → instance_pool.acquire_connection()
-    4. 发送请求 → _do_request() / _do_streaming_request()
-    5. 记录成功 → release_connection() + record_route_success()
+    V7.5 异构计算增强链路：
+    1. **意图检测**：从 request.agent_id / tags 识别 Agent 类型
+    2. **异构路由**：Intent → compute_class（Planner → heavy / Executor → light）
+    3. **Prefix Hash 亲和**：KV-Cache 复用（相同前缀 → 历史实例）
+    4. **动态降级**：heavy 实例 VRAM/连接数超限 → 自动降级到 light 实例
+       - 透明重写 model_name（降级后使用轻量模型）
+       - 响应 Header/Meta 标记 `downgraded: true`
+    5. **透明输出**：GatewayResponse 返回降级元信息，上层 Agent 无需感知
     """
 
-    instance_pool: LLMInstancePool
-    load_balancer: PrefixAwareLoadBalancer | None = None
-    watermark_breaker: VRAMWatermarkBreaker | None = None
+    instance_pool: LLMInstancePool = field(default=None)
+    load_balancer: PrefixAwareLoadBalancer = field(default=None)
+    watermark_breaker: VRAMWatermarkBreaker = field(default=None)
+    config: GatewayConfig | None = None
+
     _http_client: httpx.AsyncClient | None = field(default=None, init=False, repr=False)
     _running: bool = field(default=False, init=False)
-    _lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False, repr=False)
-    # 统计
+    _pipeline: PromptTransformationPipeline | None = field(default=None, init=False)
+    # V7.5 新增：异构算力指标
     _stats: dict[str, int] = field(default_factory=lambda: {
         "total_requests": 0,
         "successful_requests": 0,
         "failed_requests": 0,
-        "prefix_cached_requests": 0,
         "circuit_broken_requests": 0,
         "vram_rejected_requests": 0,
-        "cross_agent_cache_hits": 0,      # 跨智能体预热成功命中次数
-        "tool_schema_saved_tokens": 0,    # StaticMCP 累计节省的 Prefill Tokens
+        "cross_agent_cache_hits": 0,
+        "tool_schema_saved_tokens": 0,
+        "prefix_cached_requests": 0,
+        # V7.5 异构计算指标
+        "compute_downgrade_count": 0,    # 触发算力降级的总次数
+        "light_model_routed_count": 0,   # 成功分发给低算力小模型的极速请求次数
+        "heavy_model_routed_count": 0,   # 分发给高算力大模型的请求次数
     })
-    # Prompt 转换流水线（可选）
-    pipeline: PromptTransformationPipeline | None = field(default=None, init=False)
-    # LLM 响应净化器（剥离 DeepSeek 等蒸馏模型的 <think>/</think> 推理噪声）
     _sanitizer: ResponseSanitizer = field(
         default_factory=ResponseSanitizer, init=False, repr=False,
     )
+    # V7.5 新增：降级模型映射表（config.yaml intent_routing.downgrade_model_map）
+    _downgrade_model_map: dict[str, str] = field(default_factory=dict, init=False)
 
     def __post_init__(self) -> None:
         if self.load_balancer is None:
@@ -156,6 +217,14 @@ class GatewayProxy:
             prefix_builder=PrefixBuilder(),
             warmer=None,  # 启动时注入，见 start()
         )
+
+        # 注入意图路由配置到 LoadBalancer
+        if self.config and self.config.intent_routing:
+            self.load_balancer.set_intent_config(
+                default_compute_class=self.config.intent_routing.default_compute_class,
+                allow_downgrade=self.config.intent_routing.allow_downgrade,
+            )
+            self._downgrade_model_map = dict(self.config.intent_routing.downgrade_model_map)
 
     # ------------------------------------------------------------------------ #
     #  Lifecycle                                                                 #
@@ -173,7 +242,7 @@ class GatewayProxy:
         await self.load_balancer.start()
         await self.instance_pool.start()
 
-        # 注入 URL → model_name 映射（Task 0 核心能力）
+        # 注入 URL → model_name 映射
         url_to_model: dict[str, str] = {
             url: cfg.model_name
             for url, cfg in self.instance_pool.configs.items()
@@ -191,7 +260,11 @@ class GatewayProxy:
                 await self.pipeline.warmer.start()
                 self.pipeline.warmer.set_url_model_map(url_to_model)
 
-        logger.info("[GatewayProxy] 网关代理已启动（含 PromptTransformationPipeline）")
+        logger.info(
+            "[GatewayProxy] 网关代理已启动（V7.5 异构算力感知版）"
+            " | downgrade_model_map=%s",
+            self._downgrade_model_map,
+        )
 
     async def stop(self) -> None:
         """停止网关代理。"""
@@ -210,7 +283,7 @@ class GatewayProxy:
     # ------------------------------------------------------------------------ #
 
     async def _route(self, request: GatewayRequest) -> tuple[RoutingDecision, str]:
-        """执行路由决策和准入检查。
+        """执行路由决策和准入检查（V7.5 增强：agent_id 传入意图路由）。
 
         Returns
         -------
@@ -231,16 +304,17 @@ class GatewayProxy:
         if not user_prompt:
             user_prompt = str(request.messages[-1].get("content", ""))
 
-        # 1. 路由决策
+        # 1. 路由决策（V7.5：传入 agent_id 用于意图检测）
         decision = await self.load_balancer.route(
             prompt=user_prompt,
             system_prompt=system_prompt,
             priority=request.priority,
             tags=request.tags,
             prefer_cached=True,
+            agent_id=request.agent_id,    # V7.5 新增
         )
 
-        # 2. 准入检查
+        # 2. 准入检查（VRAMWatermarkBreaker）
         admission = self.watermark_breaker.check_admission(
             instance=self.instance_pool.get_instance(decision.url),
             priority=request.priority,
@@ -272,6 +346,9 @@ class GatewayProxy:
         if instance is None:
             raise RuntimeError(f"无可用实例: {admission.reason if admission else '未知原因'}")
 
+        cfg = self.instance_pool.configs.get(instance.url)
+        cc = cfg.compute_class if cfg else "heavy"
+
         decision = RoutingDecision(
             url=instance.url,
             strategy=RoutingStrategy.LEAST_CONNECTIONS,
@@ -280,18 +357,70 @@ class GatewayProxy:
             vram_ratio=instance.vram_ratio,
             active_connections=instance.active_connections,
             is_cached=False,
+            compute_class=cc,
         )
 
         return decision, instance.url
+
+    def _resolve_model_for_decision(
+        self,
+        request: GatewayRequest,
+        decision: RoutingDecision,
+    ) -> tuple[str, str | None]:
+        """V7.5 新增：解析请求应使用的真实模型名称。
+
+        若路由决策发生了算力降级（heavy → light），则通过降级模型映射表
+        将原模型名替换为轻量替代模型名。
+
+        Returns
+        -------
+        tuple[str, str | None]
+            (实际使用的 model_name, 降级原因描述)
+            降级原因仅在发生降级时非 None
+        """
+        instance_config = self.instance_pool.configs.get(decision.url)
+        if instance_config is None:
+            return request.model or "qwen2.5:7b", None
+
+        base_model = request.model or instance_config.model_name
+        downgrade_reason: str | None = None
+
+        # Case 1: 路由决策本身已触发降级（负载均衡器直接路由到 light 实例）
+        if decision.is_downgraded and decision.required_compute_class == "heavy":
+            # 查降级映射表，尝试将原始模型替换为轻量替代模型
+            if base_model in self._downgrade_model_map:
+                fallback_model = self._downgrade_model_map[base_model]
+                downgrade_reason = (
+                    f"算力降级: {base_model} → {fallback_model} "
+                    f"(高算力实例满载，透明路由至 {decision.url})"
+                )
+                return fallback_model, downgrade_reason
+            else:
+                # 无映射表，直接使用 light 实例的默认模型
+                downgrade_reason = (
+                    f"算力降级: 高算力实例满载，透明路由至 light 实例 {decision.url}"
+                    f"（使用实例默认模型: {instance_config.model_name}）"
+                )
+                return instance_config.model_name, downgrade_reason
+
+        # Case 2: 正常路由，使用实例默认模型
+        return instance_config.model_name, None
 
     # ------------------------------------------------------------------------ #
     #  HTTP Request Handling                                                     #
     # ------------------------------------------------------------------------ #
 
     async def chat(self, request: GatewayRequest) -> GatewayResponse | GatewayError:
-        """同步 Chat 接口。
+        """同步 Chat 接口（V7.5 异构计算增强）。
 
-        完整链路：Transform → 路由 → 准入 → 连接 → 请求 → 响应 → 预热触发
+        完整链路：
+        Transform → 意图检测 → 异构路由 → Prefix Hash 亲和 →
+        VRAM 准入 → 连接池 → HTTP 请求 → 响应净化 → 预热触发
+
+        V7.5 异构增强：
+        - agent_id 传入 LoadBalancer 进行意图检测
+        - 算力降级时透明替换 model_name
+        - GatewayResponse.downgraded 标记降级状态
         """
         if not request.request_id:
             request.request_id = str(uuid.uuid4())
@@ -301,43 +430,34 @@ class GatewayProxy:
 
         try:
             # 0. Prompt 转换（流量拦截与重构）
-            instance_config: LLMInstanceConfig | None = None
             agent_type = "experiment"
             if self.pipeline:
-                # 推断 Agent 类型
                 agent_type = self.pipeline.infer_agent_type(
                     request.messages, request.tags,
                 )
-                # 执行流水线
                 transformed_messages, transform_ctx = await self.pipeline.transform(
                     request, agent_type=agent_type,
                 )
-                # 将转换后的 messages 写回请求
                 request.messages = transformed_messages
 
-            # 1. 路由 + 准入
+            # 1. 路由 + 准入（V7.5：含意图检测）
             decision, url = await self._route(request)
 
-            # 2. 获取目标实例配置（用于强制 model 覆盖）
-            instance_config = self.instance_pool.configs.get(url)
-            real_model = (
-                instance_config.model_name
-                if instance_config and instance_config.model_name
-                else (request.model or "qwen2.5:7b")
-            )
+            # 2. 解析实际使用的模型（V7.5：降级时透明替换 model_name）
+            real_model, downgrade_reason = self._resolve_model_for_decision(request, decision)
 
-            # 3. 获取连接
+            # 3. 记录异构指标（V7.5 新增）
+            self._record_compute_metrics(decision, downgrade_reason)
+
+            # 4. 获取连接
             await self.instance_pool.acquire_connection(url)
 
             try:
-                # 4. 发送请求（强制使用真实 model_name）
+                # 5. 发送请求
                 result = await self._do_request(url, real_model, request)
                 elapsed_ms = (time.monotonic() - start_time) * 1000
 
-                # 4a. 响应净化：剥离 LLM 返回的 <think>/</think> 推理噪声
-                # 背景：DeepSeek-R1 等蒸馏模型会携带大量推理标签，
-                # 上层 Planner/Executor Agent 的 JSON 解析器会崩溃
-                # 透明修复：网关层统一处理，对上层 Agent 无感
+                # 5a. 响应净化：剥离 <think>/</think> 推理噪声
                 raw_content = result.get("content", "")
                 clean_content = self._sanitizer.sanitize(raw_content)
                 if clean_content != raw_content:
@@ -347,7 +467,7 @@ class GatewayProxy:
                     )
                     result["content"] = clean_content
 
-                # 5. 记录成功
+                # 6. 记录成功
                 await self.instance_pool.release_connection(url, success=True, latency_ms=elapsed_ms)
                 await self.watermark_breaker.on_request_success(url)
                 await self.load_balancer.record_route_success(decision)
@@ -356,14 +476,16 @@ class GatewayProxy:
                 if decision.is_cached:
                     self._stats["prefix_cached_requests"] += 1
 
-                # 6. 触发推测性预热（后台，fire-and-forget）
+                # 7. 触发推测性预热（后台，fire-and-forget）
                 if self.pipeline:
                     self.pipeline.trigger_warmup(request, agent_type, url)
 
                 logger.info(
-                    "[GatewayProxy] 请求完成: %s → %s [%s] model=%s (%.1fms)",
+                    "[GatewayProxy] 请求完成: %s → %s [%s] model=%s compute_class=%s "
+                    "downgraded=%s (%.1fms)",
                     request.request_id[:8], url,
-                    decision.strategy.value, real_model, elapsed_ms,
+                    decision.strategy.value, real_model,
+                    decision.compute_class, decision.is_downgraded, elapsed_ms,
                 )
 
                 return GatewayResponse(
@@ -377,6 +499,10 @@ class GatewayProxy:
                     prefix_hash=decision.prefix_hash,
                     latency_ms=elapsed_ms,
                     streamed=False,
+                    # V7.5 新增：异构降级标记
+                    downgraded=decision.is_downgraded,
+                    compute_class=decision.compute_class,
+                    downgrade_reason=downgrade_reason,
                 )
 
             except Exception as e:
@@ -396,9 +522,9 @@ class GatewayProxy:
             )
 
     async def stream_chat(self, request: GatewayRequest) -> AsyncGenerator[bytes, None]:
-        """流式 Chat 接口。
+        """流式 Chat 接口（V7.5 异构计算增强）。
 
-        完整链路：Transform → 路由 → 准入 → 连接 → 流式请求 → 响应 → 预热触发
+        完整链路：Transform → 意图检测 → 异构路由 → 流式请求 → SSE 净化
         """
         if not request.request_id:
             request.request_id = str(uuid.uuid4())
@@ -420,34 +546,17 @@ class GatewayProxy:
             # 1. 路由 + 准入
             decision, url = await self._route(request)
 
-            # 2. 强制 model 覆盖
-            instance_config = self.instance_pool.configs.get(url)
-            real_model = (
-                instance_config.model_name
-                if instance_config and instance_config.model_name
-                else (request.model or "qwen2.5:7b")
-            )
+            # 2. 解析实际模型（V7.5：降级时透明替换）
+            real_model, downgrade_reason = self._resolve_model_for_decision(request, decision)
+
+            # 3. 记录异构指标
+            self._record_compute_metrics(decision, downgrade_reason)
 
             await self.instance_pool.acquire_connection(url)
 
             try:
                 start_time = time.monotonic()
-                # 流式场景下的思考标签处理策略：
-                #
-                # 方案 A（已实现）：在流式 _do_streaming_request 层面逐 chunk 过滤。
-                #   - 每个 SSE chunk 先经过 _sanitizer.stream_sanitize_chunk() 检查
-                #   - 若 chunk 包含完整 <think>...</think> 标签对 → 整块替换
-                #   - 若 chunk 包含不完整的开标签（仅有 <think> 无</think>）→ 丢弃该 chunk
-                #   - 优点：流式传输过程中实时净化，不等待最终内容
-                #
-                # 方案 B（备选）：流结束后在外部再做 sanitize()
-                #   - 若方案 A 仍有边界残留，可在 stream_chat 外部做最终净化
-                #   - 例如：after collecting full response → sanitizer.sanitize(raw)
-                #
-                # 跨 chunk 标签问题：DeepSeek 的 <think> 块通常单独作为连续几个 chunk
-                # 发送（如 delta.content = "<think>" / delta.content = "温度..." / ...），
-                # 此时 stream_sanitize_chunk() 对每个 chunk 单独判断即可。
-                # 如果流结束后仍有残留，可对聚合内容再做一次 sanitize()。
+                # 流式净化：逐 chunk 过滤 <think>/</think> 思考标签
                 async for chunk in self._do_streaming_request(url, real_model, request, sanitizer=self._sanitizer):
                     yield chunk
 
@@ -460,14 +569,16 @@ class GatewayProxy:
                 if decision.is_cached:
                     self._stats["prefix_cached_requests"] += 1
 
-                # 触发推测性预热（后台，fire-and-forget）
+                # 触发推测性预热
                 if self.pipeline:
                     self.pipeline.trigger_warmup(request, agent_type, url)
 
                 logger.info(
-                    "[GatewayProxy] 流式请求完成: %s → %s [%s] model=%s (%.1fms)",
+                    "[GatewayProxy] 流式请求完成: %s → %s [%s] model=%s compute_class=%s "
+                    "downgraded=%s (%.1fms)",
                     request.request_id[:8], url,
-                    decision.strategy.value, real_model, elapsed_ms,
+                    decision.strategy.value, real_model,
+                    decision.compute_class, decision.is_downgraded, elapsed_ms,
                 )
 
             except Exception:
@@ -482,6 +593,24 @@ class GatewayProxy:
             yield f"data: {error_msg}\n\n".encode("utf-8")
             yield b"data: [DONE]\n\n"
 
+    def _record_compute_metrics(
+        self,
+        decision: RoutingDecision,
+        downgrade_reason: str | None,
+    ) -> None:
+        """V7.5 新增：记录异构算力路由指标。"""
+        if decision.is_downgraded:
+            self._stats["compute_downgrade_count"] += 1
+            logger.info(
+                "[GatewayProxy] 算力降级触发: url=%s reason=%s",
+                decision.url, downgrade_reason,
+            )
+
+        if decision.compute_class == "light":
+            self._stats["light_model_routed_count"] += 1
+        else:
+            self._stats["heavy_model_routed_count"] += 1
+
     # ------------------------------------------------------------------------ #
     #  Internal HTTP Methods                                                     #
     # ------------------------------------------------------------------------ #
@@ -492,7 +621,7 @@ class GatewayProxy:
             raise RuntimeError("HTTP 客户端未初始化")
 
         payload = {
-            "model": real_model,           # 强制使用实例真实 model_name（禁止透传客户端默认值）
+            "model": real_model,
             "messages": request.messages,
             "temperature": request.temperature,
             "max_tokens": request.max_tokens,
@@ -514,7 +643,7 @@ class GatewayProxy:
 
         return {
             "content": content,
-            "model": real_model,           # 回传真实的 model（而非后端可能返回的别名）
+            "model": real_model,
             "usage": data.get("usage"),
             "finish_reason": data["choices"][0].get("finish_reason") if "choices" in data else None,
         }
@@ -526,19 +655,12 @@ class GatewayProxy:
         request: GatewayRequest,
         sanitizer: ResponseSanitizer | None = None,
     ) -> AsyncGenerator[bytes, None]:
-        """发送流式请求到 LLM 实例（透传 SSE）。
-
-        Parameters
-        ----------
-        sanitizer : ResponseSanitizer | None
-            流式响应净化器。如提供，则每个 SSE chunk 在 yield 前会经过
-            stream_sanitize_chunk() 检查，包含不完整思考标签的 chunk 会被丢弃。
-        """
+        """发送流式请求到 LLM 实例（透传 SSE）。"""
         if not self._http_client:
             raise RuntimeError("HTTP 客户端未初始化")
 
         payload = {
-            "model": real_model,           # 强制使用实例真实 model_name
+            "model": real_model,
             "messages": request.messages,
             "temperature": request.temperature,
             "max_tokens": request.max_tokens,
@@ -556,14 +678,11 @@ class GatewayProxy:
 
             async for line in response.aiter_lines():
                 if line.strip() and line.startswith("data: "):
-                    raw_chunk = line[6:].strip()  # 去掉 "data: " 前缀
-                    # 流式净化：检查是否包含思考标签
+                    raw_chunk = line[6:].strip()
                     if sanitizer is not None:
-                        # stream_sanitize_chunk 返回 None 表示该 chunk 应被丢弃
                         cleaned = sanitizer.stream_sanitize_chunk(raw_chunk)
                         if cleaned is None:
                             continue
-                        # 写回 SSE 格式
                         yield f"data: {cleaned}\n".encode("utf-8")
                     else:
                         yield f"{line}\n".encode("utf-8")
@@ -583,9 +702,12 @@ class GatewayProxy:
     # ------------------------------------------------------------------------ #
 
     def get_stats(self) -> dict[str, Any]:
-        """获取聚合统计信息。"""
+        """获取聚合统计信息（含 V7.5 异构计算指标）。"""
         total = self._stats["total_requests"]
         successful = self._stats["successful_requests"]
+        light_count = self._stats["light_model_routed_count"]
+        heavy_count = self._stats["heavy_model_routed_count"]
+        downgrade_count = self._stats["compute_downgrade_count"]
 
         return {
             "gateway": {
@@ -598,6 +720,12 @@ class GatewayProxy:
                 "vram_rejected_requests": self._stats["vram_rejected_requests"],
                 "cross_agent_cache_hits": self._stats["cross_agent_cache_hits"],
                 "tool_schema_saved_tokens": self._stats["tool_schema_saved_tokens"],
+                # V7.5 异构算力指标
+                "compute_downgrade_count": downgrade_count,     # 算力降级触发次数
+                "light_model_routed_count": light_count,       # 低算力极速分发次数
+                "heavy_model_routed_count": heavy_count,       # 高算力大模型分发次数
+                "light_model_routed_rate": f"{light_count / max(1, heavy_count + light_count) * 100:.1f}%",
+                "downgrade_rate": f"{downgrade_count / max(1, total) * 100:.1f}%",
             },
             "instance_pool": self.instance_pool.get_stats(),
             "load_balancer": self.load_balancer.get_stats(),

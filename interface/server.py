@@ -70,7 +70,8 @@ class LLMChatRequest(BaseModel):
     """LLM 推理请求。"""
     messages: list[dict[str, str]] = Field(..., description="消息列表")
     model: str = Field(default="qwen2.5:7b", description="模型名称")
-    agent_id: str = Field(default="http_client", description="调用者 ID")
+    agent_id: str = Field(default="http_client", description="调用者 ID（用于意图检测）")
+    tags: list[str] = Field(default_factory=list, description="标签（用于意图检测，e.g. ['planner'], ['executor']）")
     temperature: float | None = Field(default=None, ge=0.0, le=2.0)
     max_tokens: int | None = Field(default=None, gt=0)
     priority: int = Field(default=2, ge=0, le=3, description="优先级: 0=CRITICAL, 1=HIGH, 2=NORMAL, 3=LOW")
@@ -282,6 +283,9 @@ async def llm_chat(request: LLMChatRequest) -> dict[str, Any]:
         temperature=request.temperature or 0.1,
         max_tokens=request.max_tokens or 2048,
         priority=priority,
+        # V7.5 新增：意图感知
+        agent_id=request.agent_id,
+        tags=request.tags,
     )
 
     try:

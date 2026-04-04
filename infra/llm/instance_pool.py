@@ -61,12 +61,18 @@ DEFAULT_UNHEALTHY_THRESHOLD: int = 3           # 连续失败次数阈值
 
 @dataclass(frozen=True)
 class LLMInstanceConfig:
-    """LLM 实例配置。"""
+    """LLM 实例配置。
+
+    V7.5 新增字段：
+    - compute_class: 算力分级，"heavy"（7B+ 大模型）或 "light"（1.5B 轻量模型）
+    """
     url: str                           # 例如 "http://192.168.1.10:8000"
     provider: str = "ollama"          # "ollama" | "sglang" | "vllm"（决定健康检查路径）
     weight: int = 1                   # 路由权重
     model_name: str = ""               # 模型名称（SGLang/vLLM 部署的模型）
     tags: list[str] = field(default_factory=list)  # 标签，用于路由筛选
+    # V7.5 新增：算力分级（决定异构路由策略）
+    compute_class: str = "heavy"       # "heavy" | "light"
 
 
 @dataclass
@@ -201,6 +207,7 @@ class LLMInstancePool:
         self,
         tags: list[str] | None = None,
         require_healthy: bool = False,
+        compute_class: str | None = None,
     ) -> InstanceMetrics | None:
         """获取负载最轻的可用实例（Least-Connections 策略）。
 
@@ -210,6 +217,8 @@ class LLMInstancePool:
             标签过滤，仅返回包含所有指定标签的实例
         require_healthy : bool
             是否仅返回 HEALTHY 状态的实例
+        compute_class : str | None
+            V7.5 新增：仅返回指定算力分级的实例（"heavy" | "light"）
 
         Returns
         -------
@@ -217,6 +226,12 @@ class LLMInstancePool:
             负载最轻的实例，若无可用实例返回 None
         """
         candidates = self.available_instances
+
+        if compute_class is not None:
+            candidates = [
+                inst for inst in candidates
+                if self.configs[inst.url].compute_class == compute_class
+            ]
 
         if tags:
             candidates = [
@@ -232,6 +247,20 @@ class LLMInstancePool:
             return None
 
         return min(candidates, key=lambda inst: (1 - inst.health_score, inst.active_connections))
+
+    def get_heavy_instances(self) -> list[InstanceMetrics]:
+        """V7.5 新增：返回所有高算力（heavy）可用实例。"""
+        return [
+            inst for inst in self.available_instances
+            if self.configs[inst.url].compute_class == "heavy"
+        ]
+
+    def get_light_instances(self) -> list[InstanceMetrics]:
+        """V7.5 新增：返回所有低算力（light）可用实例。"""
+        return [
+            inst for inst in self.available_instances
+            if self.configs[inst.url].compute_class == "light"
+        ]
 
     async def start(self) -> None:
         """启动实例池（启动健康检查协程）。"""
@@ -472,8 +501,13 @@ class LLMInstancePool:
                     "health_score": f"{m.health_score:.2f}",
                     "avg_latency_ms": f"{m.avg_latency_ms:.1f}",
                     "last_success": m.last_success_time,
+                    # V7.5 新增：算力分级
+                    "compute_class": cfg.compute_class,
+                    "model": cfg.model_name,
                 }
                 for url, m in self.instances.items()
+                for cfg in [self.configs.get(url)]
+                if cfg is not None
             },
         }
 
