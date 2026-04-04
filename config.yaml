@@ -53,3 +53,9 @@ orchestrator:
 middleware:
   spacewire_bandwidth_kbps: 200          # SpaceWire 模拟带宽 (Kbps)
   enable_space_mcp_compression: true     # 是否启用 Space-MCP 二进制压缩
+  # V7.5 新增：令牌桶与 QoS 配置
+  token_bucket_burst_bytes: 1024         # 令牌桶突发容量 (Byte)，允许短时超速
+  aoi_enabled: true                     # 是否启用 AoI 遥测覆写
+  # V7.5 新增：A2A 增量同步配置
+  diff_float_tolerance: 0.001            # Diff 对比时浮点数容差（避免抖动噪声）
+  enable_semantic_diff: true            # 是否启用 A2A 语义增量同步

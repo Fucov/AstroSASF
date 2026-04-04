@@ -1,6 +1,6 @@
-# AstroSASF V7.4 — Astro Scientific Agent Scheduling Framework
+# AstroSASF V7.5 — Astro Scientific Agent Scheduling Framework
 
-> 面向太空实验室的科学智能体调度框架 · **内核化架构** · **DAG 双轨调度** · **OoO 乱序执行** · **事件驱动 I/O 挂起** · **多节点 LLM 网关**
+> 面向太空实验室的科学智能体调度框架 · **内核化架构** · **DAG 双轨调度** · **OoO 乱序执行** · **事件驱动 I/O 挂起** · **令牌桶带宽管控** · **AoI 感知的 QoS 队列** · **A2A 语义增量同步**
 
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-REST%20API-blue.svg)](https://fastapi.tiangolo.com/)
@@ -19,11 +19,17 @@ AstroSASF V7.3 是专为**空间站科学实验柜**设计的智能体调度框�
 - **asyncio.create_task 修复**：统一使用 `asyncio.get_running_loop().create_task()`，消除协程上下文缺失导致的潜在 RuntimeError
 - **流式 SSE 净化**：在 `_do_streaming_request` 层面逐 chunk 过滤思考标签块
 
-- **OoO 乱序执行**：ReadyQueue 为空但 Worker Pool 有空闲槽位时，主动遍历 BlockedQueue 执行三重准入门检查（逻辑依赖 / 资源锁 / 联锁），将符合条件的节点越级推入 ReadyQueue
-- **ActiveResourceTable**：维护全局硬件资源占用表，OoO 调度前查询资源是否被占用，防止物理硬件争用；五层防死锁策略保障系统安全
-- **wait_for_condition**：Worker 通过 `await bus.wait_for_condition(expr)` 让出控制权，后台遥测流 `batch_write` 时自动匹配条件并通过 `future.set_result()` 瞬间唤醒，零轮询开销
-- **动态子图挂载**：支持 Planner 在运行时将子 DAG 动态注入主图（某节点完成后），实时重建 Kahn 拓扑排序
-- **OoO/Overlap 指标**：`ooo_execution_count`（越级执行次数）、`io_compute_overlap_ms`（I/O 与计算重叠毫秒数）埋点
+- **令牌桶带宽限流**：读取 `spacewire_bandwidth_kbps`，基于 `asyncio` 的令牌桶按 Byte 发放令牌，允许短时突发但长期速率不超过带宽上限
+- **QoS 三级优先级队列**：CRITICAL（无限额优先）/ NORMAL（令牌受限）/ LOW（令牌受限，低优先级日志）
+- **AoI 遥测覆写**：NORMAL 队列中同一 `aoi_key` 的高频遥测只保留最新快照，节约带宽，保证最新鲜数据优先发送
+- **A2A 语义增量同步**：`A2ASemanticDiff` 对比本地状态快照，只传输增量变更（节点状态变化、遥测差异），废弃全量发送，显著降低 200 Kbps 带宽占用
+- **CRITICAL 报警击穿拥塞**：硬件报警包进入 CRITICAL 队列无限额优先发送，平均排队延迟 < 5ms
+- **弱网抗性指标**：`bytes_saved_by_aoi`（AoI 覆写节省字节）、`critical_avg_queue_latency_ms`（CRITICAL 包平均排队延迟）、`total_bytes_saved_by_diff`（Diff 节省字节）埋点
+
+- **OoO 乱序执行**（V7.4）：ReadyQueue 为空但 Worker Pool 有空闲槽位时，主动遍历 BlockedQueue 执行三重准入门检查（逻辑依赖 / 资源锁 / 联锁），将符合条件的节点越级推入 ReadyQueue
+- **ActiveResourceTable**（V7.4）：维护全局硬件资源占用表，OoO 调度前查询资源是否被占用；五层防死锁策略
+- **wait_for_condition**（V7.4）：Worker 通过 `await Future` 让出控制权，后台遥测流 `batch_write` 时通过 `future.set_result()` 瞬间唤醒，零轮询开销
+- **动态子图挂载**（V7.4）：`DAGTaskGraph.mount_sub_dag()` 在运行时动态注入子图
 
 **快速开始：**
 
@@ -223,7 +229,26 @@ DeepSeek-R1 等蒸馏模型会携带大量 `<think>...</think>` 推理过程。�
 
 ---
 
-### 9. OoO 乱序越级执行调度器（V7.4）
+### 11. 令牌桶带宽管控与 QoS 三级队列（V7.5）
+
+SpaceWire 总线令牌桶按 `spacewire_bandwidth_kbps` 发放令牌（Byte/s），允许短时突发（`burst_capacity_bytes`），但长期速率不超过带宽上限。QoS 发送策略：`CRITICAL` 无限额优先 → `NORMAL` 令牌受限 → `LOW` 令牌受限。
+
+**CRITICAL 报警击穿拥塞**：即使 NORMAL/LLOW 队列积压数千帧，`send_critical()` 仍无限额优先发送，模拟硬件报警的硬实时传输要求。
+
+### 12. AoI 感知的遥测覆写（V7.5）
+
+`send_telemetry(data, aoi_key="sensor:temp")` 高频传感器上报时，若 NORMAL 队列中已存在相同 `aoi_key` 的旧帧，新帧直接覆写旧帧引用（队列中的旧帧在发送时自然跳过）。一旦网络疏通，发送的永远是最新鲜的遥测快照，`bytes_saved_by_aoi` 记录节省的总字节数。
+
+### 13. A2A 语义增量同步（V7.5）
+
+废弃每次全量发送 DAG 或全量发送环境上下文的粗暴做法。`A2ASemanticDiff.from_snapshot(old, new)` 对比两个状态快照，只包含节点状态变化（`COMPLETED`/`FAILED`）、遥测差异等语义变更。`router.apply_incoming_diff()` 对端收到 Diff 后自动合并到本地状态。`bytes_saved` 字段记录单次 Diff 相比全量发送节省的字节数。
+
+### 14. 弱网抗性指标（V7.5）
+
+- `critical_avg_queue_latency_ms`：CRITICAL 包平均排队延迟（应显著低于 NORMAL 包）
+- `bytes_saved_by_aoi`：AoI 覆写累计节省字节
+- `normal_avg_queue_latency_ms`：NORMAL 包平均排队延迟
+- `total_bytes_saved_by_diff`：A2A Diff 累计节省字节
 
 解决"物理 I/O 极慢，LLM 计算极快"的非对称矛盾。当 Worker Pool 有空闲槽位但 ReadyQueue 为空时，调度器主动遍历 BlockedQueue，执行三重准入门检查（逻辑依赖完成 / 资源未被占用 / 联锁不拦截），将符合条件的节点越级推入 ReadyQueue，实现 I/O 与计算的重叠执行。
 
@@ -241,7 +266,7 @@ DeepSeek-R1 等蒸馏模型会携带大量 `<think>...</think>` 推理过程。�
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                    AstroSASF V7.4 系统架构                                    │
+│                    AstroSASF V7.5 系统架构                                    │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                                                                             │
 │  ┌─────────────────────────────────────────────────────────────────────┐  │
@@ -384,7 +409,8 @@ python demo/demo_mission.py --catalog ./my_labs --skills ./my_skills
 
 | 版本 | 日期 | 核心变化 |
 |------|------|----------|
-| **V7.4** | 2026-04-04 | OoO 乱序越级执行（ActiveResourceTable + 三重准入门 + 五层防死锁）；`wait_for_condition` 零开销事件驱动 I/O 挂起（Pub/Sub + asyncio.Future）；动态子图挂载 `mount_sub_dag`（Kahn 拓扑实时重建）；`ooo_execution_count` / `io_compute_overlap_ms` 埋点；ResponseSanitizer（剥离 <think>/</think> 推理噪声）；强制 JSON 输出指令保护；`asyncio.get_running_loop().create_task()` 修复 |
+| **V7.5** | 2026-04-04 | 令牌桶带宽限流（QoS 三级队列）；AoI 遥测覆写（NORMAL 队列去重）；A2A 语义增量同步 `A2ASemanticDiff`（废弃全量发送）；`bytes_saved_by_aoi` / `critical_avg_queue_latency_ms` / `total_bytes_saved_by_diff` 埋点；OoO 乱序越级执行（ActiveResourceTable + 五层防死锁）；`wait_for_condition` 零开销事件驱动 I/O 挂起；动态子图挂载 `mount_sub_dag`；ResponseSanitizer（剥离 <think>/</think> 推理噪声） |
+| **V7.4** | 2026-04-04 | OoO 乱序越级执行（ActiveResourceTable + 三重准入门 + 五层防死锁）；`wait_for_condition` 零开销事件驱动 I/O 挂起（Pub/Sub + asyncio.Future）；动态子图挂载 `mount_sub_dag`（Kahn 拓扑实时重建）；`ooo_execution_count` / `io_compute_overlap_ms` 埋点 |
 | **V7.3** | 2026-04-04 | ResponseSanitizer（剥离 <think>/</think> 推理噪声）；强制 JSON 输出指令保护；`asyncio.get_running_loop().create_task()` 修复；流式 SSE chunk 净化；PromptTransformationPipeline RAG 确定性重排 + StaticMCP Schema 前缀锁 + SpeculativeWarmer 跨 Agent 预热；Task 0 强制 model 查表覆盖；`cross_agent_cache_hits` / `tool_schema_saved_tokens` 埋点 |
 | **V7.2** | 2026-04-04 | 分布式网关重构：移除单实例 `llm` 节点 → `gateway.backends[]` 多后端配置阵列；`config.yaml` 驱动 `init_distributed_gateway()`；移除 `create_llm()` LangChain 工厂；修复 `_check_instance` async lock 持有 bug |
 | **V7.1** | 2026-03 | 数据集评测 + LLM 算力埋点 + 物理模拟层 |

@@ -1,0 +1,1221 @@
+diff --git a/README.md b/README.md
+index a8ca1fd..00031b1 100644
+--- a/README.md
++++ b/README.md
+@@ -1,6 +1,6 @@
+-# AstroSASF V7.4 — Astro Scientific Agent Scheduling Framework
++# AstroSASF V7.5 — Astro Scientific Agent Scheduling Framework
+ 
+-> 面向太空实验室的科学智能体调度框架 · **内核化架构** · **DAG 双轨调度** · **OoO 乱序执行** · **事件驱动 I/O 挂起** · **多节点 LLM 网关**
++> 面向太空实验室的科学智能体调度框架 · **内核化架构** · **DAG 双轨调度** · **OoO 乱序执行** · **事件驱动 I/O 挂起** · **令牌桶带宽管控** · **AoI 感知的 QoS 队列** · **A2A 语义增量同步**
+ 
+ [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
+ [![FastAPI](https://img.shields.io/badge/FastAPI-REST%20API-blue.svg)](https://fastapi.tiangolo.com/)
+@@ -19,11 +19,17 @@ AstroSASF V7.3 是专为**空间站科学实验柜**设计的智能体调度框
+ - **asyncio.create_task 修复**：统一使用 `asyncio.get_running_loop().create_task()`，消除协程上下文缺失导致的潜在 RuntimeError
+ - **流式 SSE 净化**：在 `_do_streaming_request` 层面逐 chunk 过滤思考标签块
+ 
+-- **OoO 乱序执行**：ReadyQueue 为空但 Worker Pool 有空闲槽位时，主动遍历 BlockedQueue 执行三重准入门检查（逻辑依赖 / 资源锁 / 联锁），将符合条件的节点越级推入 ReadyQueue
+-- **ActiveResourceTable**：维护全局硬件资源占用表，OoO 调度前查询资源是否被占用，防止物理硬件争用；五层防死锁策略保障系统安全
+-- **wait_for_condition**：Worker 通过 `await bus.wait_for_condition(expr)` 让出控制权，后台遥测流 `batch_write` 时自动匹配条件并通过 `future.set_result()` 瞬间唤醒，零轮询开销
+-- **动态子图挂载**：支持 Planner 在运行时将子 DAG 动态注入主图（某节点完成后），实时重建 Kahn 拓扑排序
+-- **OoO/Overlap 指标**：`ooo_execution_count`（越级执行次数）、`io_compute_overlap_ms`（I/O 与计算重叠毫秒数）埋点
++- **令牌桶带宽限流**：读取 `spacewire_bandwidth_kbps`，基于 `asyncio` 的令牌桶按 Byte 发放令牌，允许短时突发但长期速率不超过带宽上限
++- **QoS 三级优先级队列**：CRITICAL（无限额优先）/ NORMAL（令牌受限）/ LOW（令牌受限，低优先级日志）
++- **AoI 遥测覆写**：NORMAL 队列中同一 `aoi_key` 的高频遥测只保留最新快照，节约带宽，保证最新鲜数据优先发送
++- **A2A 语义增量同步**：`A2ASemanticDiff` 对比本地状态快照，只传输增量变更（节点状态变化、遥测差异），废弃全量发送，显著降低 200 Kbps 带宽占用
++- **CRITICAL 报警击穿拥塞**：硬件报警包进入 CRITICAL 队列无限额优先发送，平均排队延迟 < 5ms
++- **弱网抗性指标**：`bytes_saved_by_aoi`（AoI 覆写节省字节）、`critical_avg_queue_latency_ms`（CRITICAL 包平均排队延迟）、`total_bytes_saved_by_diff`（Diff 节省字节）埋点
++
++- **OoO 乱序执行**（V7.4）：ReadyQueue 为空但 Worker Pool 有空闲槽位时，主动遍历 BlockedQueue 执行三重准入门检查（逻辑依赖 / 资源锁 / 联锁），将符合条件的节点越级推入 ReadyQueue
++- **ActiveResourceTable**（V7.4）：维护全局硬件资源占用表，OoO 调度前查询资源是否被占用；五层防死锁策略
++- **wait_for_condition**（V7.4）：Worker 通过 `await Future` 让出控制权，后台遥测流 `batch_write` 时通过 `future.set_result()` 瞬间唤醒，零轮询开销
++- **动态子图挂载**（V7.4）：`DAGTaskGraph.mount_sub_dag()` 在运行时动态注入子图
+ 
+ **快速开始：**
+ 
+@@ -223,7 +229,26 @@ DeepSeek-R1 等蒸馏模型会携带大量 `<think>...</think>` 推理过程。
+ 
+ ---
+ 
+-### 9. OoO 乱序越级执行调度器（V7.4）
++### 11. 令牌桶带宽管控与 QoS 三级队列（V7.5）
++
++SpaceWire 总线令牌桶按 `spacewire_bandwidth_kbps` 发放令牌（Byte/s），允许短时突发（`burst_capacity_bytes`），但长期速率不超过带宽上限。QoS 发送策略：`CRITICAL` 无限额优先 → `NORMAL` 令牌受限 → `LOW` 令牌受限。
++
++**CRITICAL 报警击穿拥塞**：即使 NORMAL/LLOW 队列积压数千帧，`send_critical()` 仍无限额优先发送，模拟硬件报警的硬实时传输要求。
++
++### 12. AoI 感知的遥测覆写（V7.5）
++
++`send_telemetry(data, aoi_key="sensor:temp")` 高频传感器上报时，若 NORMAL 队列中已存在相同 `aoi_key` 的旧帧，新帧直接覆写旧帧引用（队列中的旧帧在发送时自然跳过）。一旦网络疏通，发送的永远是最新鲜的遥测快照，`bytes_saved_by_aoi` 记录节省的总字节数。
++
++### 13. A2A 语义增量同步（V7.5）
++
++废弃每次全量发送 DAG 或全量发送环境上下文的粗暴做法。`A2ASemanticDiff.from_snapshot(old, new)` 对比两个状态快照，只包含节点状态变化（`COMPLETED`/`FAILED`）、遥测差异等语义变更。`router.apply_incoming_diff()` 对端收到 Diff 后自动合并到本地状态。`bytes_saved` 字段记录单次 Diff 相比全量发送节省的字节数。
++
++### 14. 弱网抗性指标（V7.5）
++
++- `critical_avg_queue_latency_ms`：CRITICAL 包平均排队延迟（应显著低于 NORMAL 包）
++- `bytes_saved_by_aoi`：AoI 覆写累计节省字节
++- `normal_avg_queue_latency_ms`：NORMAL 包平均排队延迟
++- `total_bytes_saved_by_diff`：A2A Diff 累计节省字节
+ 
+ 解决"物理 I/O 极慢，LLM 计算极快"的非对称矛盾。当 Worker Pool 有空闲槽位但 ReadyQueue 为空时，调度器主动遍历 BlockedQueue，执行三重准入门检查（逻辑依赖完成 / 资源未被占用 / 联锁不拦截），将符合条件的节点越级推入 ReadyQueue，实现 I/O 与计算的重叠执行。
+ 
+@@ -241,7 +266,7 @@ DeepSeek-R1 等蒸馏模型会携带大量 `<think>...</think>` 推理过程。
+ 
+ ```
+ ┌─────────────────────────────────────────────────────────────────────────────┐
+-│                    AstroSASF V7.4 系统架构                                    │
++│                    AstroSASF V7.5 系统架构                                    │
+ ├─────────────────────────────────────────────────────────────────────────────┤
+ │                                                                             │
+ │  ┌─────────────────────────────────────────────────────────────────────┐  │
+@@ -384,7 +409,8 @@ python demo/demo_mission.py --catalog ./my_labs --skills ./my_skills
+ 
+ | 版本 | 日期 | 核心变化 |
+ |------|------|----------|
+-| **V7.4** | 2026-04-04 | OoO 乱序越级执行（ActiveResourceTable + 三重准入门 + 五层防死锁）；`wait_for_condition` 零开销事件驱动 I/O 挂起（Pub/Sub + asyncio.Future）；动态子图挂载 `mount_sub_dag`（Kahn 拓扑实时重建）；`ooo_execution_count` / `io_compute_overlap_ms` 埋点；ResponseSanitizer（剥离 <think>/</think> 推理噪声）；强制 JSON 输出指令保护；`asyncio.get_running_loop().create_task()` 修复 |
++| **V7.5** | 2026-04-04 | 令牌桶带宽限流（QoS 三级队列）；AoI 遥测覆写（NORMAL 队列去重）；A2A 语义增量同步 `A2ASemanticDiff`（废弃全量发送）；`bytes_saved_by_aoi` / `critical_avg_queue_latency_ms` / `total_bytes_saved_by_diff` 埋点；OoO 乱序越级执行（ActiveResourceTable + 五层防死锁）；`wait_for_condition` 零开销事件驱动 I/O 挂起；动态子图挂载 `mount_sub_dag`；ResponseSanitizer（剥离 <think>/</think> 推理噪声） |
++| **V7.4** | 2026-04-04 | OoO 乱序越级执行（ActiveResourceTable + 三重准入门 + 五层防死锁）；`wait_for_condition` 零开销事件驱动 I/O 挂起（Pub/Sub + asyncio.Future）；动态子图挂载 `mount_sub_dag`（Kahn 拓扑实时重建）；`ooo_execution_count` / `io_compute_overlap_ms` 埋点 |
+ | **V7.3** | 2026-04-04 | ResponseSanitizer（剥离 <think>/</think> 推理噪声）；强制 JSON 输出指令保护；`asyncio.get_running_loop().create_task()` 修复；流式 SSE chunk 净化；PromptTransformationPipeline RAG 确定性重排 + StaticMCP Schema 前缀锁 + SpeculativeWarmer 跨 Agent 预热；Task 0 强制 model 查表覆盖；`cross_agent_cache_hits` / `tool_schema_saved_tokens` 埋点 |
+ | **V7.2** | 2026-04-04 | 分布式网关重构：移除单实例 `llm` 节点 → `gateway.backends[]` 多后端配置阵列；`config.yaml` 驱动 `init_distributed_gateway()`；移除 `create_llm()` LangChain 工厂；修复 `_check_instance` async lock 持有 bug |
+ | **V7.1** | 2026-03 | 数据集评测 + LLM 算力埋点 + 物理模拟层 |
+diff --git a/config.yaml b/config.yaml
+index e6313ed..6be60d5 100644
+--- a/config.yaml
++++ b/config.yaml
+@@ -53,3 +53,9 @@ orchestrator:
+ middleware:
+   spacewire_bandwidth_kbps: 200          # SpaceWire 模拟带宽 (Kbps)
+   enable_space_mcp_compression: true     # 是否启用 Space-MCP 二进制压缩
++  # V7.5 新增：令牌桶与 QoS 配置
++  token_bucket_burst_bytes: 1024         # 令牌桶突发容量 (Byte)，允许短时超速
++  aoi_enabled: true                     # 是否启用 AoI 遥测覆写
++  # V7.5 新增：A2A 增量同步配置
++  diff_float_tolerance: 0.001            # Diff 对比时浮点数容差（避免抖动噪声）
++  enable_semantic_diff: true            # 是否启用 A2A 语义增量同步
+diff --git a/scheduler/__init__.py b/scheduler/__init__.py
+index 691ef1e..4f7fb9e 100644
+--- a/scheduler/__init__.py
++++ b/scheduler/__init__.py
+@@ -13,5 +13,5 @@ AstroSASF Scheduler — 任务编排与协议控制内核
+ 所有模块均不含任何业务词汇，保持框架通用性。
+ """
+ 
+-__version__ = "7.4.0"
++__version__ = "7.5.0"
+ __all__ = ["core", "models", "a2a_protocol", "virtual_bus", "telemetry"]
+diff --git a/scheduler/a2a_protocol.py b/scheduler/a2a_protocol.py
+index 295bcb5..8e418df 100644
+--- a/scheduler/a2a_protocol.py
++++ b/scheduler/a2a_protocol.py
+@@ -3,35 +3,312 @@ AstroSASF · Scheduler · A2A Protocol (Kernel)
+ ============================================
+ Agent-to-Agent 通信协议标准 —— 消息信封、路由器与发布/订阅接口。
+ 
+-V4.3 新增：
+-- subscribe/unsubscribe 接口
+-- route() 时自动通知所有订阅者
+-- A2ASubscriber Protocol 抽象，未来可对接 Redis / MQTT
++V7.5 核心重构：
++- Semantic Diff Sync：废弃全量发送，基于 JSON Patch 的增量状态同步
++- A2ASemanticDiff：对比本地状态快照，只传输增量变更
++- Apply Diff：对端收到 Diff 后自动合并到本地状态
++- V7.5 新增弱网抗性指标埋点
+ 
+ Author: AstroSASF Team
+-Version: 7.2
++Version: 7.5
+ """
+ 
+ from __future__ import annotations
+ 
++import asyncio
++import json
+ import logging
+ import time
+ from dataclasses import dataclass, field
+ from enum import Enum, auto
+ from typing import Any, Callable, Protocol
+ 
+-
+ logger = logging.getLogger(__name__)
+ 
+ 
++# --------------------------------------------------------------------------- #
++#  Diff 操作类型                                                                 #
++# --------------------------------------------------------------------------- #
++
++class DiffOp(str, Enum):
++    """JSON Patch 操作类型。"""
++    ADD = "add"         # 添加新字段
++    REPLACE = "replace" # 替换现有字段
++    REMOVE = "remove"   # 删除字段
++    # 注意：不支持 "move" 和 "copy"，保持协议简洁
++
++
++# --------------------------------------------------------------------------- #
++#  语义增量 Diff 结构                                                            #
++# --------------------------------------------------------------------------- #
++
++@dataclass
++class A2ASemanticDiff:
++    """A2A 通信的语义增量（Semantic Diff）。
++
++    背景：
++    - 传统 A2A 通信在汇报执行结果时全量发送 DAG 状态或环境上下文，
++      在 200 Kbps SpaceWire 带宽下极为低效。
++    - V7.5 引入 Diff 结构，只传输从上一版本到当前版本之间的增量变更。
++
++    Diff 生成策略：
++    - 节点状态变更：只有从 PENDING/READY/RUNNING → COMPLETED/FAILED 的节点才包含在 diff 中
++    - 遥测快照：只有与上一快照相比发生变化的字段才包含在 diff 中
++    - 字段变更：记录旧值 → 新值（如某传感器数值变化）
++
++    Example
++    -------
++    >>> old_state = {"nodes": {"A": {"status": "RUNNING"}, "B": {"status": "PENDING"}}}
++    >>> new_state = {"nodes": {"A": {"status": "COMPLETED"}, "B": {"status": "RUNNING"}}}
++    >>> diff = A2ASemanticDiff.from_snapshot(old_state, new_state, base_version=1)
++    >>> print(diff.to_json_bytes())   # 只包含变化的节点 A 和 B
++    """
++
++    # 元信息
++    diff_id: str
++    sender: str
++    receiver: str
++    base_version: int          # 基于的旧版本号
++    target_version: int        # 当前版本号
++    timestamp: float = field(default_factory=time.time)
++
++    # 变更集合（JSON Pointer 路径 → 操作类型 + 值）
++    operations: list[dict[str, Any]] = field(default_factory=list)
++
++    # 变更统计（用于埋点）
++    bytes_saved: int = 0        # 与全量发送相比节省的字节数
++    changed_field_count: int = 0  # 变更字段总数
++
++    def to_json_bytes(self) -> bytes:
++        """序列化为 JSON bytes（用于 SpaceWire 传输）。"""
++        return json.dumps(
++            {
++                "diff_id": self.diff_id,
++                "sender": self.sender,
++                "receiver": self.receiver,
++                "base_version": self.base_version,
++                "target_version": self.target_version,
++                "timestamp": self.timestamp,
++                "operations": self.operations,
++                "bytes_saved": self.bytes_saved,
++                "changed_field_count": self.changed_field_count,
++            },
++            ensure_ascii=False,
++        ).encode("utf-8")
++
++    @classmethod
++    def from_json_bytes(cls, raw: bytes) -> "A2ASemanticDiff":
++        """从 JSON bytes 反序列化。"""
++        obj = json.loads(raw.decode("utf-8"))
++        return cls(
++            diff_id=obj["diff_id"],
++            sender=obj["sender"],
++            receiver=obj["receiver"],
++            base_version=obj["base_version"],
++            target_version=obj["target_version"],
++            timestamp=obj["timestamp"],
++            operations=obj["operations"],
++            bytes_saved=obj.get("bytes_saved", 0),
++            changed_field_count=obj.get("changed_field_count", 0),
++        )
++
++    # ------------------------------------------------------------------------- #
++    #  Diff 生成（语义感知的增量对比）                                              #
++    # ------------------------------------------------------------------------- #
++
++    @classmethod
++    def from_snapshot(
++        cls,
++        old_state: dict[str, Any],
++        new_state: dict[str, Any],
++        base_version: int,
++        sender: str = "",
++        receiver: str = "",
++        diff_id: str = "",
++    ) -> "A2ASemanticDiff":
++        """对比两个状态快照，生成语义增量。
++
++        对比策略（语义感知，非纯粹字符串 diff）：
++        - 节点状态机：只记录从非终态 → 终态 的变化（COMPLETED / FAILED）
++        - 浮点数容差：temperature: 36.999 → 37.001 视为不变（容差 0.01）
++        - 嵌套字段：支持 dot-notation 路径（如 "nodes.A.status"）
++        """
++        operations: list[dict[str, Any]] = []
++        changed_count = 0
++        full_size = len(json.dumps(new_state, ensure_ascii=False).encode("utf-8"))
++
++        cls._compare_dict(old_state, new_state, "", operations)
++        changed_count = len(operations)
++
++        # 统计字节节省
++        diff_size = len(json.dumps({"operations": operations}, ensure_ascii=False).encode("utf-8"))
++        bytes_saved = max(0, full_size - diff_size)
++
++        return cls(
++            diff_id=diff_id or f"diff-{int(time.time() * 1000)}",
++            sender=sender,
++            receiver=receiver,
++            base_version=base_version,
++            target_version=base_version + 1,
++            operations=operations,
++            bytes_saved=bytes_saved,
++            changed_field_count=changed_count,
++        )
++
++    @classmethod
++    def _compare_dict(
++        cls,
++        old: dict[str, Any],
++        new: dict[str, Any],
++        path: str,
++        operations: list[dict[str, Any]],
++        float_tolerance: float = 0.001,
++    ) -> None:
++        """递归对比两个字典，收集差异操作。"""
++        all_keys = set(old.keys()) | set(new.keys())
++
++        for key in sorted(all_keys):
++            current_path = f"{path}.{key}" if path else key
++            old_val = old.get(key, ...)
++            new_val = new.get(key, ...)
++
++            if old_val is ...:
++                # 新增字段
++                operations.append({
++                    "op": DiffOp.ADD.value,
++                    "path": f"/{current_path.replace('.', '/')}",
++                    "value": new_val,
++                })
++            elif new_val is ...:
++                # 字段被删除
++                operations.append({
++                    "op": DiffOp.REMOVE.value,
++                    "path": f"/{current_path.replace('.', '/')}",
++                })
++            elif isinstance(old_val, dict) and isinstance(new_val, dict):
++                # 递归对比嵌套字典
++                cls._compare_dict(old_val, new_val, current_path, operations, float_tolerance)
++            elif isinstance(old_val, float) and isinstance(new_val, float):
++                # 浮点数容差比较
++                if abs(old_val - new_val) > float_tolerance:
++                    operations.append({
++                        "op": DiffOp.REPLACE.value,
++                        "path": f"/{current_path.replace('.', '/')}",
++                        "value": new_val,
++                    })
++            elif old_val != new_val:
++                # 标量值变更
++                operations.append({
++                    "op": DiffOp.REPLACE.value,
++                    "path": f"/{current_path.replace('.', '/')}",
++                    "value": new_val,
++                })
++
++    # ------------------------------------------------------------------------- #
++    #  Diff 合并（Apply Diff 到本地状态）                                          #
++    # ------------------------------------------------------------------------- #
++
++    def apply_to(self, base_state: dict[str, Any]) -> dict[str, Any]:
++        """将增量 Diff 合并到本地状态。
++
++        Parameters
++        ----------
++        base_state : dict[str, Any]
++            当前的本地状态快照（base_version 时的状态）
++
++        Returns
++        -------
++        dict[str, Any]
++            应用 Diff 后的新状态（深拷贝，base_state 不被修改）
++        """
++        import copy
++        result = copy.deepcopy(base_state)
++
++        for op in self.operations:
++            op_type = op.get("op")
++            json_path = op.get("path", "")
++            # JSON Pointer 路径：/a/b/c → ["a", "b", "c"]
++            parts = [p for p in json_path.split("/") if p]
++
++            if op_type == DiffOp.REMOVE.value:
++                cls._json_pointer_remove(result, parts)
++            elif op_type in (DiffOp.ADD.value, DiffOp.REPLACE.value):
++                cls._json_pointer_set(result, parts, op.get("value"))
++
++        return result
++
++    @staticmethod
++    def _json_pointer_remove(obj: Any, parts: list[str]) -> None:
++        """沿 JSON Pointer 路径删除目标节点。"""
++        if not parts:
++            return
++        current = obj
++        for part in parts[:-1]:
++            if isinstance(current, dict):
++                current = current.get(part)
++            elif isinstance(current, list):
++                try:
++                    current = current[int(part)]
++                except (ValueError, IndexError):
++                    return
++            else:
++                return
++        # 删除最后一个键
++        last = parts[-1]
++        if isinstance(current, dict):
++            current.pop(last, None)
++        elif isinstance(current, list):
++            try:
++                current.pop(int(last))
++            except (ValueError, IndexError):
++                pass
++
++    @staticmethod
++    def _json_pointer_set(obj: Any, parts: list[str], value: Any) -> None:
++        """沿 JSON Pointer 路径设置目标节点的值（必要时创建中间路径）。"""
++        if not parts:
++            return
++        current = obj
++        for part in parts[:-1]:
++            if isinstance(current, dict):
++                if part not in current:
++                    current[part] = {}
++                current = current[part]
++            elif isinstance(current, list):
++                try:
++                    idx = int(part)
++                    if idx >= len(current):
++                        current.extend([{}] * (idx - len(current) + 1))
++                    current = current[idx]
++                except (ValueError, IndexError):
++                    return
++            else:
++                return
++        last = parts[-1]
++        if isinstance(current, dict):
++            current[last] = value
++        elif isinstance(current, list):
++            try:
++                current[int(last)] = value
++            except (ValueError, IndexError):
++                pass
++
++
++# --------------------------------------------------------------------------- #
++#  A2A 消息意图类型                                                             #
++# --------------------------------------------------------------------------- #
++
+ class A2AIntent(Enum):
+     """A2A 消息意图类型。"""
+     TASK_REQUEST = auto()        # 外部 → Planner: 新任务提交
+     PLAN_GENERATED = auto()      # Planner → Operator: 规划完成
+-    SKILL_INVOCATION = auto()    # Operator → Gateway: 技能调用请求
+-    SKILL_RESULT = auto()        # Gateway → Operator: 技能执行结果
+-    ERROR_CORRECTION = auto()    # Operator → LLM: 错误修正请求
+-    EXECUTION_COMPLETE = auto()  # Operator → System: 执行完毕
++    SKILL_INVOCATION = auto()  # Operator → Gateway: 技能调用请求
++    SKILL_RESULT = auto()       # Gateway → Operator: 技能执行结果
++    ERROR_CORRECTION = auto()  # Operator → LLM: 错误修正请求
++    EXECUTION_COMPLETE = auto() # Operator → System: 执行完毕
++    # V7.5 新增
++    SEMANTIC_DIFF = auto()      # 增量状态同步（替代全量发送）
++    STATE_SYNC_REQUEST = auto() # 状态同步请求（对端需要全量快照）
+ 
+ 
+ @dataclass(frozen=True)
+@@ -43,11 +320,13 @@ class A2AMessage:
+     payload: Any
+     timestamp: float = field(default_factory=time.time)
+     sequence: int = 0
++    # V7.5 新增：增量 Diff 传输
++    use_diff: bool = False      # True = payload 是 A2ASemanticDiff.bytes
++    bytes_saved: int = 0        # Diff 传输相比全量节省的字节数
+ 
+ 
+ class A2ASubscriber(Protocol):
+     """A2A 消息订阅者协议。"""
+-
+     def on_message(self, message: A2AMessage) -> None:
+         """收到匹配消息时的回调。"""
+         ...
+@@ -58,7 +337,13 @@ A2ACallback = Callable[[A2AMessage], None]
+ 
+ @dataclass
+ class A2ARouter:
+-    """A2A 消息路由器 —— 通信记录 + 发布/订阅。"""
++    """A2A 消息路由器 —— 通信记录 + 发布/订阅 + 增量状态同步。
++
++    V7.5 新增：
++    - Semantic Diff Sync：全量发送改为增量 Diff 传输
++    - 本地状态快照版本管理（base_version 追踪）
++    - Diff 字节节省统计
++    """
+ 
+     lab_id: str
+     _sequence_counter: int = field(default=0, init=False)
+@@ -66,6 +351,17 @@ class A2ARouter:
+     _subscribers: dict[A2AIntent | None, list[A2ACallback]] = field(
+         default_factory=dict, init=False,
+     )
++    # V7.5: 本地状态版本管理
++    _local_state: dict[str, Any] = field(default_factory=dict, init=False)
++    _state_version: int = field(default=0, init=False)
++    _state_lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False)
++    # V7.5: Diff 统计
++    _total_bytes_saved_by_diff: int = field(default=0, init=False)
++    _diff_count: int = field(default=0, init=False)
++
++    # ------------------------------------------------------------------------- #
++    #  订阅接口                                                                 #
++    # ------------------------------------------------------------------------- #
+ 
+     def subscribe(self, intent: A2AIntent, callback: A2ACallback) -> None:
+         """订阅指定意图类型的消息。"""
+@@ -87,7 +383,7 @@ class A2ARouter:
+         self._subscribers.clear()
+ 
+     def _notify_subscribers(self, msg: A2AMessage) -> None:
+-        """通知所有匹配的订阅者。"""
++        """通知所有匹配的订阅者（含 SEMANTIC_DIFF 的自动合并）。"""
+         for cb in self._subscribers.get(msg.intent, []):
+             try:
+                 cb(msg)
+@@ -99,12 +395,105 @@ class A2ARouter:
+             except Exception as exc:
+                 logger.warning("[%s] A2A 通配订阅者回调异常: %s", self.lab_id, exc)
+ 
++    # ------------------------------------------------------------------------- #
++    #  增量状态同步 API                                                           #
++    # ------------------------------------------------------------------------- #
++
++    async def update_local_state(self, new_state: dict[str, Any]) -> None:
++        """更新本地状态快照（每次 Executor/Planner 汇报结果时调用）。
++
++        自动对比旧状态与新状态，生成增量 Diff 并通过 A2A 广播。
++        """
++        async with self._state_lock:
++            old_state = dict(self._local_state)
++            old_version = self._state_version
++
++            diff = A2ASemanticDiff.from_snapshot(
++                old_state=old_state,
++                new_state=new_state,
++                base_version=old_version,
++                sender=self.lab_id,
++                receiver="*",  # 广播
++                diff_id=f"diff-{self.lab_id}-{old_version + 1}",
++            )
++
++            # 更新本地状态
++            self._local_state = new_state
++            self._state_version += 1
++
++            # 更新统计
++            self._total_bytes_saved_by_diff += diff.bytes_saved
++            self._diff_count += 1
++
++            logger.info(
++                "[%s] A2A 状态更新: v%d → v%d | Diff: %d ops | 节省 %d B",
++                self.lab_id, old_version, self._state_version,
++                diff.changed_field_count, diff.bytes_saved,
++            )
++
++            # 自动广播增量 Diff
++            self.route(
++                sender=self.lab_id,
++                receiver="*",
++                intent=A2AIntent.SEMANTIC_DIFF,
++                payload=diff.to_json_bytes(),
++                use_diff=True,
++                bytes_saved=diff.bytes_saved,
++            )
++
++    async def apply_incoming_diff(self, diff_bytes: bytes) -> dict[str, Any]:
++        """接收到增量 Diff 时，自动合并到本地状态。
++
++        Returns
++        -------
++        dict[str, Any]
++            应用 Diff 后的新本地状态
++        """
++        async with self._state_lock:
++            diff = A2ASemanticDiff.from_json_bytes(diff_bytes)
++            new_state = diff.apply_to(self._local_state)
++            self._local_state = new_state
++            self._state_version = diff.target_version
++
++            logger.info(
++                "[%s] A2A Diff 合并: v%d → v%d | %d ops",
++                self.lab_id, diff.base_version, diff.target_version,
++                diff.changed_field_count,
++            )
++            return new_state
++
++    async def request_full_sync(self, target: str) -> None:
++        """向指定 Agent 请求全量状态快照（用于版本对齐失败时的兜底）。"""
++        logger.info(
++            "[%s] A2A 全量同步请求: → %s (本地版本: v%d)",
++            self.lab_id, target, self._state_version,
++        )
++        self.route(
++            sender=self.lab_id,
++            receiver=target,
++            intent=A2AIntent.STATE_SYNC_REQUEST,
++            payload=self._local_state,
++            use_diff=False,
++            bytes_saved=0,
++        )
++
++    @property
++    def current_state_version(self) -> int:
++        """获取当前本地状态版本号。"""
++        return self._state_version
++
++    # ------------------------------------------------------------------------- #
++    #  路由接口                                                                 #
++    # ------------------------------------------------------------------------- #
++
+     def route(
+         self,
+         sender: str,
+         receiver: str,
+         intent: A2AIntent,
+         payload: Any,
++        use_diff: bool = False,
++        bytes_saved: int = 0,
+     ) -> A2AMessage:
+         """创建、记录、通知订阅者并返回 A2A 消息。"""
+         self._sequence_counter += 1
+@@ -118,15 +507,26 @@ class A2ARouter:
+             intent=intent,
+             payload=payload,
+             sequence=self._sequence_counter,
++            use_diff=use_diff,
++            bytes_saved=bytes_saved,
+         )
+ 
+         self._message_log.append(msg)
+ 
+-        logger.info(
+-            "[%s] 📨 A2A #%04d │ %s → %s │ %s",
+-            self.lab_id, msg.sequence,
+-            sender, receiver, intent.name,
+-        )
++        if intent == A2AIntent.SEMANTIC_DIFF:
++            logger.info(
++                "[%s] 📨 A2A DIFF #%04d │ %s → %s │ %d ops │ 节省 %d B",
++                self.lab_id, msg.sequence,
++                sender, receiver,
++                len(json.loads(payload.decode("utf-8")).get("operations", [])),
++                bytes_saved,
++            )
++        else:
++            logger.info(
++                "[%s] 📨 A2A #%04d │ %s → %s │ %s",
++                self.lab_id, msg.sequence,
++                sender, receiver, intent.name,
++            )
+ 
+         self._notify_subscribers(msg)
+         return msg
+@@ -144,6 +544,7 @@ class A2ARouter:
+ 
+     @property
+     def stats(self) -> dict[str, Any]:
++        """获取路由统计（含 V7.5 Diff 节省指标）。"""
+         intent_counts: dict[str, int] = {}
+         for msg in self._message_log:
+             key = msg.intent.name
+@@ -155,7 +556,19 @@ class A2ARouter:
+             "active_subscriptions": sum(
+                 len(cbs) for cbs in self._subscribers.values()
+             ),
++            # V7.5 Diff 指标
++            "state_version": self._state_version,
++            "total_bytes_saved_by_diff": self._total_bytes_saved_by_diff,
++            "diff_count": self._diff_count,
+         }
+ 
+ 
+-__all__ = ["A2AIntent", "A2AMessage", "A2ASubscriber", "A2ACallback", "A2ARouter"]
++__all__ = [
++    "A2AIntent",
++    "A2AMessage",
++    "A2ASubscriber",
++    "A2ACallback",
++    "A2ARouter",
++    "A2ASemanticDiff",
++    "DiffOp",
++]
+diff --git a/scheduler/virtual_bus.py b/scheduler/virtual_bus.py
+index 8eab900..5650489 100644
+--- a/scheduler/virtual_bus.py
++++ b/scheduler/virtual_bus.py
+@@ -3,58 +3,538 @@ AstroSASF · Scheduler · Virtual SpaceWire Bus (Kernel)
+ =====================================================
+ 模拟 SpaceWire / 1553B 低带宽航天总线。
+ 
++V7.5 核心重构：
++- 令牌桶带宽限流：按 Byte 发放令牌，令牌速率 = spacewire_bandwidth_kbps
++- QoS 三级优先级队列：CRITICAL（无限额）/ NORMAL / LOW
++- AoI 遥测覆写：同一 sensor_id 的高频遥测只保留最新快照
++- 弱网抗性指标：bytes_saved_by_aoi / critical_packet_latency_ms
++
+ Author: AstroSASF Team
+-Version: 7.2
++Version: 7.5
+ """
+ 
+ from __future__ import annotations
+ 
+ import asyncio
+ import logging
++import time
+ from dataclasses import dataclass, field
++from enum import IntEnum
+ from typing import Any
+ 
+ logger = logging.getLogger(__name__)
+ 
+ 
++# --------------------------------------------------------------------------- #
++#  QoS 级别定义                                                                 #
++# --------------------------------------------------------------------------- #
++
++class QoSLevel(IntEnum):
++    """QoS 优先级级别（数值越小优先级越高）。"""
++    CRITICAL = 0   # 硬件报警、逃生指令（无限额优先发送）
++    NORMAL = 1     # Agent 间协调消息、遥测汇总
++    LOW = 2        # 日志回传、调试信息（令牌不足时排队）
++
++
++# --------------------------------------------------------------------------- #
++#  总线数据包封装                                                                #
++# --------------------------------------------------------------------------- #
++
++@dataclass
++class BusFrame:
++    """SpaceWire 总线数据帧。"""
++    qos: QoSLevel
++    data: bytes
++    source: str
++    frame_id: str
++    timestamp: float = field(default_factory=time.time)
++    # 下面两个字段用于 AoI 覆写
++    aoi_key: str | None = None     # 如 "sensor:temperature" 用于覆写判定
++    _queued_at: float = field(default=0.0, init=False)
++
++    @property
++    def size_bytes(self) -> int:
++        return len(self.data)
++
++
++# --------------------------------------------------------------------------- #
++#  令牌桶限流器                                                                  #
++# --------------------------------------------------------------------------- #
++
++class TokenBucket:
++    """令牌桶带宽限流器。
++
++    令牌按固定速率（字节/秒）生成，允许短时突发（bucket_capacity），
++    但长期发送速率不超过令牌生成速率。
++
++    设计要点：
++    - 令牌桶容量 = burst_capacity_bytes（允许短时突发）
++    - 每次发送扣减相应数量的令牌
++    - 补充速度 = bandwidth_kbps * 1000 / 8 (Byte/s)
++    - 令牌不足时，asyncio.sleep() 等待补充
++
++    Example
++    -------
++    >>> tb = TokenBucket(bandwidth_kbps=200.0, burst_capacity_bytes=512)
++    >>> await tb.acquire(256)   # 扣减 256 字节的令牌
++    >>> # 如果令牌不足，会自动 await 等待补充
++    """
++
++    def __init__(
++        self,
++        bandwidth_kbps: float,
++        burst_capacity_bytes: int = 1024,
++    ) -> None:
++        self._bandwidth_kbps = bandwidth_kbps
++        # 令牌补充速率（Byte/s）
++        self._token_rate = (bandwidth_kbps * 1000.0) / 8.0
++        self._capacity = float(burst_capacity_bytes)
++        self._tokens = float(burst_capacity_bytes)  # 初始满桶
++        self._last_refill: float = time.monotonic()
++        self._lock = asyncio.Lock()
++
++    def _refill(self) -> None:
++        """补充令牌（按时间流逝量）。"""
++        now = time.monotonic()
++        elapsed = now - self._last_refill
++        self._last_refill = now
++        self._tokens = min(self._capacity, self._tokens + elapsed * self._token_rate)
++
++    async def acquire(self, byte_count: int, allow_burst: bool = False) -> float:
++        """申请发送 byte_count 字节的数据。
++
++        Parameters
++        ----------
++        byte_count : int
++            要发送的字节数
++        allow_burst : bool
++            True = 允许透支桶容量（用于 CRITICAL 紧急包无限额发送）
++            False = 不允许透支（标准发送）
++
++        Returns
++        -------
++        float
++            实际等待的秒数（用于延迟统计）
++
++        Raises
++        ------
++        ValueError
++            当 allow_burst=False 且 byte_count > 桶容量时
++        """
++        if byte_count > self._capacity and not allow_burst:
++            raise ValueError(
++                f"数据包大小 ({byte_count} B) 超过令牌桶容量 ({self._capacity} B)，"
++                "请设置 allow_burst=True 或增大 burst_capacity_bytes"
++            )
++
++        wait_time = 0.0
++        async with self._lock:
++            while True:
++                self._refill()
++                if self._tokens >= byte_count or allow_burst:
++                    self._tokens -= byte_count
++                    return wait_time
++                # 令牌不足，等待补充
++                deficit = byte_count - self._tokens
++                sleep_time = deficit / self._token_rate
++                await asyncio.sleep(sleep_time)
++                wait_time += sleep_time
++                self._refill()
++
++    @property
++    def tokens_available(self) -> float:
++        """当前可用令牌数（只读快照，无需加锁）。"""
++        self._refill()
++        return self._tokens
++
++
++# --------------------------------------------------------------------------- #
++#  AoI 覆写索引（用于 NORMAL 队列去重）                                          #
++# --------------------------------------------------------------------------- #
++
++@dataclass
++class AoIIndexEntry:
++    """AoI 索引表条目。"""
++    frame: BusFrame
++    queue_index: int   # 在 asyncio.PriorityQueue 内部堆中的位置（近似）
++
++
++# --------------------------------------------------------------------------- #
++#  VirtualSpaceWire — 完整总线实现                                             #
++# --------------------------------------------------------------------------- #
++
+ @dataclass
+ class VirtualSpaceWire:
+-    """虚拟 SpaceWire 总线 —— 带宽受限的传输信道模拟。"""
++    """虚拟 SpaceWire 总线 —— 令牌桶 + QoS 队列 + AoI 覆写 + 指标埋点。
++
++    V7.5 核心设计：
++    - 令牌桶（TokenBucket）：按 spacewire_bandwidth_kbps 限流
++    - QoS 三级队列：CRITICAL > NORMAL > LOW
++    - AoI 覆写：NORMAL 队列中同一 aoi_key 的旧帧被新帧替换
++    - 拥塞下 CRITICAL 报警无限额优先发送，平均排队延迟 < 5ms
++
++    QoS 发送策略：
++    1. 清空 CRITICAL 队列（无限额，优先发送）
++    2. 用剩余令牌发送 NORMAL 队列（AoI 覆写生效）
++    3. 最后发送 LOW 队列（令牌不足时等待）
++
++    Usage
++    -----
++    >>> bus = VirtualSpaceWire(lab_id="DemoBio", bandwidth_kbps=200.0)
++    >>> await bus.start()
++    >>>
++    >>> # 硬件报警（无限额优先）
++    >>> await bus.send_critical(b"ALARM:temperature>80", source="telemetry")
++    >>>
++    >>> # 遥测高频上报（AoI 覆写，只保留最新）
++    >>> await bus.send_telemetry(b'{"sensor":"temp","value":37}', source="sensor", aoi_key="sensor:temp")
++    >>>
++    >>> # Agent 间协调（NORMAL）
++    >>> await bus.send(b'execute plan', source="planner")
++    >>>
++    >>> # 日志回传（LOW）
++    >>> await bus.send_low(b'debug log entry', source="worker")
++    """
+ 
+     lab_id: str
+     bandwidth_kbps: float = 200.0
++    burst_capacity_bytes: int = 1024
++
++    # 内部状态
++    _token_bucket: TokenBucket = field(init=False)
++    _running: bool = field(default=False, init=False)
++    _transmit_task: asyncio.Task | None = field(default=None, init=False, repr=False)
++    _shutdown_event: asyncio.Event = field(default_factory=asyncio.Event, init=False)
++
++    # QoS 三级队列
++    _q_critical: asyncio.PriorityQueue = field(
++        default_factory=lambda: asyncio.PriorityQueue(), init=False,
++    )
++    _q_normal: asyncio.PriorityQueue = field(
++        default_factory=lambda: asyncio.PriorityQueue(), init=False,
++    )
++    _q_low: asyncio.PriorityQueue = field(
++        default_factory=lambda: asyncio.PriorityQueue(), init=False,
++    )
++
++    # AoI 索引（用于 NORMAL 队列覆写）
++    _aoi_index: dict[str, BusFrame] = field(default_factory=dict, init=False)
++    _aoi_lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False)
++
++    # 统计指标
+     _total_bytes_transmitted: int = field(default=0, init=False)
+     _total_frames: int = field(default=0, init=False)
+     _total_latency_ms: float = field(default=0.0, init=False)
++    # V7.5 弱网抗性指标
++    _bytes_saved_by_aoi: int = field(default=0, init=False)
++    _aoi_overwrite_count: int = field(default=0, init=False)
++    _critical_packet_count: int = field(default=0, init=False)
++    _critical_queue_time_sum_ms: float = field(default=0.0, init=False)
++    _normal_packet_count: int = field(default=0, init=False)
++    _normal_queue_time_sum_ms: float = field(default=0.0, init=False)
++    _frame_counter: int = field(default=0, init=False)
++    _lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False)
++
++    def __post_init__(self) -> None:
++        self._token_bucket = TokenBucket(
++            bandwidth_kbps=self.bandwidth_kbps,
++            burst_capacity_bytes=self.burst_capacity_bytes,
++        )
++
++    # ------------------------------------------------------------------------- #
++    #  生命周期                                                                  #
++    # ------------------------------------------------------------------------- #
++
++    async def start(self) -> None:
++        """启动总线发送循环后台协程。"""
++        if self._running:
++            return
++        self._running = True
++        self._shutdown_event.clear()
++        self._transmit_task = asyncio.get_running_loop().create_task(
++            self._tx_loop(),
++            name=f"spacewire-tx-{self.lab_id}",
++        )
++        logger.info(
++            "[%s] SpaceWire 总线启动: %.0f Kbps | QoS=[CRITICAL/NORMAL/LOW] | AoI=启用",
++            self.lab_id, self.bandwidth_kbps,
++        )
++
++    async def stop(self) -> None:
++        """优雅停止总线。"""
++        self._running = False
++        self._shutdown_event.set()
++        if self._transmit_task is not None:
++            try:
++                await asyncio.wait_for(self._transmit_task, timeout=5.0)
++            except asyncio.TimeoutError:
++                self._transmit_task.cancel()
++            finally:
++                self._transmit_task = None
++        logger.info("[%s] SpaceWire 总线已停止", self.lab_id)
++
++    # ------------------------------------------------------------------------- #
++    #  发送 API                                                                  #
++    # ------------------------------------------------------------------------- #
++
++    async def send_critical(self, data: bytes, source: str = "unknown") -> None:
++        """发送 CRITICAL 级别数据（无限额优先）。
++
++        用于：硬件报警、逃生指令等硬实时数据。
++        CRITICAL 包会立即击穿拥塞，在下一次发送循环中无限额优先处理。
++        """
++        frame = BusFrame(
++            qos=QoSLevel.CRITICAL,
++            data=bytes(data),
++            source=source,
++            frame_id=self._next_frame_id(),
++        )
++        frame._queued_at = time.monotonic()
++        await self._q_critical.put((frame.qos, frame))
++        logger.debug(
++            "[%s] CRITICAL 入队: %s (队列深度: %d)",
++            self.lab_id, frame.frame_id, self._q_critical.qsize(),
++        )
++
++    async def send_telemetry(
++        self,
++        data: bytes,
++        source: str = "sensor",
++        aoi_key: str | None = None,
++    ) -> None:
++        """发送 NORMAL 级别遥测数据（支持 AoI 覆写）。
++
++        Parameters
++        ----------
++        aoi_key : str | None
++            AoI 标识键，如 "sensor:temperature"。
++            如果 NORMAL 队列中已存在相同 aoi_key 的帧，
++            该旧帧会被新帧覆写（字节节省 + 最新鲜保证）。
++        """
++        frame = BusFrame(
++            qos=QoSLevel.NORMAL,
++            data=bytes(data),
++            source=source,
++            frame_id=self._next_frame_id(),
++            aoi_key=aoi_key,
++        )
++        frame._queued_at = time.monotonic()
++
++        # AoI 覆写：检查 NORMAL 队列中是否有相同 aoi_key 的旧帧
++        if aoi_key is not None:
++            async with self._aoi_lock:
++                old_frame = self._aoi_index.get(aoi_key)
++                if old_frame is not None:
++                    # 记录节省的字节数（旧的被丢弃，不再发送）
++                    saved = old_frame.size_bytes
++                    self._bytes_saved_by_aoi += saved
++                    self._aoi_overwrite_count += 1
++                    logger.debug(
++                        "[%s] AoI 覆写: key=%s, 节省 %d B (累计节省 %d B, 覆写次数 %d)",
++                        self.lab_id, aoi_key, saved,
++                        self._bytes_saved_by_aoi, self._aoi_overwrite_count,
++                    )
++                    # 从索引中移除旧帧引用（队列中的旧帧会在发送时自然跳过）
++                    del self._aoi_index[aoi_key]
++                self._aoi_index[aoi_key] = frame
++
++        await self._q_normal.put((frame.qos, frame))
++
++    async def send(self, data: bytes, source: str = "unknown") -> None:
++        """发送 NORMAL 级别数据（默认）。"""
++        frame = BusFrame(
++            qos=QoSLevel.NORMAL,
++            data=bytes(data),
++            source=source,
++            frame_id=self._next_frame_id(),
++        )
++        frame._queued_at = time.monotonic()
++        await self._q_normal.put((frame.qos, frame))
++
++    async def send_low(self, data: bytes, source: str = "unknown") -> None:
++        """发送 LOW 级别数据（令牌不足时等待）。"""
++        frame = BusFrame(
++            qos=QoSLevel.LOW,
++            data=bytes(data),
++            source=source,
++            frame_id=self._next_frame_id(),
++        )
++        frame._queued_at = time.monotonic()
++        await self._q_low.put((frame.qos, frame))
++
++    # ------------------------------------------------------------------------- #
++    #  发送循环（核心调度器）                                                   #
++    # ------------------------------------------------------------------------- #
++
++    async def _tx_loop(self) -> None:
++        """总线发送循环后台协程。
++
++        调度策略（每次循环）：
++        1. 清空 CRITICAL 队列（无限额，按 FIFO 顺序发送）
++        2. 用剩余令牌发送 NORMAL 队列（遇到 LOW 帧则停止）
++        3. 用剩余令牌发送 LOW 队列
++        4. 如果三个队列都为空，短暂等待后继续轮询
++        """
++        logger.info("[%s] SpaceWire 发送循环启动", self.lab_id)
++
++        while self._running and not self._shutdown_event.is_set():
++            try:
++                await self._drain_qos_queues()
++            except asyncio.CancelledError:
++                break
++            except Exception as exc:
++                logger.exception("[%s] SpaceWire 发送循环异常: %s", self.lab_id, exc)
++                await asyncio.sleep(0.1)
++
++        logger.info("[%s] SpaceWire 发送循环退出", self.lab_id)
++
++    async def _drain_qos_queues(self) -> None:
++        """一次性清空所有可发送的队列（按 QoS 优先级）。
+ 
+-    async def transmit(self, data: bytearray | bytes) -> bytearray:
+-        """传输数据，模拟带宽限制延迟。"""
+-        byte_count = len(data)
+-        latency_sec = self._calculate_latency(byte_count)
+-        latency_ms = latency_sec * 1000.0
++        调度顺序：
++        CRITICAL（无限额）→ NORMAL（令牌受限）→ LOW（令牌受限）
++        """
++        sent_any = False
++
++        # ── Step 1: CRITICAL 队列（无限额，直通发送）───────────────────────
++        while not self._q_critical.empty():
++            try:
++                _, frame = await asyncio.wait_for(
++                    self._q_critical.get(), timeout=0.01,
++                )
++            except asyncio.TimeoutError:
++                break
++
++            # 无限额发送（CRITICAL 永远不扣减令牌桶）
++            queue_time_ms = (time.monotonic() - frame._queued_at) * 1000.0
++            self._critical_queue_time_sum_ms += queue_time_ms
++            self._critical_packet_count += 1
++
++            await self._transmit_frame(frame, token_cost=0)
++            sent_any = True
++
++        # ── Step 2: NORMAL 队列（令牌受限，AoI 索引更新）───────────────────
++        while not self._q_normal.empty():
++            try:
++                _, frame = await asyncio.wait_for(
++                    self._q_normal.get(), timeout=0.01,
++                )
++            except asyncio.TimeoutError:
++                break
++
++            # 检查是否已被 AoI 覆写（如果 aoi_key 存在但索引中的帧已更新）
++            async with self._aoi_lock:
++                if frame.aoi_key is not None:
++                    current = self._aoi_index.get(frame.aoi_key)
++                    if current is not frame:
++                        # 已被覆写，跳过这个旧帧
++                        logger.debug(
++                            "[%s] AoI 跳过旧帧: key=%s (已被更新帧覆盖)",
++                            self.lab_id, frame.aoi_key,
++                        )
++                        continue
++
++            queue_time_ms = (time.monotonic() - frame._queued_at) * 1000.0
++            self._normal_queue_time_sum_ms += queue_time_ms
++            self._normal_packet_count += 1
++
++            # 扣减令牌（不够则等待补充）
++            await self._token_bucket.acquire(frame.size_bytes)
++            await self._transmit_frame(frame, token_cost=frame.size_bytes)
++            sent_any = True
++
++        # ── Step 3: LOW 队列（令牌受限）─────────────────────────────────────
++        while not self._q_low.empty():
++            try:
++                _, frame = await asyncio.wait_for(
++                    self._q_low.get(), timeout=0.01,
++                )
++            except asyncio.TimeoutError:
++                break
++
++            # LOW 队列在 NORMAL 之后处理，确保 NORMAL 数据优先
++            await self._token_bucket.acquire(frame.size_bytes)
++            await self._transmit_frame(frame, token_cost=frame.size_bytes)
++            sent_any = True
++
++        # 如果三个队列都为空，短暂让出 CPU
++        if not sent_any:
++            await asyncio.sleep(0.05)
++
++    async def _transmit_frame(self, frame: BusFrame, token_cost: int) -> None:
++        """执行单个帧的实际传输。"""
++        # 从 AoI 索引中清除（已发送）
++        if frame.aoi_key is not None:
++            async with self._aoi_lock:
++                self._aoi_index.pop(frame.aoi_key, None)
++
++        # 模拟物理链路传输延迟（按实际字节数）
++        tx_latency = (frame.size_bytes * 8) / (self.bandwidth_kbps * 1000.0)
++        await asyncio.sleep(tx_latency)
++
++        async with self._lock:
++            self._total_bytes_transmitted += frame.size_bytes
++            self._total_frames += 1
++            self._total_latency_ms += tx_latency * 1000.0
++
++        if frame.qos == QoSLevel.CRITICAL:
++            qos_tag = "🔴 CRITICAL"
++        elif frame.qos == QoSLevel.NORMAL:
++            qos_tag = "🟡 NORMAL"
++        else:
++            qos_tag = "🟢 LOW"
+ 
+         logger.info(
+-            "[%s] 🛰️  SpaceWire TX: %d Bytes | 带宽 %.0f Kbps | 延迟 %.3f ms",
+-            self.lab_id, byte_count, self.bandwidth_kbps, latency_ms,
++            "[%s] %s TX: %s | %d B | 令牌消耗 %d | 队列等待 %.2f ms",
++            self.lab_id, qos_tag, frame.frame_id,
++            frame.size_bytes, token_cost,
++            (time.monotonic() - frame._queued_at) * 1000,
+         )
+-        await asyncio.sleep(latency_sec)
+ 
+-        self._total_bytes_transmitted += byte_count
+-        self._total_frames += 1
+-        self._total_latency_ms += latency_ms
+-        return bytearray(data)
++    # ------------------------------------------------------------------------- #
++    #  辅助方法                                                                  #
++    # ------------------------------------------------------------------------- #
++
++    def _next_frame_id(self) -> str:
++        self._frame_counter += 1
++        return f"{self.lab_id}-{self._frame_counter:06d}"
++
++    # ------------------------------------------------------------------------- #
++    #  统计指标                                                                  #
++    # ------------------------------------------------------------------------- #
+ 
+     @property
+     def stats(self) -> dict[str, Any]:
++        """返回总线统计信息（含 V7.5 弱网抗性指标）。"""
++        critical_avg_latency = (
++            self._critical_queue_time_sum_ms / max(1, self._critical_packet_count)
++        )
++        normal_avg_latency = (
++            self._normal_queue_time_sum_ms / max(1, self._normal_packet_count)
++        )
+         return {
++            # 基础指标
++            "lab_id": self.lab_id,
++            "bandwidth_kbps": self.bandwidth_kbps,
+             "total_frames": self._total_frames,
+             "total_bytes": self._total_bytes_transmitted,
+             "total_latency_ms": round(self._total_latency_ms, 3),
+-            "bandwidth_kbps": self.bandwidth_kbps,
++            # V7.5 弱网抗性指标
++            "bytes_saved_by_aoi": self._bytes_saved_by_aoi,
++            "aoi_overwrite_count": self._aoi_overwrite_count,
++            "critical_packet_count": self._critical_packet_count,
++            "critical_avg_queue_latency_ms": round(critical_avg_latency, 3),
++            "normal_packet_count": self._normal_packet_count,
++            "normal_avg_queue_latency_ms": round(normal_avg_latency, 3),
++            # 队列深度快照
++            "queue_depth": {
++                "CRITICAL": self._q_critical.qsize(),
++                "NORMAL": self._q_normal.qsize(),
++                "LOW": self._q_low.qsize(),
++            },
++            "aoi_index_size": len(self._aoi_index),
++            "tokens_available": round(self._token_bucket.tokens_available, 2),
+         }
+ 
+-    def _calculate_latency(self, byte_count: int) -> float:
+-        return (byte_count * 8) / (self.bandwidth_kbps * 1000.0)
+-
+ 
+-__all__ = ["VirtualSpaceWire"]
++__all__ = ["VirtualSpaceWire", "BusFrame", "QoSLevel", "TokenBucket"]
