@@ -11,6 +11,7 @@ AstroSASF · Infra · Prompt Transformation Pipeline (Kernel)
 - 传入的 messages 列表就地重排（避免复制开销）
 - SpeculativeWarmer 运行于独立后台协程，与请求处理完全解耦
 - 三类 Agent 的 Prompt 模板被静态化，即使运行时内容变化，也会被拦截到末尾
+- ResponseSanitizer 运行于 GatewayProxy 层，剥离 LLM 返回的 <think>/</think> 推理噪声
 
 Author: AstroSASF Team
 Version: 7.3
@@ -49,6 +50,124 @@ AGENT_TYPE_EXPERIMENT = "experiment"
 
 # SOP ID 正则（用于 Speculative Warming 触发检测）
 SOP_ID_PATTERN = re.compile(r"SOP[s]?:?\s*([a-zA-Z_][a-zA-Z0-9_]*)", re.IGNORECASE)
+
+# DeepSeek / 蒸馏模型强制输出指令（追加到 User Message 末尾）
+FORCED_JSON_OUTPUT_REMINDER = (
+    "\n\n请直接输出执行计划的 JSON 数组，不要包含任何额外的 markdown 标记或解释。"
+)
+
+# 思考标签（用于 ResponseSanitizer — 彻底剔除 LLM 推理噪声）
+THINK_OPEN_TAG = "<think>"
+THINK_CLOSE_TAG = "</think>"
+_THINK_PATTERN = re.compile(
+    re.escape(THINK_OPEN_TAG) + r".*?" + re.escape(THINK_CLOSE_TAG),
+    re.DOTALL,
+)
+
+
+# --------------------------------------------------------------------------- #
+#  ResponseSanitizer — 剥离 LLM 推理噪声                                        #
+# --------------------------------------------------------------------------- #
+
+class ResponseSanitizer:
+    """LLM 响应净化器。
+
+    背景：
+    DeepSeek-R1 等蒸馏模型在输出中会携带大量 <think>...</think> 推理过程。
+    上层 Planner Agent 和 Executor Agent 的 JSON/DAG 解析器收到这类内容会崩溃
+    （生成类似 FSM({}) 的垃圾数据）。
+
+    设计原则：
+    - 网关透明：上层 Agent 无需修改任何解析逻辑
+    - 非流式（chat）：在 GatewayProxy.chat() 返回前完整替换内容
+    - 流式（stream_chat）：在 SSE chunk 层面过滤（见 stream_sanitize_chunk）
+
+    性能备注：
+    - 非流式：使用 re.DOTALL 模式的 DOTALL 模式贪婪匹配，高效一次性替换
+    - 流式：逐 chunk 检查，包含标签的 chunk 会被整块丢弃
+
+    Example
+    -------
+    >>> sanitizer = ResponseSanitizer()
+    >>> raw = "让我想想。<think>用户要设置温度</think>[{\"id\": \"A\", \"skill\": \"set_temp\"}]"
+    >>> clean = sanitizer.sanitize(raw)
+    >>> print(clean)
+    让我想想。[{"id": "A", "skill": "set_temp"}]
+    """
+
+    __slots__ = ("_compiled",)
+
+    def __init__(self) -> None:
+        # 编译一次，复用（_THINK_PATTERN 在模块级别已编译）
+        self._compiled: re.Pattern = _THINK_PATTERN
+
+    def sanitize(self, content: str) -> str:
+        """非流式场景：一次性剔除所有 <think>...</think> 标签及内容。
+
+        Parameters
+        ----------
+        content : str
+            原始 LLM 返回内容
+
+        Returns
+        -------
+        str
+            剔除思考标签后的干净内容
+        """
+        if THINK_OPEN_TAG not in content:
+            return content
+        return self._compiled.sub("", content)
+
+    @staticmethod
+    def stream_sanitize_chunk(chunk: str) -> str | None:
+        """流式场景：检查单个 SSE chunk 是否需要过滤。
+
+        流式处理的复杂性：
+        - <think>...</think> 标签可能跨越多个 SSE chunk 边界
+        - 一个 chunk 可能只包含 <think> 或 仅包含</think>
+        - 同一轮对话中可能出现多次 <think>...</think>
+
+        简化策略（状态机）：
+        - 维护一个 "是否处于标签内" 的状态
+        - 如果 chunk 完整包含标签，则删除标签内容
+        - 如果 chunk 包含开标签且没有闭标签，丢弃从开标签到下一个换行前的内容
+        - 如果 chunk 包含闭标签且没有开标签，丢弃该标签
+        - 如果 chunk 跨越多个标签，仅保留最后一个闭标签之后的内容
+
+        注意：由于流式 SSE 中 DeepSeek 的 <think> 内容通常单独作为
+        某几个 chunk 存在，本函数主要处理单个 chunk 内包含完整标签的情况。
+        对于跨 chunk 的情况，建议在流结束后进行一次 sanitize() 调用。
+
+        Parameters
+        ----------
+        chunk : str
+            单个 SSE data 行（不含 "data: " 前缀）
+
+        Returns
+        -------
+        str | None
+            清理后的 chunk 内容；如果该 chunk 应被完全丢弃则返回 None
+        """
+        # 快速路径：没有任何思考标签 → 直接透传
+        if THINK_OPEN_TAG not in chunk and THINK_CLOSE_TAG not in chunk:
+            return chunk
+
+        # 如果 chunk 包含完整标签对：一次替换
+        if THINK_OPEN_TAG in chunk and THINK_CLOSE_TAG in chunk:
+            cleaned = _THINK_PATTERN.sub("", chunk)
+            # 如果清理后为空（纯思考 chunk），丢弃
+            return cleaned if cleaned.strip() else None
+
+        # 跨越标签不完整：丢弃开标签到行尾，或行首到闭标签
+        # 这种边界情况在流式 SSE 中相对少见，此处保守处理
+        if THINK_OPEN_TAG in chunk:
+            # 丢弃开标签及其后续内容
+            return None
+        if THINK_CLOSE_TAG in chunk:
+            # 丢弃该标签
+            return chunk.replace(THINK_CLOSE_TAG, "")
+
+        return chunk
 
 
 # --------------------------------------------------------------------------- #
@@ -699,11 +818,15 @@ class PromptTransformationPipeline:
 
         messages = request.messages  # 引用，不复制（Middleware 内部处理）
 
-        # 1. RAG 重排（仅 QA / Planner）
+        # 3. 追加强制输出指令（保护 Prompt 中的 JSON 输出要求不被 Static MCP 前缀挤压）
+        # 注意：这条指令必须在动态 Task 拼接之后、请求发出之前追加
+        messages = self._append_forced_output_reminder(messages)
+
+        # 4. RAG 重排（仅 QA / Planner）
         if self.rag_middleware:
             messages = await self.rag_middleware.apply(messages, ctx, instance_config)
 
-        # 2. 静态 MCP 前缀锁（仅 Experiment）
+        # 5. 静态 MCP 前缀锁（仅 Experiment）
         if self.mcp_middleware:
             messages = await self.mcp_middleware.apply(messages, ctx, instance_config)
 
@@ -714,16 +837,65 @@ class PromptTransformationPipeline:
 
         return messages, ctx
 
+    # ------------------------------------------------------------------------ #
+    #  Forced Output Reminder                                                    #
+    # ------------------------------------------------------------------------ #
+
+    @staticmethod
+    def _append_forced_output_reminder(
+        messages: list[dict[str, str]],
+    ) -> list[dict[str, str]]:
+        """在 User Message 末尾追加强制 JSON 输出指令。
+
+        背景：Static MCP Prefix Lock 会将动态遥测推到末尾，可能导致系统提示词中的
+        "请务必输出 JSON 格式" 等关键指令被挤出到不重要的位置。
+        本方法在最后一条 User Message 末尾追加一句不可绕过的强提醒，
+        确保 DeepSeek 等蒸馏模型的输出严格符合 JSON 格式规范。
+
+        注意：本方法仅追加文本，不修改 messages 的 role 结构。
+        """
+        if not messages:
+            return messages
+
+        # 找到最后一条 User Message
+        for i in range(len(messages) - 1, -1, -1):
+            if messages[i].get("role") == "user":
+                original = messages[i].get("content", "")
+                messages[i]["content"] = (
+                    original.rstrip() + FORCED_JSON_OUTPUT_REMINDER
+                )
+                logger.debug(
+                    "[Pipeline] 强制输出指令已追加到 user message（长度=%d → %d）",
+                    len(original), len(messages[i]["content"]),
+                )
+                return messages
+
+        # 没有 user message：追加一条新的
+        messages.append({
+            "role": "user",
+            "content": FORCED_JSON_OUTPUT_REMINDER.strip(),
+        })
+        logger.debug("[Pipeline] 强制输出指令已追加（新 user message）")
+        return messages
+
     async def trigger_warmup(
         self,
         request: GatewayRequest,
         agent_type: str,
         url: str,
     ) -> None:
-        """触发推测性预热（后台调用，无阻塞）。"""
+        """触发推测性预热（后台调用，无阻塞）。
+
+        实现要点：
+        - 必须使用 asyncio.get_running_loop().create_task() 而非 asyncio.create_task()
+        - asyncio.create_task() 要求在协程内部调用（否则抛出 RuntimeError）
+        - GatewayProxy.chat() 是协程，故此处可以安全使用
+        - 本方法本身是协程，保证在协程上下文中执行
+        """
         if self.warmer:
-            # 不等待，fire-and-forget
-            asyncio.create_task(
+            # asyncio.get_running_loop() 在协程内调用始终安全
+            loop = asyncio.get_running_loop()
+            loop.create_task(
                 self.warmer.on_request(request, agent_type, url),
                 name=f"warmup-trigger-{request.request_id[:8]}",
             )

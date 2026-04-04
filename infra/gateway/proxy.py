@@ -14,7 +14,7 @@ AstroSASF · Infra · Distributed Gateway Proxy (Kernel)
 5. **透明集成**：对上层多智能体完全透明
 
 Author: AstroSASF Team
-Version: 7.2
+Version: 7.3
 """
 
 from __future__ import annotations
@@ -48,6 +48,7 @@ from infra.gateway.transform_pipeline import (
     StaticMCPMiddleware,
     SpeculativeWarmer,
     PrefixBuilder,
+    ResponseSanitizer,
 )
 
 logger = logging.getLogger(__name__)
@@ -137,6 +138,10 @@ class GatewayProxy:
     })
     # Prompt 转换流水线（可选）
     pipeline: PromptTransformationPipeline | None = field(default=None, init=False)
+    # LLM 响应净化器（剥离 DeepSeek 等蒸馏模型的 <think>/</think> 推理噪声）
+    _sanitizer: ResponseSanitizer = field(
+        default_factory=ResponseSanitizer, init=False, repr=False,
+    )
 
     def __post_init__(self) -> None:
         if self.load_balancer is None:
@@ -329,6 +334,19 @@ class GatewayProxy:
                 result = await self._do_request(url, real_model, request)
                 elapsed_ms = (time.monotonic() - start_time) * 1000
 
+                # 4a. 响应净化：剥离 LLM 返回的 <think>/</think> 推理噪声
+                # 背景：DeepSeek-R1 等蒸馏模型会携带大量推理标签，
+                # 上层 Planner/Executor Agent 的 JSON 解析器会崩溃
+                # 透明修复：网关层统一处理，对上层 Agent 无感
+                raw_content = result.get("content", "")
+                clean_content = self._sanitizer.sanitize(raw_content)
+                if clean_content != raw_content:
+                    logger.debug(
+                        "[GatewayProxy] 剥离思考标签: request_id=%s, 原始长度=%d → 清理后=%d",
+                        request.request_id[:8], len(raw_content), len(clean_content),
+                    )
+                    result["content"] = clean_content
+
                 # 5. 记录成功
                 await self.instance_pool.release_connection(url, success=True, latency_ms=elapsed_ms)
                 await self.watermark_breaker.on_request_success(url)
@@ -414,7 +432,23 @@ class GatewayProxy:
 
             try:
                 start_time = time.monotonic()
-                async for chunk in self._do_streaming_request(url, real_model, request):
+                # 流式场景下的思考标签处理策略：
+                #
+                # 方案 A（已实现）：在流式 _do_streaming_request 层面逐 chunk 过滤。
+                #   - 每个 SSE chunk 先经过 _sanitizer.stream_sanitize_chunk() 检查
+                #   - 若 chunk 包含完整 <think>...</think> 标签对 → 整块替换
+                #   - 若 chunk 包含不完整的开标签（仅有 <think> 无</think>）→ 丢弃该 chunk
+                #   - 优点：流式传输过程中实时净化，不等待最终内容
+                #
+                # 方案 B（备选）：流结束后在外部再做 sanitize()
+                #   - 若方案 A 仍有边界残留，可在 stream_chat 外部做最终净化
+                #   - 例如：after collecting full response → sanitizer.sanitize(raw)
+                #
+                # 跨 chunk 标签问题：DeepSeek 的 <think> 块通常单独作为连续几个 chunk
+                # 发送（如 delta.content = "<think>" / delta.content = "温度..." / ...），
+                # 此时 stream_sanitize_chunk() 对每个 chunk 单独判断即可。
+                # 如果流结束后仍有残留，可对聚合内容再做一次 sanitize()。
+                async for chunk in self._do_streaming_request(url, real_model, request, sanitizer=self._sanitizer):
                     yield chunk
 
                 elapsed_ms = (time.monotonic() - start_time) * 1000
@@ -490,8 +524,16 @@ class GatewayProxy:
         url: str,
         real_model: str,
         request: GatewayRequest,
+        sanitizer: ResponseSanitizer | None = None,
     ) -> AsyncGenerator[bytes, None]:
-        """发送流式请求到 LLM 实例（透传 SSE）。"""
+        """发送流式请求到 LLM 实例（透传 SSE）。
+
+        Parameters
+        ----------
+        sanitizer : ResponseSanitizer | None
+            流式响应净化器。如提供，则每个 SSE chunk 在 yield 前会经过
+            stream_sanitize_chunk() 检查，包含不完整思考标签的 chunk 会被丢弃。
+        """
         if not self._http_client:
             raise RuntimeError("HTTP 客户端未初始化")
 
@@ -514,7 +556,17 @@ class GatewayProxy:
 
             async for line in response.aiter_lines():
                 if line.strip() and line.startswith("data: "):
-                    yield f"{line}\n".encode("utf-8")
+                    raw_chunk = line[6:].strip()  # 去掉 "data: " 前缀
+                    # 流式净化：检查是否包含思考标签
+                    if sanitizer is not None:
+                        # stream_sanitize_chunk 返回 None 表示该 chunk 应被丢弃
+                        cleaned = sanitizer.stream_sanitize_chunk(raw_chunk)
+                        if cleaned is None:
+                            continue
+                        # 写回 SSE 格式
+                        yield f"data: {cleaned}\n".encode("utf-8")
+                    else:
+                        yield f"{line}\n".encode("utf-8")
 
             yield b"data: [DONE]\n\n"
 

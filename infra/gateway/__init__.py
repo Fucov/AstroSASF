@@ -11,6 +11,7 @@ from infra.gateway.transform_pipeline import (
     SpeculativeWarmer,
     PrefixBuilder,
     TransformContext,
+    ResponseSanitizer,
 )
 
 __all__ = [
@@ -25,4 +26,5 @@ __all__ = [
     "SpeculativeWarmer",
     "PrefixBuilder",
     "TransformContext",
+    "ResponseSanitizer",
 ]

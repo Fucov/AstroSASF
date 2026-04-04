@@ -1,4 +1,4 @@
-# AstroSASF V7.2 — Astro Scientific Agent Scheduling Framework
+# AstroSASF V7.3 — Astro Scientific Agent Scheduling Framework
 
 > 面向太空实验室的科学智能体调度框架 · **内核化架构** · **DAG 双轨调度** · **硬件级抢占** · **多节点 LLM 网关**
 
@@ -11,9 +11,13 @@
 
 ## 项目概述
 
-AstroSASF V7.2 是专为**空间站科学实验柜**设计的智能体调度框架，解决大语言模型（LLM）推理的**概率性/高延迟**与物理硬件控制的**确定性/硬实时**之间的根本矛盾。
+AstroSASF V7.3 是专为**空间站科学实验柜**设计的智能体调度框架，解决大语言模型（LLM）推理的**概率性/高延迟**与物理硬件控制的**确定性/硬实时**之间的根本矛盾。
 
-**V7.2 核心变化：内核化 + 分布式网关**
+**V7.3 核心变化：LLM 响应净化 + 网关透明修复**
+- **ResponseSanitizer**：彻底剥离 DeepSeek-R1 等蒸馏模型的 `<think>...</think>` 推理噪声，上层 Planner/Executor Agent 无需修改任何解析逻辑
+- **强制输出指令**：在 User Message 末尾追加 JSON 格式强提醒，防止 Static MCP 前缀锁将关键指令挤出
+- **asyncio.create_task 修复**：统一使用 `asyncio.get_running_loop().create_task()`，消除协程上下文缺失导致的潜在 RuntimeError
+- **流式 SSE 净化**：在 `_do_streaming_request` 层面逐 chunk 过滤思考标签块
 - **内核提取**：调度逻辑、VRAM 管理、LLM 网关下沉为独立内核模块
 - **扁平化**：减少目录嵌套深度，`catalog` 层被拆分到 `infra/` 和 `labs/`
 - **多实例网关**：`config.yaml` 配置驱动多后端路由，支持 Ollama / SGLang / vLLM 混合部署
@@ -197,13 +201,32 @@ registry.bind_macro("cell_culture_temp", "control_heater",
 # LLM 调用 "cell_culture_temp" 即可，无需传递参数
 ```
 
+### 8. LLM 响应净化器（ResponseSanitizer）
+
+DeepSeek-R1 等蒸馏模型会携带大量 `<think>...</think>` 推理过程。上层 Planner Agent 和 Executor Agent 的 JSON/DAG 解析器收到后会崩溃（生成 `FSM({})` 等垃圾数据）。
+
+```
+原始 LLM 输出:
+  <think>用户要设置温度，我应该先检查当前状态...
+</think>[{"id": "A", "skill": "set_temp", "params": {"temp": 37}}]
+
+净化后:
+  [{"id": "A", "skill": "set_temp", "params": {"temp": 37}}]
+```
+
+**非流式**：`GatewayProxy.chat()` 返回前，`sanitize()` 一次性替换所有思考标签。
+
+**流式**：`_do_streaming_request` 逐 chunk 过滤，包含不完整 `<think>` 标签的 chunk 会被丢弃，完整标签对的内容会被替换。
+
+**网关透明原则**：上层 Agent 无需修改任何解析逻辑，净化在网关层完成。
+
 ---
 
 ## 技术架构
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                    AstroSASF V7.2 系统架构                                    │
+│                    AstroSASF V7.3 系统架构                                    │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                                                                             │
 │  ┌─────────────────────────────────────────────────────────────────────┐  │
@@ -346,7 +369,7 @@ python demo/demo_mission.py --catalog ./my_labs --skills ./my_skills
 
 | 版本 | 日期 | 核心变化 |
 |------|------|----------|
-| **V7.3** | 2026-04-04 | PromptTransformationPipeline：RAG 确定性重排（SHA-256 升序）→ StaticMCP Schema 前缀锁（动态遥测推到末尾）→ SpeculativeWarmer 跨 Agent 预热；Task 0 强制 model 查表覆盖；新增 `cross_agent_cache_hits` / `tool_schema_saved_tokens` 埋点 |
+| **V7.3** | 2026-04-04 | ResponseSanitizer（剥离 <think>/</think> 推理噪声）；强制 JSON 输出指令保护；`asyncio.get_running_loop().create_task()` 修复；流式 SSE chunk 净化；PromptTransformationPipeline RAG 确定性重排 + StaticMCP Schema 前缀锁 + SpeculativeWarmer 跨 Agent 预热；Task 0 强制 model 查表覆盖；`cross_agent_cache_hits` / `tool_schema_saved_tokens` 埋点 |
 | **V7.2** | 2026-04-04 | 分布式网关重构：移除单实例 `llm` 节点 → `gateway.backends[]` 多后端配置阵列；`config.yaml` 驱动 `init_distributed_gateway()`；移除 `create_llm()` LangChain 工厂；修复 `_check_instance` async lock 持有 bug |
 | **V7.1** | 2026-03 | 数据集评测 + LLM 算力埋点 + 物理模拟层 |
 | **V7.0** | 2026-03 | DAG 双轨调度 + 理论/实践智能体分离 |
