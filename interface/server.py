@@ -37,6 +37,7 @@ from pydantic import BaseModel, Field
 
 from scheduler.models import TaskPriority
 from interface.state import AppState, state  # 全局状态（单例）
+from infra.gateway.api import gateway_state
 
 logger = logging.getLogger(__name__)
 
@@ -68,9 +69,11 @@ class ExecuteResponse(BaseModel):
 class LLMChatRequest(BaseModel):
     """LLM 推理请求。"""
     messages: list[dict[str, str]] = Field(..., description="消息列表")
+    model: str = Field(default="qwen2.5:7b", description="模型名称")
     agent_id: str = Field(default="http_client", description="调用者 ID")
     temperature: float | None = Field(default=None, ge=0.0, le=2.0)
     max_tokens: int | None = Field(default=None, gt=0)
+    priority: int = Field(default=2, ge=0, le=3, description="优先级: 0=CRITICAL, 1=HIGH, 2=NORMAL, 3=LOW")
 
 
 class LLMChatResponse(BaseModel):
@@ -110,12 +113,9 @@ async def lifespan(app: FastAPI):
     logger.info("╚" + "═" * 70 + "╝")
 
     try:
-        from infra.llm.config_loader import load_config
         from labs.lab_loader import create_loader
 
         config_path = str(_ROOT / "config.yaml")
-        state.config = load_config(config_path)
-        logger.info("[Server] 配置加载完成: %s", config_path)
 
         # ── 1. 加载实验舱（使用 demo 专用 labs 目录）── #
         demo_labs_dir = str(_ROOT / "demo" / "assets" / "labs")
@@ -123,36 +123,14 @@ async def lifespan(app: FastAPI):
         loaded_labs = await state.loader.discover_and_load()
         logger.info("[Server] 实验舱加载完成: %s", list(loaded_labs.keys()))
 
-        # ── 2. 初始化分布式 LLM 网关（PrefixBalancer + VRAMBreaker）── #
-        from infra.llm.instance_pool import LLMInstancePool, LLMInstanceConfig
-        from infra.routing.prefix_balancer import PrefixAwareLoadBalancer
-        from infra.routing.vram_breaker import VRAMWatermarkBreaker
-        from infra.gateway.proxy import GatewayProxy
+        # ── 2. 初始化分布式 LLM 网关（配置驱动）── #
+        from infra.gateway.api import init_distributed_gateway
+        from infra.llm.config_loader import load_config as _load_cfg
 
-        pool = LLMInstancePool()
-
-        # 从 config.yaml 读取 LLM 地址，注册为默认实例
-        llm_cfg = state.config.llm
-        pool.register_instance(LLMInstanceConfig(
-            url=llm_cfg.base_url,
-            weight=1,
-            model_name=llm_cfg.model_name,
-            tags=["default"],
-        ))
-        logger.info(
-            "[Server] LLM 实例注册: %s (%s)",
-            llm_cfg.base_url, llm_cfg.model_name,
-        )
-
-        lb = PrefixAwareLoadBalancer(instance_pool=pool)
-        breaker = VRAMWatermarkBreaker(instance_pool=pool)
-        state.gateway_proxy = GatewayProxy(
-            instance_pool=pool,
-            load_balancer=lb,
-            watermark_breaker=breaker,
-        )
-        await state.gateway_proxy.start()
-        logger.info("[Server] LLM GatewayProxy 启动完成（PrefixBalancer + VRAMBreaker）")
+        cfg = _load_cfg(config_path)
+        state.config = cfg
+        await init_distributed_gateway(config=cfg.gateway)
+        state.gateway_proxy = gateway_state.proxy
 
         # ── 3. 初始化 API Facade ── #
         from interface.facade import APIFacade
@@ -166,7 +144,9 @@ async def lifespan(app: FastAPI):
         logger.info("╔" + "═" * 70 + "╗")
         logger.info("║  ✅ AstroSASF V7.2 服务已就绪                                   ║")
         logger.info(f"║  API 文档: http://localhost:8000/docs                         ║")
-        logger.info(f"║  LLM:      {llm_cfg.provider} @ {llm_cfg.base_url} ({llm_cfg.model_name})     ║")
+        backend_count = len(cfg.gateway.backends)
+        backend_names = ", ".join(b.provider for b in cfg.gateway.backends)
+        logger.info(f"║  Gateway:  {backend_count} 个后端 [{backend_names}]              ║")
         logger.info("╚" + "═" * 70 + "╝")
 
         yield
@@ -286,7 +266,15 @@ async def llm_chat(request: LLMChatRequest) -> dict[str, Any]:
     from infra.gateway.proxy import GatewayRequest
     priority_map = {0: "CRITICAL", 1: "HIGH", 2: "NORMAL", 3: "LOW"}
     priority = priority_map.get(request.priority, "NORMAL")
-    model_name = state.config.llm.model_name if state.config else "qwen2.5:7b"
+    # 默认取第一个后端的模型名；请求中指定的 model 优先
+    default_model = "qwen2.5:7b"
+    if (
+        state.config
+        and state.config.gateway.backends
+        and state.config.gateway.backends[0].model_name
+    ):
+        default_model = state.config.gateway.backends[0].model_name
+    model_name = request.model or default_model
 
     gw_request = GatewayRequest(
         messages=request.messages,
@@ -317,8 +305,8 @@ async def llm_chat(request: LLMChatRequest) -> dict[str, Any]:
             logger.warning("[API] LLM 网关返回错误: %s [%s]", response.error, response.error_code)
             return LLMChatResponse(
                 content="[LLM ERROR] " + response.error,
-                task_id=response.request_id or "unknown",
-                elapsed_ms=response.latency_ms if hasattr(response, "latency_ms") else 0,
+                task_id=getattr(response, "request_id", "unknown") or "unknown",
+                elapsed_ms=getattr(response, "latency_ms", 0) or 0,
                 model=model_name,
                 error=response.error,
             )

@@ -32,8 +32,8 @@ from fastapi import FastAPI, HTTPException, status, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
-from infra.llm.instance_pool import LLMInstanceConfig
-from infra.llm.config_loader import load_config
+from infra.llm.instance_pool import LLMInstancePool, LLMInstanceConfig
+from infra.llm.config_loader import load_config, GatewayConfig
 from infra.routing.prefix_balancer import PrefixAwareLoadBalancer
 from infra.routing.vram_breaker import VRAMWatermarkBreaker
 from infra.gateway.proxy import GatewayProxy, GatewayRequest, GatewayResponse, GatewayError
@@ -135,44 +135,50 @@ gateway_state = GatewayState()
 # --------------------------------------------------------------------------- #
 
 async def init_distributed_gateway(
-    instances: list[dict[str, Any]] | None = None,
-    config: dict[str, Any] | None = None,
+    config: GatewayConfig | None = None,
+    config_path: str | Path | None = None,
 ) -> None:
-    """初始化分布式 LLM 网关。
+    """初始化分布式 LLM 网关（配置驱动）。
 
     Parameters
     ----------
-    instances : list[dict[str, Any]] | None
-        初始实例列表，格式：
-        [{"url": "http://192.168.1.10:8000", "weight": 1, "model_name": "qwen2.5-7b", "tags": ["v100"]}]
-    config : dict[str, Any] | None
-        网关配置，可选字段：
-        - high_watermark: float (默认 0.85)
-        - critical_watermark: float (默认 0.92)
-    """
-    config = config or {}
-    instances = instances or []
+    config : GatewayConfig | None
+        已解析的网关配置对象。如果为 None，则从 config_path 加载。
+    config_path : str | Path | None
+        配置文件路径（仅在 config=None 时使用）。
 
-    # 1. 创建实例池
-    gateway_state.pool = LLMInstanceConfig.__dataclass_fields__  # type: ignore
+    生命周期原则：
+        AstroSASF 不管理 LLM 进程，只连接已运行的远端推理服务。
+        所有实例通过 config.yaml 配置注入。
+    """
+    # 1. 加载 / 获取配置
+    if config is None:
+        cfg = load_config(config_path)
+        config = cfg.gateway
+
+    # 2. 创建实例池
     from infra.llm.instance_pool import LLMInstancePool
     gateway_state.pool = LLMInstancePool()
 
-    # 2. 注册初始实例
-    for inst in instances:
-        gateway_state.pool.register_instance(LLMInstanceConfig(
-            url=inst["url"],
-            weight=inst.get("weight", 1),
-            model_name=inst.get("model_name", "qwen2.5-7b"),
-            tags=inst.get("tags", []),
-        ))
+    # 3. 遍历 backends 阵列，注册每个后端实例
+    enabled_backends = [b for b in config.backends if b.enabled]
+    for backend in enabled_backends:
+        inst_config = LLMInstanceConfig(
+            url=backend.url,
+            provider=backend.provider,
+            weight=backend.weight,
+            model_name=backend.model_name,
+            tags=backend.tags,
+        )
+        gateway_state.pool.register_instance(inst_config)
+
         logger.info(
-            "[DistributedGateway] 注册实例: %s (weight=%d, model=%s, tags=%s)",
-            inst["url"], inst.get("weight", 1),
-            inst.get("model_name", "qwen2.5-7b"), inst.get("tags", [])
+            "[DistributedGateway] 注册 LLM 节点: %s (%s, model=%s, weight=%d, tags=%s)",
+            backend.url, backend.provider, backend.model_name,
+            backend.weight, backend.tags,
         )
 
-    # 3. 创建子组件
+    # 4. 创建子组件（load_balancer / breaker / proxy）
     gateway_state.load_balancer = PrefixAwareLoadBalancer(
         instance_pool=gateway_state.pool,
     )
@@ -185,13 +191,16 @@ async def init_distributed_gateway(
         watermark_breaker=gateway_state.breaker,
     )
 
-    # 4. 启动
+    # 5. 启动网关
     await gateway_state.proxy.start()
     gateway_state._initialized = True
 
     logger.info(
-        "[DistributedGateway] 初始化完成: %d 个实例",
-        len(instances),
+        "[DistributedGateway] 初始化完成: %d 个 LLM 路由节点已注册, VRAM 水线 [%.0f%% / %.0f%% / %.0f%%]",
+        len(enabled_backends),
+        config.vram_low_watermark * 100,
+        config.vram_high_watermark * 100,
+        config.vram_critical_watermark * 100,
     )
 
 
@@ -245,7 +254,7 @@ def register_gateway_routes(app: FastAPI) -> None:
         - 自动重路由与故障转移
         """
         if not gateway_state._initialized:
-            await init_distributed_gateway(instances=[])
+            await init_distributed_gateway()
 
         gw_request = GatewayRequest(
             messages=request.messages,
@@ -290,7 +299,7 @@ def register_gateway_routes(app: FastAPI) -> None:
     async def llm_stream_distributed(request: LLMChatRequest):
         """分布式 LLM Chat 流式接口。直接透传 SGLang/vLLM 的 SSE 流式响应。"""
         if not gateway_state._initialized:
-            await init_distributed_gateway(instances=[])
+            await init_distributed_gateway()
 
         gw_request = GatewayRequest(
             messages=request.messages,
@@ -388,7 +397,7 @@ def register_gateway_routes(app: FastAPI) -> None:
     async def register_instance(req: InstanceRegisterRequest) -> dict[str, Any]:
         """注册一个新的 LLM 实例。"""
         if not gateway_state._initialized:
-            await init_distributed_gateway(instances=[])
+            await init_distributed_gateway()
 
         config = LLMInstanceConfig(
             url=req.url,
@@ -397,7 +406,7 @@ def register_gateway_routes(app: FastAPI) -> None:
             tags=req.tags,
         )
 
-        gateway_state.proxy.register_instance(config)
+        gateway_state.pool.register_instance(config)
         logger.info(
             "[Admin] 注册实例: %s (weight=%d, model=%s, tags=%s)",
             req.url, req.weight, req.model_name, req.tags

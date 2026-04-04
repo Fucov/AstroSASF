@@ -1,6 +1,6 @@
 # AstroSASF V7.2 — Astro Scientific Agent Scheduling Framework
 
-> 面向太空实验室的科学智能体调度框架 · **内核化架构** · **DAG 双轨调度** · **硬件级抢占** · **前缀感知 LLM 网关**
+> 面向太空实验室的科学智能体调度框架 · **内核化架构** · **DAG 双轨调度** · **硬件级抢占** · **多节点 LLM 网关**
 
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-REST%20API-blue.svg)](https://fastapi.tiangolo.com/)
@@ -13,10 +13,11 @@
 
 AstroSASF V7.2 是专为**空间站科学实验柜**设计的智能体调度框架，解决大语言模型（LLM）推理的**概率性/高延迟**与物理硬件控制的**确定性/硬实时**之间的根本矛盾。
 
-**V7.2 核心变化：内核化重构**
+**V7.2 核心变化：内核化 + 分布式网关**
 - **内核提取**：调度逻辑、VRAM 管理、LLM 网关下沉为独立内核模块
 - **扁平化**：减少目录嵌套深度，`catalog` 层被拆分到 `infra/` 和 `labs/`
-- **业务与技能解耦**：`skills` 是 Agent 工具，不属于框架内核
+- **多实例网关**：`config.yaml` 配置驱动多后端路由，支持 Ollama / SGLang / vLLM 混合部署
+- **生命周期解耦**：AstroSASF 不管理 LLM 进程，只连接已运行的远端推理服务
 - **演示驱动**：`demo/demo_mission.py` 提供完整的三智能体协作演示
 
 **快速开始：**
@@ -25,9 +26,6 @@ AstroSASF V7.2 是专为**空间站科学实验柜**设计的智能体调度框�
 # 启动 AstroSASF 服务（推荐）
 uv run uvicorn interface.server:app --reload --host 0.0.0.0 --port 8000
 
-# 或使用旧路径（V7.2 兼容层，自动重定向）
-uv run uvicorn server:app --reload --host 0.0.0.0 --port 8000
-
 # 运行三智能体协作演示
 uv run python demo/demo_mission.py
 
@@ -35,7 +33,7 @@ uv run python demo/demo_mission.py
 uv run python demo/demo_mission.py --lab DemoBio --mission "将培养舱温度设置为37°C"
 ```
 
-> **LLM 服务（可选）**：demo 默认使用 mock 模式，无需 LLM 服务。如需真实 LLM 推理，请先启动 `ollama serve`。
+> **LLM 服务（可选）**：如果未启动 LLM 服务，Planner Agent 会自动降级为关键词匹配模式（demo-safe）。如需真实 LLM 推理，请确保 `config.yaml` 中配置的后端地址可达（Ollama / SGLang / vLLM）。
 
 
 ---
@@ -45,13 +43,13 @@ uv run python demo/demo_mission.py --lab DemoBio --mission "将培养舱温度�
 ```
 AstroSASF/
 │
-├── config.yaml                     # LLM 服务 + 中间件全局配置
+├── config.yaml                     # ★ Gateway 多后端 + 中间件全局配置
 ├── pyproject.toml                 # Python 项目配置
 │
 ├── infra/                        # ===== 内核基础设施层 =====
 │   ├── __init__.py
-│   ├── llm/                      # LLM 实例管理与配置
-│   │   ├── config_loader.py     # YAML 配置解析 + LLM 工厂
+│   ├── llm/                      # LLM 配置与实例池
+│   │   ├── config_loader.py     # YAML 配置解析（多后端 GatewayConfig）
 │   │   └── instance_pool.py     # LLM 实例池（健康检查、VRAM 监控）
 │   ├── routing/                  # 请求路由与熔断
 │   │   ├── prefix_balancer.py   # 前缀感知负载均衡（支持 SGLang RadixAttention）
@@ -101,15 +99,6 @@ AstroSASF/
 │       ├── planner_agent.py     # Planner Agent（LLM 生成 DAG 步骤）
 │       └── executor_agent.py    # Executor Agent（按序执行 MCP Tools）
 │
-├── labs_catalog/                 # 【实验舱生产配置】
-│   ├── shared/
-│   │   └── shared_tools.py
-│   ├── Lab-Bio/
-│   │   ├── lab_config.yaml
-│   │   └── custom_tools.py
-│   └── Lab-Fluid/
-│       ├── lab_config.yaml
-│       └── custom_tools.py
 │
 ├── datasets/                     # 评测数据集
 └── benchmarks/                  # 基准测试
@@ -124,7 +113,7 @@ AstroSASF/
 | **北向接口** | `interface/` | FastAPI 服务、协议网关、门面聚合 | 零业务词汇 |
 | **物理适配** | `labs/` | MCP 注册、联锁引擎、编解码、实验舱加载 | 允许业务词汇（物理层） |
 | **演示资产** | `demo/` | 三智能体协作演示 | 完整场景示例 |
-| **业务配置** | `labs_catalog/` | 实验舱配置、FSM 规则、自定义工具 | 业务词汇，完全可配置 |
+| 演示配置 | `demo/assets/labs/` | 演示实验舱（DemoBio / DemoFluid） | 业务词汇，可扩展 |
 | **旧代码** | `sasf/` | V7.1 遗留代码 | ⚠️ 已废弃 |
 
 ---
@@ -213,49 +202,75 @@ registry.bind_macro("cell_culture_temp", "control_heater",
 ## 技术架构
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                    AstroSASF V7.2 系统架构                       │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│  ┌───────────────────────────────────────────────────────────┐ │
-│  │                    客户端层 (Client)                       │ │
-│  │   航天员 / Agent → HTTP 请求 → REST API → 结果展示         │ │
-│  └───────────────────────────────────────────────────────────┘ │
-│                               │                                 │
-│                               ▼                                 │
-│  ┌───────────────────────────────────────────────────────────┐ │
-│  │              北向接口层 (interface/)                        │ │
-│  │    FastAPI Server ← Facade ← Agent (Q&A/Planner/Executor) │ │
-│  └───────────────────────────────────────────────────────────┘ │
-│                               │                                 │
-│                               ▼                                 │
-│  ┌───────────────────────────────────────────────────────────┐ │
-│  │                    内核层 (kernel)                         │ │
-│  │                                                           │ │
-│  │  ┌──────────────────┐  ┌────────────────────────────┐   │ │
-│  │  │  infra/llm/      │  │  infra/routing/           │   │ │
-│  │  │  实例池 + 配置    │  │  前缀均衡 + VRAM 熔断     │   │ │
-│  │  └──────────────────┘  └────────────────────────────┘   │ │
-│  │                                                           │ │
-│  │  ┌───────────────────────────────────────────────────┐  │ │
-│  │  │  scheduler/                                       │  │ │
-│  │  │  DAG Orchestrator → PriorityQueue → Worker Pool   │  │ │
-│  │  │  A2A Protocol │ VirtualBus │ Telemetry + Alarm    │  │ │
-│  │  └───────────────────────────────────────────────────┘  │ │
-│  └───────────────────────────────────────────────────────────┘ │
-│                               │                                 │
-│                               ▼                                 │
-│  ┌───────────────────────────────────────────────────────────┐ │
-│  │                    物理适配层 (labs/)                      │ │
-│  │    MCPToolRegistry │ InterlockEngine │ SpaceMCPCodec   │ │
-│  └───────────────────────────────────────────────────────────┘ │
-│                               │                                 │
-│                               ▼                                 │
-│  ┌───────────────────────────────────────────────────────────┐ │
-│  │                    物理模拟层 (实验舱)                       │ │
-│  │    Lab-Bio (细胞培养) │ Lab-Fluid (微重力流体) │ ...      │ │
-│  └───────────────────────────────────────────────────────────┘ │
-└─────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    AstroSASF V7.2 系统架构                                    │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────┐  │
+│  │                    客户端层 (Client)                                    │  │
+│  │   航天员 / Agent → HTTP 请求 → REST API → 结果展示                      │  │
+│  └─────────────────────────────────────────────────────────────────────┘  │
+│                               │                                            │
+│                               ▼                                            │
+│  ┌─────────────────────────────────────────────────────────────────────┐  │
+│  │              北向接口层 (interface/)                                    │  │
+│  │    FastAPI Server ← Facade ← Agent (Q&A / Planner / Executor)          │  │
+│  └─────────────────────────────────────────────────────────────────────┘  │
+│                               │                                            │
+│                               ▼                                            │
+│  ┌─────────────────────────────────────────────────────────────────────┐  │
+│  │              分布式 LLM 网关 (infra/gateway/)                          │  │
+│  │                                                                         │  │
+│  │  PrefixAwareLoadBalancer ──→ VRAMWatermarkBreaker ──→ LLMInstancePool │  │
+│  │       (前缀哈希路由)              (优先级准入)           (多节点管理)       │  │
+│  │                                                                         │  │
+│  │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐                 │  │
+│  │  │  Backend 1   │  │  Backend 2   │  │  Backend N   │  ← config.yaml   │  │
+│  │  │  Ollama      │  │  SGLang     │  │  vLLM       │                 │  │
+│  │  │  localhost   │  │  192.168.x  │  │  192.168.x  │                 │  │
+│  │  └──────────────┘  └──────────────┘  └──────────────┘                 │  │
+│  └─────────────────────────────────────────────────────────────────────┘  │
+│                               │                                            │
+│                               ▼                                            │
+│  ┌─────────────────────────────────────────────────────────────────────┐  │
+│  │              内核调度层 (scheduler/)                                    │  │
+│  │   DAG Orchestrator → PriorityQueue → Worker Pool                       │  │
+│  │   A2A Protocol │ VirtualBus │ Telemetry + Alarm                       │  │
+│  └─────────────────────────────────────────────────────────────────────┘  │
+│                               │                                            │
+│                               ▼                                            │
+│  ┌─────────────────────────────────────────────────────────────────────┐  │
+│  │              物理适配层 (labs/)                                         │  │
+│  │   MCPToolRegistry │ InterlockEngine │ SpaceMCPCodec                    │  │
+│  └─────────────────────────────────────────────────────────────────────┘  │
+│                               │                                            │
+│                               ▼                                            │
+│  ┌─────────────────────────────────────────────────────────────────────┐  │
+│  │              物理模拟层 (实验舱)                                          │  │
+│  │   DemoBio │ DemoFluid │ ... (位于 demo/assets/labs/)                   │  │
+│  └─────────────────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### config.yaml 示例（多后端配置）
+
+```yaml
+gateway:
+  vram_high_watermark: 0.85      # 高水位（限流）
+  vram_critical_watermark: 0.92  # 熔断线
+
+  backends:
+    - url: "http://localhost:11434"        # 本地 Ollama（fallback）
+      provider: "ollama"
+      model_name: "qwen2.5:7b"
+      weight: 1
+      tags: ["local", "fallback"]
+
+    - url: "http://192.168.1.10:8000"     # SGLang GPU 节点
+      provider: "sglang"
+      model_name: "qwen2.5-7b-instruct"
+      weight: 3
+      tags: ["v100", "node-1"]
 ```
 
 ### API 端点
@@ -329,7 +344,8 @@ python demo/demo_mission.py --catalog ./my_labs --skills ./my_skills
 
 | 版本 | 日期 | 核心变化 |
 |------|------|----------|
-| **V7.2** | 2026-04-03 | 内核化重构：提取 infra/、scheduler/、interface/、labs/，扁平化目录，demo_mission.py 三智能体演示，vLLM/SGLang 前缀感知网关 |
+| **V7.2** | 2026-04-04 | 分布式网关重构：移除单实例 `llm` 节点 → `gateway.backends[]` 多后端配置阵列；`config.yaml` 驱动 `init_distributed_gateway()`；移除 `create_llm()` LangChain 工厂；修复 `_check_instance` async lock 持有 bug |
+| **V7.2** | 2026-04-03 | 内核化重构：提取 `infra/`、`scheduler/`、`interface/`、`labs/`，扁平化目录，`demo_mission.py` 三智能体演示，vLLM/SGLang 前缀感知网关 |
 | **V7.1** | 2026-03 | 数据集评测 + LLM 算力埋点 + 物理模拟层 |
 | **V7.0** | 2026-03 | DAG 双轨调度 + 理论/实践智能体分离 |
 | **V6.2** | 2026-01 | LLM 语义路由替代 BM25 |

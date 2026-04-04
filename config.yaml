@@ -4,27 +4,52 @@
 # ============================================================================ #
 
 # ---------------------------------------------------------------------------- #
-#  LLM 配置                                                                     #
+#  Gateway 配置（V7.2 分布式 LLM 网关）
+#  — AstroSASF 不管理 LLM 进程，只通过 HTTP 连接已运行的远端推理服务
+#  — 支持多个后端实例，负载均衡 + VRAM 熔断 + 前缀感知路由
 # ---------------------------------------------------------------------------- #
-llm:
-  # 可选 provider: "ollama" | "openai_compatible"
-  #   ollama            → 使用 langchain_ollama.ChatOllama (本地推理)
-  #   openai_compatible → 使用 langchain_openai.ChatOpenAI  (兼容 DeepSeek / 阿里云百炼 Qwen 等)
-  provider: "ollama"
-  base_url: "http://localhost:11434"    # Ollama 默认地址
-  api_key: ""                           # Ollama 不需要; 远端 API 必填
-  model_name: "qwen2.5:7b"
-  temperature: 0.1
+gateway:
+  # VRAM 水线（V100-32G，默认值，可按节点覆盖）
+  vram_high_watermark: 0.85       # ≥85%：高水位告警，限流
+  vram_critical_watermark: 0.92   # ≥92%：熔断禁入
+  vram_low_watermark: 0.60       # <60%：完全健康
+
+  # 后端实例列表（按 weight 加权路由，weight 越高分到越多请求）
+  backends:
+    # ── 本地 Ollama（fallback / 开发用）────────────────────────────── #
+    # - url: "http://localhost:11434"
+    #   provider: "ollama"
+    #   model_name: "qwen2.5:7b"
+    #   weight: 1
+    #   tags: ["local", "fallback", "cpu"]
+    #   enabled: true
+
+    # ── 远端 SGLang 推理节点（GPU 集群主节点）─────────────────────── #
+    - url: "http://10.244.37.55:8000"
+      provider: "vllm"
+      model_name: "qwen2.5-14b-instruct"
+      weight: 3
+      tags: ["v100", "node-1", "gpu"]
+      enabled: true
+
+    # ── 远端 vLLM 推理节点（备节点）───────────────────────────────── #
+    # - url: "http://192.168.1.11:8000"
+    #   provider: "vllm"
+    #   model_name: "qwen2.5-7b-instruct"
+    #   weight: 2
+    #   tags: ["a100", "node-2", "gpu"]
+    #   enabled: true
 
 # ---------------------------------------------------------------------------- #
-#  中间件配置                                                                    #
-# ---------------------------------------------------------------------------- #
-middleware:
-  spacewire_bandwidth_kbps: 200         # SpaceWire 模拟带宽 (Kbps)
-  enable_space_mcp_compression: true    # 是否启用 Space-MCP 二进制压缩
-
-# ---------------------------------------------------------------------------- #
-#  编排器配置                                                                    #
+#  编排器配置
 # ---------------------------------------------------------------------------- #
 orchestrator:
   max_concurrent_labs: 3                # 最大并发实验柜数量
+  dag_execution_timeout: 3600.0         # DAG 任务超时（秒）
+
+# ---------------------------------------------------------------------------- #
+#  中间件配置
+# ---------------------------------------------------------------------------- #
+middleware:
+  spacewire_bandwidth_kbps: 200          # SpaceWire 模拟带宽 (Kbps)
+  enable_space_mcp_compression: true     # 是否启用 Space-MCP 二进制压缩

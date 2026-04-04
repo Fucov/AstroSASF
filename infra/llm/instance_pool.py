@@ -63,6 +63,7 @@ DEFAULT_UNHEALTHY_THRESHOLD: int = 3           # 连续失败次数阈值
 class LLMInstanceConfig:
     """LLM 实例配置。"""
     url: str                           # 例如 "http://192.168.1.10:8000"
+    provider: str = "ollama"          # "ollama" | "sglang" | "vllm"（决定健康检查路径）
     weight: int = 1                   # 路由权重
     model_name: str = ""               # 模型名称（SGLang/vLLM 部署的模型）
     tags: list[str] = field(default_factory=list)  # 标签，用于路由筛选
@@ -296,6 +297,8 @@ class LLMInstancePool:
         检查内容：
         1. 基础连通性（GET /health）
         2. 显存使用情况（GET /memory 或 /metrics）
+
+        设计原则：I/O 操作在锁外执行，锁只保护共享状态的读写。
         """
         if not self._http_client:
             return
@@ -304,90 +307,105 @@ class LLMInstancePool:
         if not metrics:
             return
 
+        start_time = time.monotonic()
+        basic_ok = False
+        vram_ratio = 0.0
+        vram_used = 0.0
+
+        # ── 根据 provider 选择健康检查端点 ──────────────────────────────── #
+        provider = self.configs[url].provider if url in self.configs else ""
+        if provider == "ollama":
+            health_path = ""          # Ollama: 根路径 `/` 总是有响应
+        else:
+            health_path = "/health"   # SGLang / vLLM: 使用标准 /health 端点
+
+        # ── I/O 操作在锁外执行 ────────────────────────────────────────────── #
+        try:
+            target = url + health_path if health_path else url
+            health_response = await self._http_client.get(target)
+            basic_ok = health_response.status_code in (200, 404)
+        except httpx.TimeoutException:
+            basic_ok = False
+        except Exception:
+            basic_ok = False
+
+        # ── 显存检查（provider 适配）─────────────────────────────────────── #
+        try:
+            if provider == "ollama":
+                # Ollama 无显存报告接口，跳过
+                pass
+            elif provider == "sglang":
+                mem_response = await self._http_client.get(f"{url}/memory")
+                if mem_response.status_code == 200:
+                    mem_data = mem_response.json()
+                    if "mem_used" in mem_data and "mem_total" in mem_data:
+                        vram_used = mem_data["mem_used"] / (1024 ** 3)
+                        vram_total = mem_data["mem_total"] / (1024 ** 3)
+                        vram_ratio = vram_used / vram_total if vram_total > 0 else 0.0
+            elif provider == "vllm":
+                metrics_response = await self._http_client.get(f"{url}/metrics")
+                if metrics_response.status_code == 200:
+                    for line in metrics_response.text.split("\n"):
+                        if "vllm_gpu_memory_usage" in line:
+                            parts = line.split()
+                            for i, part in enumerate(parts):
+                                if part == "value" and i + 1 < len(parts):
+                                    vram_ratio = float(parts[i + 1])
+                                    break
+        except Exception:
+            pass
+
+        # ── 锁内更新共享状态 ──────────────────────────────────────────────── #
+        status_changed: bool = False
+        old_status: InstanceStatus = InstanceStatus.STARTING
+        new_status: InstanceStatus | None = None
+
         async with self._lock:
-            start_time = time.monotonic()
+            old_status = metrics.status
 
-            try:
-                # 1. 基础健康检查
-                health_response = await self._http_client.get(f"{url}/health")
-                basic_ok = health_response.status_code == 200
-
-                # 2. 显存检查（SGLang/vLLM 的 /memory 或 /metrics 接口）
-                vram_ratio = 0.0
-                vram_used = 0.0
-
-                try:
-                    # 尝试 SGLang 的 /memory 接口
-                    mem_response = await self._http_client.get(f"{url}/memory")
-                    if mem_response.status_code == 200:
-                        mem_data = mem_response.json()
-                        if "mem_used" in mem_data and "mem_total" in mem_data:
-                            vram_used = mem_data["mem_used"] / (1024 ** 3)
-                            vram_total = mem_data["mem_total"] / (1024 ** 3)
-                            vram_ratio = vram_used / vram_total if vram_total > 0 else 0.0
-                except Exception:
-                    # 尝试 vLLM 的 /metrics 接口（Prometheus 格式解析）
-                    try:
-                        metrics_response = await self._http_client.get(f"{url}/metrics")
-                        if metrics_response.status_code == 200:
-                            text = metrics_response.text
-                            for line in text.split("\n"):
-                                if "vllm_gpu_memory_usage" in line:
-                                    parts = line.split()
-                                    for i, part in enumerate(parts):
-                                        if part == "value" and i + 1 < len(parts):
-                                            vram_ratio = float(parts[i + 1])
-                                            break
-                    except Exception:
-                        pass
-
-                old_status = metrics.status
-
-                # 更新指标
+            if not basic_ok:
+                metrics.consecutive_failures += 1
+                if metrics.consecutive_failures >= DEFAULT_UNHEALTHY_THRESHOLD:
+                    metrics.status = InstanceStatus.UNHEALTHY
+                    if old_status != InstanceStatus.UNHEALTHY:
+                        status_changed = True
+                        new_status = InstanceStatus.UNHEALTHY
+                        logger.error(
+                            "[InstancePool] 实例不可达: %s (%d 次连续失败)",
+                            url, metrics.consecutive_failures,
+                        )
+            else:
+                metrics.consecutive_failures = 0
                 metrics.vram_ratio = vram_ratio
                 metrics.vram_used_gb = vram_used
-                metrics.consecutive_failures = 0
                 metrics.last_check_time = time.monotonic()
                 metrics.last_success_time = time.monotonic()
 
-                # 更新状态
-                if not basic_ok:
-                    metrics.status = InstanceStatus.UNHEALTHY
-                elif vram_ratio >= VRAM_HIGH_WATERMARK:
+                if vram_ratio >= VRAM_HIGH_WATERMARK:
                     metrics.status = InstanceStatus.DEGRADED
                 else:
                     metrics.status = InstanceStatus.HEALTHY
 
-                metrics.updated_at = time.monotonic()
-
                 if old_status != metrics.status:
-                    _old, _new = old_status, metrics.status
-                    self._notify_status_change(url, _old, _new)
-                    logger.warning(
-                        "[InstancePool] 实例状态变更: %s %s -> %s (VRAM: %.1f%%)",
-                        url, old_status.name, metrics.status.name, vram_ratio * 100
-                    )
+                    status_changed = True
+                    new_status = metrics.status
 
+            metrics.updated_at = time.monotonic()
+            elapsed_ms = (time.monotonic() - start_time) * 1000
+            if basic_ok:
                 logger.debug(
                     "[InstancePool] 实例健康检查 OK: %s (VRAM: %.1f%%, %.1fms)",
-                    url, vram_ratio * 100, (time.monotonic() - start_time) * 1000
+                    url, vram_ratio * 100, elapsed_ms,
                 )
 
-            except httpx.TimeoutException:
-                metrics.consecutive_failures += 1
-                if metrics.consecutive_failures >= DEFAULT_UNHEALTHY_THRESHOLD:
-                    old_status = metrics.status
-                    metrics.status = InstanceStatus.UNHEALTHY
-                    if old_status != InstanceStatus.UNHEALTHY:
-                        self._notify_status_change(url, old_status, InstanceStatus.UNHEALTHY)
-                        logger.error("[InstancePool] 实例不可达: %s (%d 次连续失败)",
-                                     url, metrics.consecutive_failures)
-                metrics.updated_at = time.monotonic()
-
-            except Exception as e:
-                metrics.consecutive_failures += 1
-                metrics.updated_at = time.monotonic()
-                logger.warning("[InstancePool] 健康检查异常: %s -> %s", url, e)
+        # ── 回调在锁外通知（避免在持有锁时重入 async lock）── #
+        if status_changed and new_status is not None:
+            self._notify_status_change(url, old_status, new_status)
+            if basic_ok:
+                logger.warning(
+                    "[InstancePool] 实例状态变更: %s %s -> %s (VRAM: %.1f%%)",
+                    url, old_status.name, new_status.name, vram_ratio * 100,
+                )
 
     # ------------------------------------------------------------------------ #
     #  Connection Management                                                    #
