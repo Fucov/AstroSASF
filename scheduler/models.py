@@ -8,11 +8,12 @@ AstroSASF · Scheduler · DAG Data Structures (Kernel)
 - DAGTaskGraph: 完整实验的 DAG 图结构
 - 状态机: PENDING → READY → RUNNING → COMPLETED/FAILED
 
-V7.1 新增：
-- LLM 算力埋点字段：planner_llm_calls, planner_time_ms, worker_llm_calls
+V7.4 新增：
+- mount_sub_dag: 动态子图挂载（支持运行时 DAG 扩展）
+- ooo_execution_count, io_compute_overlap_ms: OoO/Overlap 指标
 
 Author: AstroSASF Team
-Version: 7.2
+Version: 7.4
 """
 
 from __future__ import annotations
@@ -203,6 +204,129 @@ class DAGTaskGraph:
         if to_node_id not in self.nodes:
             raise KeyError(f"目标节点 '{to_node_id}' 不存在于图中")
         self.nodes[to_node_id].dependencies.append(from_node_id)
+        self._validated = False
+
+    def mount_sub_dag(
+        self,
+        parent_node_id: str,
+        sub_dag: DAGTaskGraph,
+    ) -> None:
+        """在运行时动态将子图挂载到指定节点（V7.4 新增）。
+
+        背景：Planner 的"空闲算力投机预计算"需要在某节点完成后，
+        动态注入一组新节点到原有依赖关系树中。
+        例如：节点 A 完成后，检测到温度超标，动态注入降温子图。
+
+        算法步骤：
+        1. 验证 parent_node 存在且已完成（防止悬空挂载）
+        2. 将 sub_dag 的所有节点注册到主图（分配新的 node_id 前缀避免冲突）
+        3. 建立挂载边：parent_node_id → sub_dag 入口节点（无依赖的节点）
+        4. 重建拓扑结构（in_degree / out_degree / reverse_adj）
+        5. 标记图状态为未验证（下次调度前重新 validate）
+
+        防环保证：
+        - parent_node_id 必须在主图中存在且已完成，意味着它没有后续依赖
+        - sub_dag 是独立的子图，理论上无环
+        - 合并时只从 parent_node_id 向 sub_dag 引入出边，不会产生回环
+
+        Parameters
+        ----------
+        parent_node_id : str
+            挂载点节点 ID（必须存在于主图中且状态为 COMPLETED）
+        sub_dag : DAGTaskGraph
+            要挂载的子图（会修改其 node_id 以避免与主图冲突）
+
+        Raises
+        ------
+        ValueError
+            - parent_node_id 不存在或未完成
+            - sub_dag 为空
+            - 合并后检测到循环依赖
+
+        Example
+        -------
+        >>> main_graph = DAGTaskGraph(graph_id="main", name="主图")
+        >>> main_graph.add_node(DAGNode(node_id="A", skill_name="check_temp"))
+        >>> main_graph.validate()
+        >>>
+        >>> sub = DAGTaskGraph(graph_id="sub", name="降温子图")
+        >>> sub.add_node(DAGNode(node_id="B", skill_name="cool_down"))
+        >>> sub.add_node(DAGNode(node_id="C", skill_name="report"))
+        >>> sub.add_edge("B", "C")
+        >>> sub.validate()
+        >>>
+        >>> # A 完成后，动态挂载降温子图
+        >>> main_graph.mount_sub_dag("A", sub)
+        >>> # A → B → C，现在主图中存在这条依赖链
+        """
+        # 1. 验证挂载点
+        if parent_node_id not in self.nodes:
+            raise ValueError(
+                f"挂载点节点 '{parent_node_id}' 不存在于主图中"
+            )
+        parent_node = self.nodes[parent_node_id]
+        if parent_node.status != NodeStatus.COMPLETED:
+            raise ValueError(
+                f"挂载点节点 '{parent_node_id}' 未完成（当前状态: {parent_node.status.name}）"
+            )
+
+        # 2. 验证 sub_dag 非空且已验证
+        if not sub_dag.nodes:
+            raise ValueError("要挂载的子图为空")
+        if not sub_dag._validated:
+            sub_dag.validate()
+
+        # 3. 为子图节点分配新的 node_id 前缀（避免与主图冲突）
+        #    格式：{parent_node_id}::{original_id}
+        prefix = f"{parent_node_id}::"
+        id_mapping: dict[str, str] = {}  # original_id → new_id
+
+        for original_id, original_node in sub_dag.nodes.items():
+            new_id = f"{prefix}{original_id}"
+            if new_id in self.nodes:
+                raise ValueError(
+                    f"子图节点 ID '{new_id}' 与主图冲突"
+                )
+            id_mapping[original_id] = new_id
+
+        # 4. 注册子图节点到主图
+        for original_id, original_node in sub_dag.nodes.items():
+            new_node = DAGNode(
+                node_id=id_mapping[original_id],
+                skill_name=original_node.skill_name,
+                graph_id=self.graph_id,  # 归属主图
+                params=original_node.params,
+                dependencies=[
+                    id_mapping.get(dep_id, dep_id)
+                    for dep_id in original_node.dependencies
+                ],
+                status=NodeStatus.PENDING,
+                priority=original_node.priority,
+                description=original_node.description,
+                lab_id=original_node.lab_id,
+            )
+            self.nodes[new_node.node_id] = new_node
+
+        # 5. 找到子图入口节点（无依赖的节点，即 in_degree == 0 的节点）
+        sub_entry_ids: list[str] = [
+            new_id
+            for new_id, node in self.nodes.items()
+            if new_id.startswith(prefix) and not node.dependencies
+        ]
+
+        # 6. 建立挂载边：parent_node_id → 每个子图入口节点
+        for entry_id in sub_entry_ids:
+            self.nodes[entry_id].dependencies.append(parent_node_id)
+
+        logger.info(
+            "[DAGTaskGraph] 动态挂载: parent=%s → sub_dag '%s' (%d nodes), entries=%s",
+            parent_node_id, sub_dag.name, len(sub_dag.nodes), sub_entry_ids,
+        )
+
+        # 7. 使图状态失效，下次调度前重新 validate（重建拓扑结构）
+        self._in_degree.clear()
+        self._out_degree.clear()
+        self._reverse_adj.clear()
         self._validated = False
 
     def remove_node(self, node_id: str) -> None:
@@ -419,7 +543,7 @@ class DAGTaskGraph:
 
 @dataclass
 class DAGExecutionResult:
-    """DAG 执行结果摘要 (V7.2)。"""
+    """DAG 执行结果摘要 (V7.4)。"""
     graph_id: str
     status: str  # "completed", "failed", "partial"
     total_nodes: int
@@ -431,6 +555,13 @@ class DAGExecutionResult:
     planner_llm_calls: int = 0
     planner_time_ms: float = 0.0
     worker_llm_calls: int = 0
+    # V7.4: OoO 乱序执行指标
+    ooo_execution_count: int = 0
+    """成功触发乱序越级执行的次数"""
+    io_compute_overlap_ms: float = 0.0
+    """物理 I/O 阻塞等待期间，其他 Worker 同步执行 LLM 计算重叠的总毫秒数"""
+    ooo_lookahead_triggered: int = 0
+    """调度器触发 Look-ahead 扫描的总次数（用于评估 OoO 效率）"""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -445,6 +576,9 @@ class DAGExecutionResult:
             "planner_llm_calls": self.planner_llm_calls,
             "planner_time_ms": self.planner_time_ms,
             "worker_llm_calls": self.worker_llm_calls,
+            "ooo_execution_count": self.ooo_execution_count,
+            "io_compute_overlap_ms": self.io_compute_overlap_ms,
+            "ooo_lookahead_triggered": self.ooo_lookahead_triggered,
         }
 
 

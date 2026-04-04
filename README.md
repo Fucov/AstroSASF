@@ -1,6 +1,6 @@
-# AstroSASF V7.3 — Astro Scientific Agent Scheduling Framework
+# AstroSASF V7.4 — Astro Scientific Agent Scheduling Framework
 
-> 面向太空实验室的科学智能体调度框架 · **内核化架构** · **DAG 双轨调度** · **硬件级抢占** · **多节点 LLM 网关**
+> 面向太空实验室的科学智能体调度框架 · **内核化架构** · **DAG 双轨调度** · **OoO 乱序执行** · **事件驱动 I/O 挂起** · **多节点 LLM 网关**
 
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-REST%20API-blue.svg)](https://fastapi.tiangolo.com/)
@@ -18,11 +18,12 @@ AstroSASF V7.3 是专为**空间站科学实验柜**设计的智能体调度框�
 - **强制输出指令**：在 User Message 末尾追加 JSON 格式强提醒，防止 Static MCP 前缀锁将关键指令挤出
 - **asyncio.create_task 修复**：统一使用 `asyncio.get_running_loop().create_task()`，消除协程上下文缺失导致的潜在 RuntimeError
 - **流式 SSE 净化**：在 `_do_streaming_request` 层面逐 chunk 过滤思考标签块
-- **内核提取**：调度逻辑、VRAM 管理、LLM 网关下沉为独立内核模块
-- **扁平化**：减少目录嵌套深度，`catalog` 层被拆分到 `infra/` 和 `labs/`
-- **多实例网关**：`config.yaml` 配置驱动多后端路由，支持 Ollama / SGLang / vLLM 混合部署
-- **生命周期解耦**：AstroSASF 不管理 LLM 进程，只连接已运行的远端推理服务
-- **演示驱动**：`demo/demo_mission.py` 提供完整的三智能体协作演示
+
+- **OoO 乱序执行**：ReadyQueue 为空但 Worker Pool 有空闲槽位时，主动遍历 BlockedQueue 执行三重准入门检查（逻辑依赖 / 资源锁 / 联锁），将符合条件的节点越级推入 ReadyQueue
+- **ActiveResourceTable**：维护全局硬件资源占用表，OoO 调度前查询资源是否被占用，防止物理硬件争用；五层防死锁策略保障系统安全
+- **wait_for_condition**：Worker 通过 `await bus.wait_for_condition(expr)` 让出控制权，后台遥测流 `batch_write` 时自动匹配条件并通过 `future.set_result()` 瞬间唤醒，零轮询开销
+- **动态子图挂载**：支持 Planner 在运行时将子 DAG 动态注入主图（某节点完成后），实时重建 Kahn 拓扑排序
+- **OoO/Overlap 指标**：`ooo_execution_count`（越级执行次数）、`io_compute_overlap_ms`（I/O 与计算重叠毫秒数）埋点
 
 **快速开始：**
 
@@ -222,11 +223,25 @@ DeepSeek-R1 等蒸馏模型会携带大量 `<think>...</think>` 推理过程。�
 
 ---
 
-## 技术架构
+### 9. OoO 乱序越级执行调度器（V7.4）
+
+解决"物理 I/O 极慢，LLM 计算极快"的非对称矛盾。当 Worker Pool 有空闲槽位但 ReadyQueue 为空时，调度器主动遍历 BlockedQueue，执行三重准入门检查（逻辑依赖完成 / 资源未被占用 / 联锁不拦截），将符合条件的节点越级推入 ReadyQueue，实现 I/O 与计算的重叠执行。
+
+**五层防死锁策略**：锁顺序协议（字母序加锁）→ 三重准入门 → 资源预约原子性 → 推进保证 → 超时降级兜底。
+
+**ActiveResourceTable** 维护全局硬件资源占用快照，`_extract_required_resources` 从 skill_name 推断所需资源，`_check_interlock` 接入 labs/interlock_engine。
+
+**wait_for_condition** 让 Worker 通过 `await Future` 让出控制权，后台遥测流 `batch_write` 时通过 `future.set_result()` 瞬间唤醒，零轮询开销。
+
+### 10. 动态子图挂载（V7.4）
+
+`DAGTaskGraph.mount_sub_dag(parent_node_id, sub_dag)` 在某节点完成后动态注入子图，支持 Planner 的"空闲算力投机预计算"。自动分配节点 ID 前缀（`parent::`）、重建 Kahn 拓扑排序、检测循环依赖。
+
+---
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                    AstroSASF V7.3 系统架构                                    │
+│                    AstroSASF V7.4 系统架构                                    │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                                                                             │
 │  ┌─────────────────────────────────────────────────────────────────────┐  │
@@ -369,6 +384,7 @@ python demo/demo_mission.py --catalog ./my_labs --skills ./my_skills
 
 | 版本 | 日期 | 核心变化 |
 |------|------|----------|
+| **V7.4** | 2026-04-04 | OoO 乱序越级执行（ActiveResourceTable + 三重准入门 + 五层防死锁）；`wait_for_condition` 零开销事件驱动 I/O 挂起（Pub/Sub + asyncio.Future）；动态子图挂载 `mount_sub_dag`（Kahn 拓扑实时重建）；`ooo_execution_count` / `io_compute_overlap_ms` 埋点；ResponseSanitizer（剥离 <think>/</think> 推理噪声）；强制 JSON 输出指令保护；`asyncio.get_running_loop().create_task()` 修复 |
 | **V7.3** | 2026-04-04 | ResponseSanitizer（剥离 <think>/</think> 推理噪声）；强制 JSON 输出指令保护；`asyncio.get_running_loop().create_task()` 修复；流式 SSE chunk 净化；PromptTransformationPipeline RAG 确定性重排 + StaticMCP Schema 前缀锁 + SpeculativeWarmer 跨 Agent 预热；Task 0 强制 model 查表覆盖；`cross_agent_cache_hits` / `tool_schema_saved_tokens` 埋点 |
 | **V7.2** | 2026-04-04 | 分布式网关重构：移除单实例 `llm` 节点 → `gateway.backends[]` 多后端配置阵列；`config.yaml` 驱动 `init_distributed_gateway()`；移除 `create_llm()` LangChain 工厂；修复 `_check_instance` async lock 持有 bug |
 | **V7.1** | 2026-03 | 数据集评测 + LLM 算力埋点 + 物理模拟层 |

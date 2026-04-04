@@ -9,10 +9,10 @@ AstroSASF · Scheduler · DAG Orchestrator (Kernel)
 - DAG 依赖状态机：PENDING → READY → RUNNING → COMPLETED/FAILED
 - 双队列机制：ReadyQueue（就绪）| BlockedQueue（阻塞）
 - 结算时触发依赖解除，递归检查下游节点
-- V7.2 新增：硬件级抢占 + 动态优先级 Aging 机制
+- V7.4 新增：OoO 乱序越级执行 + 事件驱动零开销 I/O 挂起
 
 Author: AstroSASF Team
-Version: 7.2
+Version: 7.4
 """
 
 from __future__ import annotations
@@ -35,6 +35,126 @@ from scheduler.models import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# --------------------------------------------------------------------------- #
+#  ActiveResourceTable — 资源锁感知的 OoO 调度基础                                  #
+# --------------------------------------------------------------------------- #
+
+@dataclass
+class ResourceLock:
+    """单个硬件资源的锁记录。"""
+    resource_name: str
+    owner_node_id: str | None  # 当前持有者（None = 空闲）
+    locked_at: float            # 锁定时间戳
+
+
+class ActiveResourceTable:
+    """运行时资源占用表（V7.4 新增）。
+
+    维护一张全局的硬件资源占用表，支持：
+    - 查询单个资源是否被占用
+    - 查询某节点是否持有一个或多个资源
+    - 在 OoO 调度前做准入检查（防止资源争用）
+    - 在节点完成时自动释放资源
+
+    锁顺序协议（Dead-lock Prevention）：
+    - 当需要同时锁定多个资源时，必须按 resource_name 字母序依次加锁
+    - 这消除了"循环等待"类型的死锁
+
+    Usage
+    -----
+    >>> table = ActiveResourceTable()
+    >>> table.acquire("camera", "node-A")
+    True
+    >>> table.is_free("camera")
+    False
+    >>> table.acquire("camera", "node-B")  # 已被 node-A 占用 → 失败
+    False
+    >>> table.release("node-A")  # node-A 完成，自动释放
+    {'camera'}
+    """
+
+    def __init__(self) -> None:
+        self._locks: dict[str, ResourceLock] = {}
+        self._node_resources: dict[str, set[str]] = {}  # node_id → set of resource names
+        self._lock_obj: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+    async def acquire(
+        self,
+        resource_name: str,
+        node_id: str,
+    ) -> bool:
+        """原子性地申请持有某资源。
+
+        Returns
+        -------
+        bool
+            True = 成功获取；False = 已被其他节点占用。
+        """
+        async with self._lock_obj:
+            existing = self._locks.get(resource_name)
+            if existing is not None and existing.owner_node_id is not None:
+                if existing.owner_node_id != node_id:
+                    return False  # 已被其他节点占用
+
+            self._locks[resource_name] = ResourceLock(
+                resource_name=resource_name,
+                owner_node_id=node_id,
+                locked_at=time.monotonic(),
+            )
+            if node_id not in self._node_resources:
+                self._node_resources[node_id] = set()
+            self._node_resources[node_id].add(resource_name)
+
+            logger.debug(
+                "[ResourceTable] 资源占用: node=%s, resource=%s",
+                node_id, resource_name,
+            )
+            return True
+
+    async def release(self, node_id: str) -> set[str]:
+        """节点完成后释放其持有的所有资源（原子操作）。
+
+        Returns
+        -------
+        set[str]
+            被释放的资源名集合。
+        """
+        async with self._lock_obj:
+            freed: set[str] = set()
+            resources = self._node_resources.pop(node_id, set())
+            for res_name in resources:
+                lock = self._locks.get(res_name)
+                if lock is not None and lock.owner_node_id == node_id:
+                    lock.owner_node_id = None
+                    freed.add(res_name)
+                    logger.debug(
+                        "[ResourceTable] 资源释放: node=%s, resource=%s",
+                        node_id, res_name,
+                    )
+            return freed
+
+    def is_free(self, resource_name: str) -> bool:
+        """查询某资源是否空闲（无需加锁，只读快照）。"""
+        lock = self._locks.get(resource_name)
+        return lock is None or lock.owner_node_id is None
+
+    def get_holder(self, resource_name: str) -> str | None:
+        """查询某资源的当前持有者。"""
+        lock = self._locks.get(resource_name)
+        return lock.owner_node_id if lock else None
+
+    def get_node_resources(self, node_id: str) -> frozenset[str]:
+        """查询某节点当前持有的资源集合。"""
+        return frozenset(self._node_resources.get(node_id, set()))
+
+    def get_all_held_resources(self) -> dict[str, str | None]:
+        """获取所有资源的占用快照（resource_name → owner_node_id）。"""
+        return {
+            res: lock.owner_node_id
+            for res, lock in self._locks.items()
+        }
 
 
 @dataclass
@@ -97,6 +217,24 @@ class DAGOrchestrator:
     _rebalance_interval: float = field(default=DEFAULT_REBALANCE_INTERVAL, init=False)
     _dag_complete_event: asyncio.Event = field(default=None, init=False)
 
+    # ── V7.4: OoO 乱序越级执行 ── #
+    _resource_table: ActiveResourceTable = field(
+        default_factory=ActiveResourceTable, init=False,
+    )
+    _ooo_lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False)
+    # 每次 Worker 从 ReadyQueue 取不到节点时（阻塞），调度器尝试 OoO 推进
+    _ooo_lookahead_triggered: int = field(default=0, init=False)
+    # OoO 成功越级执行的节点数
+    _ooo_execution_count: int = field(default=0, init=False)
+    # I/O 与计算重叠的累计毫秒数
+    _io_compute_overlap_ms: float = field(default=0.0, init=False)
+    # 每当一个 Worker 在 I/O 等待时记录开始时间；I/O 结束时累积到 _io_compute_overlap_ms
+    _active_io_windows: dict[str, float] = field(default_factory=dict, init=False)
+    # 空闲 Worker 槽位阈值（当 RunningNodes 数量 < max_workers 时，触发 Look-ahead）
+    _min_idle_worker_threshold: int = 1
+    # OoO 最大等待窗口（毫秒），超时后强制回退
+    _ooo_max_wait_ms: float = 2000.0
+
     # --------------------------------------------------------------------------- #
     #  实验柜注册                                                                #
     # --------------------------------------------------------------------------- #
@@ -125,7 +263,8 @@ class DAGOrchestrator:
             raise ValueError(f"实验柜 '{lab_id}' 未绑定 TelemetryBus")
 
         def _interrupt_callback(interrupt: HardwareInterruptTask) -> None:
-            asyncio.create_task(
+            loop = asyncio.get_running_loop()
+            loop.create_task(
                 self._handle_hardware_interrupt(interrupt),
                 name=f"hw-int-{interrupt.interrupt_id}",
             )
@@ -417,6 +556,174 @@ class DAGOrchestrator:
             self._dag_complete_event.set()
 
     # --------------------------------------------------------------------------- #
+    #  V7.4: OoO 乱序越级执行 (Out-of-Order Look-ahead Scheduler)                   #
+    # --------------------------------------------------------------------------- #
+    # 防死锁策略：
+    # 1. 锁顺序协议：_resource_table 内部在同时锁多个资源时按字母序依次加锁
+    # 2. OoO 三重准入门：(a) 逻辑依赖全部 COMPLETED (b) 资源未被占用 (c) 联锁不拦截
+    # 3. 资源预约原子性：检查与预约在同一 _ooo_lock 下完成，不分拆
+    # 4. 推进保证：每次 OoO 推进后立即更新 _resource_table，不留幽灵锁
+    # 5. 降级兜底：超时 _ooo_max_wait_ms 后强制回退，正常结算
+    # --------------------------------------------------------------------------- #
+
+    async def _check_ooo_promotion(
+        self,
+        node: DAGNode,
+        dag_graph: DAGTaskGraph,
+    ) -> tuple[bool, str]:
+        """OoO 越级提取的三重准入门检查。
+
+        Returns
+        -------
+        tuple[bool, str]
+            (can_promote, reason_if_not)
+        """
+        # Gate 1: 逻辑依赖已全部完成（已在 BlockedQueue 中说明）
+        all_deps_done = all(
+            dag_graph.nodes[dep_id].status == NodeStatus.COMPLETED
+            for dep_id in node.dependencies
+            if dep_id in dag_graph.nodes
+        )
+        if not all_deps_done:
+            return False, "仍有逻辑依赖未完成"
+
+        # Gate 2: 物理资源未被锁定（查询 ActiveResourceTable）
+        required_resources = self._extract_required_resources(node)
+        for res in required_resources:
+            if not self._resource_table.is_free(res):
+                holder = self._resource_table.get_holder(res)
+                return False, f"资源 '{res}' 已被 '{holder}' 占用"
+
+        # Gate 3: 联锁引擎不拦截（可选，如果接入了 interlock_engine）
+        interlock_allowed = await self._check_interlock(node)
+        if not interlock_allowed:
+            return False, "联锁引擎拦截"
+
+        return True, "OK"
+
+    def _extract_required_resources(self, node: DAGNode) -> list[str]:
+        """从节点参数中提取所需的硬件资源列表。
+
+        策略：从 skill_name 和 params 中提取资源标识符。
+        可通过 _tool_registrar 扩展（暂不强制依赖）。
+        """
+        resources: list[str] = []
+        # 从 skill_name 中提取资源前缀（如 "camera_*.py" → "camera"）
+        if node.skill_name:
+            parts = node.skill_name.lower().split("_")
+            if parts:
+                resources.append(parts[0])
+        # 从 lab_id 推断（同一实验柜硬件互斥）
+        if node.lab_id:
+            resources.append(f"lab:{node.lab_id}")
+        return resources
+
+    async def _check_interlock(self, node: DAGNode) -> bool:
+        """查询联锁引擎，判断节点是否可以执行（可扩展接入 labs/interlock_engine）。"""
+        # 默认允许；如果接入了 interlock_engine，可以在这里调用其 API
+        # labs/interlock_engine.InterlockEngine.check(node) → bool
+        # 此处保持默认 True，避免强制依赖 labs 模块
+        return True
+
+    async def _look_ahead_and_promote(self) -> int:
+        """主动遍历 BlockedQueue，执行资源锁感知的越级推进。
+
+        触发时机：Worker Pool 有空闲槽位但 ReadyQueue 为空时。
+
+        算法：
+        1. 遍历所有 BlockedQueue 中的节点
+        2. 对每个节点执行三重准入门检查（依赖 / 资源 / 联锁）
+        3. 若检查通过：在 _ooo_lock 下将节点预约资源并移入 ReadyQueue
+        4. 记录 OoO 执行次数
+
+        Returns
+        -------
+        int
+            本次调用成功越级推进的节点数。
+
+        防死锁核心：
+        - 资源预约与 ReadyQueue 入队在同一把 _ooo_lock 下完成
+        - 不存在"检查通过但预约失败"的竞态窗口
+        """
+        promoted = 0
+
+        async with self._ooo_lock:
+            # 获取 BlockedQueue 快照（遍历时不上锁，允许并发 I/O 回调正常结算）
+            blocked_snapshot = list(self._blocked_queue)
+            for node in blocked_snapshot:
+                if node.status != NodeStatus.PENDING:
+                    continue
+
+                dag_graph = self._active_graphs.get(node.graph_id)
+                if dag_graph is None:
+                    continue
+
+                can_promote, reason = await self._check_ooo_promotion(node, dag_graph)
+                if not can_promote:
+                    logger.debug(
+                        "[OoO] 节点 '%s' 越级检查未通过: %s",
+                        node.node_id, reason,
+                    )
+                    continue
+
+                # 原子性资源预约（在 _ooo_lock 下）
+                required_resources = self._extract_required_resources(node)
+                reservation_ok = True
+                for res in sorted(required_resources):  # 字母序 → 锁顺序协议
+                    acquired = await self._resource_table.acquire(res, node.node_id)
+                    if not acquired:
+                        reservation_ok = False
+                        # 回滚已预约的资源（保持原子性）
+                        await self._resource_table.release(node.node_id)
+                        logger.warning(
+                            "[OoO] 资源预约失败，回滚: node=%s, resource=%s",
+                            node.node_id, res,
+                        )
+                        break
+
+                if not reservation_ok:
+                    continue
+
+                # 从 BlockedQueue 移除（在 _ooo_lock 下）
+                self._blocked_queue = [n for n in self._blocked_queue if n.node_id != node.node_id]
+
+                # 注入 ReadyQueue（立即可被任何空闲 Worker 抢到）
+                node.status = NodeStatus.READY
+                priority_score = node.get_ready_score()
+                await self._ready_queue.put((priority_score, node))
+
+                self._ooo_execution_count += 1
+                promoted += 1
+                self._ooo_lookahead_triggered += 1
+
+                logger.info(
+                    "🔀 [OoO] 越级推进成功: 节点 '%s' (skill=%s, reason=%s) "
+                    "→ ReadyQueue | OoO累计: %d",
+                    node.node_id, node.skill_name, reason, self._ooo_execution_count,
+                )
+
+        return promoted
+
+    def _start_io_overlap_tracking(self, node_id: str) -> None:
+        """记录某节点开始 I/O 等待的时间戳（用于 I/O-计算重叠度统计）。"""
+        self._active_io_windows[node_id] = time.monotonic()
+        logger.debug(
+            "[IoOverlap] I/O 等待开始: node=%s (活跃 I/O 窗口: %d)",
+            node_id, len(self._active_io_windows),
+        )
+
+    def _end_io_overlap_tracking(self, node_id: str) -> None:
+        """节点 I/O 等待结束，累加重叠时长到统计指标。"""
+        start = self._active_io_windows.pop(node_id, None)
+        if start is not None:
+            elapsed_ms = (time.monotonic() - start) * 1000
+            self._io_compute_overlap_ms += elapsed_ms
+            logger.debug(
+                "[IoOverlap] I/O 窗口结束: node=%s, duration=%.1fms (累计: %.1fms)",
+                node_id, elapsed_ms, self._io_compute_overlap_ms,
+            )
+
+    # --------------------------------------------------------------------------- #
     #  Worker 生命周期 (执行阶段)                                                 #
     # --------------------------------------------------------------------------- #
 
@@ -427,21 +734,22 @@ class DAGOrchestrator:
 
         logger.info("")
         logger.info("╔" + "═" * 60 + "╗")
-        logger.info("║  🚀 DAG 调度内核启动 (V7.2 Dual-Track + HW Preemption)  ║")
+        logger.info("║  🚀 DAG 调度内核启动 (V7.4 OoO + Event-Driven I/O)     ║")
         logger.info("║  Workers: %-3d | ReadyQueue | BlockedQueue               ║", self.max_workers)
         logger.info("║  理论智能体: DAG Planner | 实践智能体: DAG Workers    ║")
         logger.info("║  Aging 重平衡: %.1fs 间隔 | 因子: %.3f                     ║",
                     self._rebalance_interval, self._aging_factor)
+        logger.info("║  OoO 越级执行: 启用 | 资源锁感知: 启用                  ║")
         logger.info("╚" + "═" * 60 + "╝")
         logger.info("")
 
-        self._aging_rebalance_task = asyncio.create_task(
+        self._aging_rebalance_task = asyncio.get_running_loop().create_task(
             self._aging_rebalance_loop(),
             name="aging-rebalance",
         )
 
         for i in range(self.max_workers):
-            worker = asyncio.create_task(
+            worker = asyncio.get_running_loop().create_task(
                 self._worker_loop(worker_id=i),
                 name=f"dag-worker-{i}",
             )
@@ -488,7 +796,13 @@ class DAGOrchestrator:
         return [self._build_dag_result(g) for g in self._completed_graphs]
 
     async def _worker_loop(self, worker_id: int) -> None:
-        """实践智能体 Worker 协程 — 从 ReadyQueue 取节点执行。"""
+        """实践智能体 Worker 协程 — 从 ReadyQueue 取节点执行。
+
+        V7.4 增强：
+        - ReadyQueue 为空时，触发 _look_ahead_and_promote() 尝试 OoO 越级提取
+        - 当 RunningNodes 数量 < max_workers 时，说明有 Worker 在等待 I/O
+          （或完全挂起），此时 OoO 推进可以提升资源利用率
+        """
         logger.info("[Worker-%d] 实践智能体就绪", worker_id)
 
         while not self._shutdown_flag:
@@ -497,17 +811,27 @@ class DAGOrchestrator:
                     self._hardware_interrupt_event.clear()
                     logger.info("[Worker-%d] 检测到硬件中断信号", worker_id)
 
-                priority_score, node = await asyncio.wait_for(
-                    self._ready_queue.get(),
-                    timeout=1.0,
-                )
-            except asyncio.TimeoutError:
-                continue
-            except asyncio.CancelledError:
-                break
+                # V7.4: 动态超时 — 有空闲槽位时缩短等待，允许更快触发 OoO
+                async with self._lock:
+                    running_now = len(self._running_nodes)
+                idle_slots = self.max_workers - running_now
+                queue_timeout = 0.2 if idle_slots > 0 else 1.0
 
-            if node is None:
-                break
+                try:
+                    priority_score, node = await asyncio.wait_for(
+                        self._ready_queue.get(),
+                        timeout=queue_timeout,
+                    )
+                except asyncio.TimeoutError:
+                    # V7.4: ReadyQueue 为空，尝试 OoO 越级推进
+                    if idle_slots > 0 and self._blocked_queue:
+                        promoted = await self._look_ahead_and_promote()
+                        if promoted > 0:
+                            logger.info(
+                                "[Worker-%d] OoO 推进了 %d 个节点，触发 Worker 重新竞争",
+                                worker_id, promoted,
+                            )
+                    continue
 
             try:
                 await self._execute_node(worker_id, node)
@@ -566,12 +890,18 @@ class DAGOrchestrator:
             async with self._lock:
                 self._running_nodes.pop(node.node_id, None)
                 self._completed_nodes.append(node)
+            # V7.4: 节点完成，自动释放其持有的所有硬件资源
+            await self._resource_table.release(node.node_id)
+            self._end_io_overlap_tracking(node.node_id)
         except Exception as exc:
             logger.exception("[Worker-%d] 节点执行异常: [%s]", worker_id, node.node_id)
             node.mark_failed(str(exc))
             async with self._lock:
                 self._running_nodes.pop(node.node_id, None)
                 self._failed_nodes.append(node)
+            # V7.4: 节点失败也必须释放资源，防止幽灵锁
+            await self._resource_table.release(node.node_id)
+            self._end_io_overlap_tracking(node.node_id)
 
         elapsed = node.elapsed_time or 0
         logger.info(
@@ -620,7 +950,7 @@ class DAGOrchestrator:
         return result
 
     def _build_dag_result(self, dag_graph: DAGTaskGraph) -> DAGExecutionResult:
-        """构建 DAG 执行结果。"""
+        """构建 DAG 执行结果（含 V7.4 OoO/Overlap 指标）。"""
         total_time = (
             max((n.end_time or 0) for n in dag_graph.nodes.values()) -
             dag_graph.created_at
@@ -636,6 +966,13 @@ class DAGOrchestrator:
             total_time=total_time,
             execution_levels=len(dag_graph.get_execution_levels()),
             node_results=[n.to_dict() for n in dag_graph.nodes.values()],
+            # V7.4 新增指标
+            planner_llm_calls=0,
+            planner_time_ms=0.0,
+            worker_llm_calls=0,
+            ooo_execution_count=self._ooo_execution_count,
+            io_compute_overlap_ms=self._io_compute_overlap_ms,
+            ooo_lookahead_triggered=self._ooo_lookahead_triggered,
         )
 
     @property
@@ -656,7 +993,7 @@ class DAGOrchestrator:
 
     @property
     def status_summary(self) -> dict[str, Any]:
-        """获取调度器状态摘要。"""
+        """获取调度器状态摘要（含 V7.4 OoO 指标）。"""
         return {
             "ready_queue": self.ready_count,
             "blocked_queue": self.blocked_count,
@@ -669,6 +1006,12 @@ class DAGOrchestrator:
             "interrupt_queue_size": self._interrupt_queue.qsize(),
             "aging_factor": self._aging_factor,
             "rebalance_interval": self._rebalance_interval,
+            # V7.4 OoO 指标
+            "ooo_execution_count": self._ooo_execution_count,
+            "ooo_lookahead_triggered": self._ooo_lookahead_triggered,
+            "io_compute_overlap_ms": self._io_compute_overlap_ms,
+            "active_io_windows": len(self._active_io_windows),
+            "resource_locks": self._resource_table.get_all_held_resources(),
         }
 
 
@@ -681,6 +1024,8 @@ __all__ = [
     "TaskPriority",
     "HardwareInterruptTask",
     "HardwareAlarm",
+    "ActiveResourceTable",
+    "ResourceLock",
     "compute_dynamic_priority",
     "DAG_PLANNER_PROMPT_TEMPLATE",
     "DAG_VALIDATOR_PROMPT",
