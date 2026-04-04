@@ -4,6 +4,14 @@
 
 from infra.gateway.proxy import GatewayProxy, GatewayRequest, GatewayResponse
 from infra.gateway.api import create_gateway_app, GatewayState
+from infra.gateway.transform_pipeline import (
+    PromptTransformationPipeline,
+    RAGReorderMiddleware,
+    StaticMCPMiddleware,
+    SpeculativeWarmer,
+    PrefixBuilder,
+    TransformContext,
+)
 
 __all__ = [
     "GatewayProxy",
@@ -11,4 +19,10 @@ __all__ = [
     "GatewayResponse",
     "create_gateway_app",
     "GatewayState",
+    "PromptTransformationPipeline",
+    "RAGReorderMiddleware",
+    "StaticMCPMiddleware",
+    "SpeculativeWarmer",
+    "PrefixBuilder",
+    "TransformContext",
 ]

@@ -17,20 +17,20 @@ gateway:
   # 后端实例列表（按 weight 加权路由，weight 越高分到越多请求）
   backends:
     # ── 本地 Ollama（fallback / 开发用）────────────────────────────── #
-    # - url: "http://localhost:11434"
-    #   provider: "ollama"
-    #   model_name: "qwen2.5:7b"
-    #   weight: 1
-    #   tags: ["local", "fallback", "cpu"]
-    #   enabled: true
+    - url: "http://localhost:11434"
+      provider: "ollama"
+      model_name: "qwen2.5:7b"
+      weight: 1
+      tags: ["local", "fallback", "cpu"]
+      enabled: true
 
     # ── 远端 SGLang 推理节点（GPU 集群主节点）─────────────────────── #
-    - url: "http://10.244.37.55:8000"
-      provider: "vllm"
-      model_name: "qwen2.5-14b-instruct"
-      weight: 3
-      tags: ["v100", "node-1", "gpu"]
-      enabled: true
+    # - url: "http://10.244.37.59:8000"
+    #   provider: "vllm"
+    #   model_name: "DeepSeek-R1-0528-Qwen3-8B"
+    #   weight: 3
+    #   tags: ["v100", "node-1", "gpu"]
+    #   enabled: true
 
     # ── 远端 vLLM 推理节点（备节点）───────────────────────────────── #
     # - url: "http://192.168.1.11:8000"

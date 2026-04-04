@@ -42,6 +42,13 @@ from infra.routing.vram_breaker import (
     VRAMWatermarkBreaker,
     AdmissionResult,
 )
+from infra.gateway.transform_pipeline import (
+    PromptTransformationPipeline,
+    RAGReorderMiddleware,
+    StaticMCPMiddleware,
+    SpeculativeWarmer,
+    PrefixBuilder,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -125,13 +132,25 @@ class GatewayProxy:
         "prefix_cached_requests": 0,
         "circuit_broken_requests": 0,
         "vram_rejected_requests": 0,
+        "cross_agent_cache_hits": 0,      # 跨智能体预热成功命中次数
+        "tool_schema_saved_tokens": 0,    # StaticMCP 累计节省的 Prefill Tokens
     })
+    # Prompt 转换流水线（可选）
+    pipeline: PromptTransformationPipeline | None = field(default=None, init=False)
 
     def __post_init__(self) -> None:
         if self.load_balancer is None:
             self.load_balancer = PrefixAwareLoadBalancer(instance_pool=self.instance_pool)
         if self.watermark_breaker is None:
             self.watermark_breaker = VRAMWatermarkBreaker(instance_pool=self.instance_pool)
+
+        # 构建 Prompt 转换流水线
+        self.pipeline = PromptTransformationPipeline(
+            rag_middleware=RAGReorderMiddleware(),
+            mcp_middleware=StaticMCPMiddleware(stats_ref=self._stats),
+            prefix_builder=PrefixBuilder(),
+            warmer=None,  # 启动时注入，见 start()
+        )
 
     # ------------------------------------------------------------------------ #
     #  Lifecycle                                                                 #
@@ -148,11 +167,32 @@ class GatewayProxy:
         )
         await self.load_balancer.start()
         await self.instance_pool.start()
-        logger.info("[GatewayProxy] 网关代理已启动")
+
+        # 注入 URL → model_name 映射（Task 0 核心能力）
+        url_to_model: dict[str, str] = {
+            url: cfg.model_name
+            for url, cfg in self.instance_pool.configs.items()
+        }
+
+        # 启动推测性预热后台协程
+        if self.pipeline is not None:
+            self.pipeline.warmer = SpeculativeWarmer(
+                http_client=self._http_client,
+                prefix_builder=self.pipeline.prefix_builder,
+                instance_pool=self.instance_pool,
+                stats_ref=self._stats,
+            )
+            if self.pipeline.warmer is not None:
+                await self.pipeline.warmer.start()
+                self.pipeline.warmer.set_url_model_map(url_to_model)
+
+        logger.info("[GatewayProxy] 网关代理已启动（含 PromptTransformationPipeline）")
 
     async def stop(self) -> None:
         """停止网关代理。"""
         self._running = False
+        if self.pipeline and self.pipeline.warmer:
+            await self.pipeline.warmer.stop()
         if self._http_client:
             await self._http_client.aclose()
             self._http_client = None
@@ -246,7 +286,7 @@ class GatewayProxy:
     async def chat(self, request: GatewayRequest) -> GatewayResponse | GatewayError:
         """同步 Chat 接口。
 
-        完整链路：路由 → 准入 → 连接 → 请求 → 响应 → 记录
+        完整链路：Transform → 路由 → 准入 → 连接 → 请求 → 响应 → 预热触发
         """
         if not request.request_id:
             request.request_id = str(uuid.uuid4())
@@ -255,18 +295,41 @@ class GatewayProxy:
         self._stats["total_requests"] += 1
 
         try:
+            # 0. Prompt 转换（流量拦截与重构）
+            instance_config: LLMInstanceConfig | None = None
+            agent_type = "experiment"
+            if self.pipeline:
+                # 推断 Agent 类型
+                agent_type = self.pipeline.infer_agent_type(
+                    request.messages, request.tags,
+                )
+                # 执行流水线
+                transformed_messages, transform_ctx = await self.pipeline.transform(
+                    request, agent_type=agent_type,
+                )
+                # 将转换后的 messages 写回请求
+                request.messages = transformed_messages
+
             # 1. 路由 + 准入
             decision, url = await self._route(request)
 
-            # 2. 获取连接
+            # 2. 获取目标实例配置（用于强制 model 覆盖）
+            instance_config = self.instance_pool.configs.get(url)
+            real_model = (
+                instance_config.model_name
+                if instance_config and instance_config.model_name
+                else (request.model or "qwen2.5:7b")
+            )
+
+            # 3. 获取连接
             await self.instance_pool.acquire_connection(url)
 
             try:
-                # 3. 发送请求
-                result = await self._do_request(url, request)
+                # 4. 发送请求（强制使用真实 model_name）
+                result = await self._do_request(url, real_model, request)
                 elapsed_ms = (time.monotonic() - start_time) * 1000
 
-                # 4. 记录成功
+                # 5. 记录成功
                 await self.instance_pool.release_connection(url, success=True, latency_ms=elapsed_ms)
                 await self.watermark_breaker.on_request_success(url)
                 await self.load_balancer.record_route_success(decision)
@@ -275,15 +338,19 @@ class GatewayProxy:
                 if decision.is_cached:
                     self._stats["prefix_cached_requests"] += 1
 
+                # 6. 触发推测性预热（后台，fire-and-forget）
+                if self.pipeline:
+                    self.pipeline.trigger_warmup(request, agent_type, url)
+
                 logger.info(
-                    "[GatewayProxy] 请求完成: %s → %s [%s] (%.1fms)",
+                    "[GatewayProxy] 请求完成: %s → %s [%s] model=%s (%.1fms)",
                     request.request_id[:8], url,
-                    decision.strategy.value, elapsed_ms,
+                    decision.strategy.value, real_model, elapsed_ms,
                 )
 
                 return GatewayResponse(
                     content=result["content"],
-                    model=result.get("model", ""),
+                    model=real_model,
                     usage=result.get("usage"),
                     finish_reason=result.get("finish_reason"),
                     request_id=request.request_id,
@@ -313,7 +380,7 @@ class GatewayProxy:
     async def stream_chat(self, request: GatewayRequest) -> AsyncGenerator[bytes, None]:
         """流式 Chat 接口。
 
-        直接透传 SGLang/vLLM 的 SSE 流式响应。
+        完整链路：Transform → 路由 → 准入 → 连接 → 流式请求 → 响应 → 预热触发
         """
         if not request.request_id:
             request.request_id = str(uuid.uuid4())
@@ -321,12 +388,33 @@ class GatewayProxy:
         self._stats["total_requests"] += 1
 
         try:
+            # 0. Prompt 转换
+            agent_type = "experiment"
+            if self.pipeline:
+                agent_type = self.pipeline.infer_agent_type(
+                    request.messages, request.tags,
+                )
+                transformed_messages, _ = await self.pipeline.transform(
+                    request, agent_type=agent_type,
+                )
+                request.messages = transformed_messages
+
+            # 1. 路由 + 准入
             decision, url = await self._route(request)
+
+            # 2. 强制 model 覆盖
+            instance_config = self.instance_pool.configs.get(url)
+            real_model = (
+                instance_config.model_name
+                if instance_config and instance_config.model_name
+                else (request.model or "qwen2.5:7b")
+            )
+
             await self.instance_pool.acquire_connection(url)
 
             try:
                 start_time = time.monotonic()
-                async for chunk in self._do_streaming_request(url, request):
+                async for chunk in self._do_streaming_request(url, real_model, request):
                     yield chunk
 
                 elapsed_ms = (time.monotonic() - start_time) * 1000
@@ -338,10 +426,14 @@ class GatewayProxy:
                 if decision.is_cached:
                     self._stats["prefix_cached_requests"] += 1
 
+                # 触发推测性预热（后台，fire-and-forget）
+                if self.pipeline:
+                    self.pipeline.trigger_warmup(request, agent_type, url)
+
                 logger.info(
-                    "[GatewayProxy] 流式请求完成: %s → %s [%s] (%.1fms)",
+                    "[GatewayProxy] 流式请求完成: %s → %s [%s] model=%s (%.1fms)",
                     request.request_id[:8], url,
-                    decision.strategy.value, elapsed_ms,
+                    decision.strategy.value, real_model, elapsed_ms,
                 )
 
             except Exception:
@@ -360,13 +452,13 @@ class GatewayProxy:
     #  Internal HTTP Methods                                                     #
     # ------------------------------------------------------------------------ #
 
-    async def _do_request(self, url: str, request: GatewayRequest) -> dict[str, Any]:
+    async def _do_request(self, url: str, real_model: str, request: GatewayRequest) -> dict[str, Any]:
         """发送非流式请求到 LLM 实例。"""
         if not self._http_client:
             raise RuntimeError("HTTP 客户端未初始化")
 
         payload = {
-            "model": request.model or "qwen2.5-7b",
+            "model": real_model,           # 强制使用实例真实 model_name（禁止透传客户端默认值）
             "messages": request.messages,
             "temperature": request.temperature,
             "max_tokens": request.max_tokens,
@@ -388,7 +480,7 @@ class GatewayProxy:
 
         return {
             "content": content,
-            "model": data.get("model", ""),
+            "model": real_model,           # 回传真实的 model（而非后端可能返回的别名）
             "usage": data.get("usage"),
             "finish_reason": data["choices"][0].get("finish_reason") if "choices" in data else None,
         }
@@ -396,6 +488,7 @@ class GatewayProxy:
     async def _do_streaming_request(
         self,
         url: str,
+        real_model: str,
         request: GatewayRequest,
     ) -> AsyncGenerator[bytes, None]:
         """发送流式请求到 LLM 实例（透传 SSE）。"""
@@ -403,7 +496,7 @@ class GatewayProxy:
             raise RuntimeError("HTTP 客户端未初始化")
 
         payload = {
-            "model": request.model or "qwen2.5-7b",
+            "model": real_model,           # 强制使用实例真实 model_name
             "messages": request.messages,
             "temperature": request.temperature,
             "max_tokens": request.max_tokens,
@@ -451,6 +544,8 @@ class GatewayProxy:
                 "prefix_cached_rate": f"{self._stats['prefix_cached_requests'] / max(1, total) * 100:.1f}%",
                 "circuit_broken_requests": self._stats["circuit_broken_requests"],
                 "vram_rejected_requests": self._stats["vram_rejected_requests"],
+                "cross_agent_cache_hits": self._stats["cross_agent_cache_hits"],
+                "tool_schema_saved_tokens": self._stats["tool_schema_saved_tokens"],
             },
             "instance_pool": self.instance_pool.get_stats(),
             "load_balancer": self.load_balancer.get_stats(),

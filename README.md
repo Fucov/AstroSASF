@@ -334,6 +334,8 @@ python demo/demo_mission.py --catalog ./my_labs --skills ./my_skills
 | **安全求值** | `ast.parse` + 白名单节点遍历 | 联锁表达式安全执行 |
 | **并发** | `asyncio` (标准库) | 异步任务调度 |
 | **调度** | `asyncio.PriorityQueue` + `asyncio.Lock` | DAG 任务排队与并发控制 |
+| **网关流水线** | PromptTransformationPipeline | 流量拦截与 Prompt 重构 |
+| **前缀缓存** | RadixTree (SGLang) + SHA-256 排序 | KV-Cache 复用 |
 | **负载均衡** | 前缀哈希 + 最少连接 | LLM 路由 |
 | **熔断** | 状态机 + VRAM 水位 | 保护 LLM 实例 |
 | **总线模拟** | SpaceWire 协议 | 低带宽遥测约束 |
@@ -344,8 +346,8 @@ python demo/demo_mission.py --catalog ./my_labs --skills ./my_skills
 
 | 版本 | 日期 | 核心变化 |
 |------|------|----------|
+| **V7.3** | 2026-04-04 | PromptTransformationPipeline：RAG 确定性重排（SHA-256 升序）→ StaticMCP Schema 前缀锁（动态遥测推到末尾）→ SpeculativeWarmer 跨 Agent 预热；Task 0 强制 model 查表覆盖；新增 `cross_agent_cache_hits` / `tool_schema_saved_tokens` 埋点 |
 | **V7.2** | 2026-04-04 | 分布式网关重构：移除单实例 `llm` 节点 → `gateway.backends[]` 多后端配置阵列；`config.yaml` 驱动 `init_distributed_gateway()`；移除 `create_llm()` LangChain 工厂；修复 `_check_instance` async lock 持有 bug |
-| **V7.2** | 2026-04-03 | 内核化重构：提取 `infra/`、`scheduler/`、`interface/`、`labs/`，扁平化目录，`demo_mission.py` 三智能体演示，vLLM/SGLang 前缀感知网关 |
 | **V7.1** | 2026-03 | 数据集评测 + LLM 算力埋点 + 物理模拟层 |
 | **V7.0** | 2026-03 | DAG 双轨调度 + 理论/实践智能体分离 |
 | **V6.2** | 2026-01 | LLM 语义路由替代 BM25 |
