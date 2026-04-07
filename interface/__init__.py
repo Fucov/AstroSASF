@@ -10,5 +10,5 @@ AstroSASF Interface — 向上暴露的 API 接口
 提供统一的 HTTP API 接口，供外部系统调用。
 """
 
-__version__ = "7.2.0"
+__version__ = "8.0.0"
 __all__ = ["gateway", "server", "facade", "state"]

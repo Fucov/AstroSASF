@@ -1,6 +1,6 @@
-# AstroSASF V7.5 — Astro Scientific Agent Scheduling Framework
+# AstroSASF V8.0 — Astro Scientific Agent Scheduling Framework
 
-> 面向太空实验室的科学智能体调度框架 · **内核化架构** · **DAG 双轨调度** · **OoO 乱序执行** · **事件驱动 I/O 挂起** · **令牌桶带宽管控** · **AoI 感知的 QoS 队列** · **A2A 语义增量同步**
+> 面向太空实验室的科学智能体调度框架 · **V8.0 内核重写** · **OoO 后台主动扫描** · **五层防死锁协议** · **时间维度挂起** · **纳秒级调度时延** · **意图感知异构路由** · **透明模型降级** · **权威指标评估体系**
 
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-REST%20API-blue.svg)](https://fastapi.tiangolo.com/)
@@ -26,10 +26,10 @@ AstroSASF V7.3 是专为**空间站科学实验柜**设计的智能体调度框�
 - **CRITICAL 报警击穿拥塞**：硬件报警包进入 CRITICAL 队列无限额优先发送，平均排队延迟 < 5ms
 - **弱网抗性指标**：`bytes_saved_by_aoi`（AoI 覆写节省字节）、`critical_avg_queue_latency_ms`（CRITICAL 包平均排队延迟）、`total_bytes_saved_by_diff`（Diff 节省字节）埋点
 
-- **OoO 乱序执行**（V7.4）：ReadyQueue 为空但 Worker Pool 有空闲槽位时，主动遍历 BlockedQueue 执行三重准入门检查（逻辑依赖 / 资源锁 / 联锁），将符合条件的节点越级推入 ReadyQueue
-- **ActiveResourceTable**（V7.4）：维护全局硬件资源占用表，OoO 调度前查询资源是否被占用；五层防死锁策略
-- **wait_for_condition**（V7.4）：Worker 通过 `await Future` 让出控制权，后台遥测流 `batch_write` 时通过 `future.set_result()` 瞬间唤醒，零轮询开销
-- **动态子图挂载**（V7.4）：`DAGTaskGraph.mount_sub_dag()` 在运行时动态注入子图
+- **OoO 乱序执行**（V8.0）：后台 OoO Scanner 协程持续监控 ReadyQueue，当 WorkerPool 有空余 Slot 时主动遍历 BlockedQueue 执行越级提取；资源正交性公式 R(v_k) ∩ R_active = ∅；五层防死锁协议（字母序加锁 / 三重准入门 / 原子预约 / 推进保证 / 超时自动释放）
+- **时间维度挂起**（V8.0）：asyncio.Future 驱动的 wait_for_condition，长周期物理 I/O 时立即 yield 控制权，释放推理线程
+- **调度时延纳秒级埋点**（V8.0）：每个节点记录 ReadyQueue 入队到真正 Issue 的时间差，支持 P50/P95/P99/P999 分位数统计
+- **ActiveResourceTable**（V8.0）：增强版资源占用表，支持超时自动回收（30s 锁超时阈值）、资源正交性 check_orthogonality()、复合键追踪
 
 **快速开始：**
 
@@ -112,7 +112,12 @@ AstroSASF/
 │
 │
 ├── datasets/                     # 评测数据集
-└── benchmarks/                  # 基准测试
+└── benchmarks/                  # ★ V8.0 权威指标评估体系
+    ├── metrics_collector.py     # ★ Makespan / I/O-Compute Overlap /
+    │                              #   Scheduling Latency(纳秒) / Resource Utility CV /
+    │                              #   Consistency Check + AblationComparator
+    ├── astro_concurrency.py     # 并发调度 + Ablation 对比测试
+    └── run_dataset_eval.py      # 数据集评测 + 物理模拟
 ```
 
 ### 目录分层设计哲学
@@ -258,9 +263,13 @@ SpaceWire 总线令牌桶按 `spacewire_bandwidth_kbps` 发放令牌（Byte/s）
 
 **wait_for_condition** 让 Worker 通过 `await Future` 让出控制权，后台遥测流 `batch_write` 时通过 `future.set_result()` 瞬间唤醒，零轮询开销。
 
-### 15. 异构计算调度 — 意图感知模型路由（V7.5 核心新增）
+### 16. 异构计算调度 — 意图感知模型路由（V8.0 核心新增）
 
-太空环境的算力极度不对等：大显存卡跑 7B+ 模型做复杂规划，小卡跑 1.5B 模型做极速 Tool Calling。V7.5 引入**异构算力池**和**意图感知路由**，彻底解决算力碎片与浪费问题。
+太空环境的算力极度不对等：大显存卡跑 7B+ 模型做复杂规划，小卡跑 1.5B 模型做极速 Tool Calling。V8.0 引入**异构算力池**和**意图感知路由**，彻底解决算力碎片与浪费问题。
+
+#### V8.0 新增：透明模型重写 + 时间维度优先级切换
+
+当 heavy 实例 VRAM ≥ W_high (0.85) 时，自动执行模型名称重写（查 `_MODEL_DOWNGRADE_MAP`：qwen-7b → qwen-1.5b）并路由至 light 池。时间维度优先级 `_compute_time_priority()` 返回 0=正常 / 1=降级 / 2=高压。复合路由键 `prefix_hash#compute_class` 实现跨节点 KV-Cache 隔离复用。
 
 #### 核心概念
 
@@ -297,7 +306,7 @@ Agent 请求（带 agent_id / tags）
     │
     ▼
 ┌──────────────────────────────────────────┐
-│  3. 意图降级路由（V7.5 核心）               │
+│  3. 意图降级路由（V8.0 核心）               │
 │     heavy 请求但 heavy 实例满载             │
 │     → 自动降级到 light 实例                │
 │     透明重写 model_name（查降级映射表）      │
@@ -353,7 +362,7 @@ GatewayResponse(
 - `light_model_routed_rate`：`light / (light + heavy)` 分发比率
 - `downgrade_rate`：`compute_downgrade / total_requests` 降级触发率
 
-### 16. 动态子图挂载（V7.4）
+### 17. 动态子图挂载（V7.4）
 
 `DAGTaskGraph.mount_sub_dag(parent_node_id, sub_dag)` 在某节点完成后动态注入子图，支持 Planner 的"空闲算力投机预计算"。自动分配节点 ID 前缀（`parent::`）、重建 Kahn 拓扑排序、检测循环依赖。
 
@@ -361,18 +370,20 @@ GatewayResponse(
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                    AstroSASF V7.5 系统架构                                    │
+│                    AstroSASF V8.0 系统架构                                    │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                                                                             │
 │  ┌─────────────────────────────────────────────────────────────────────┐  │
 │  │                    客户端层 (Client)                                    │  │
 │  │   航天员 / Agent → HTTP 请求 → REST API → 结果展示                      │  │
+│  │   + X-Astro-OoO / X-Astro-Downgraded 响应头（实验记录）                  │  │
 │  └─────────────────────────────────────────────────────────────────────┘  │
 │                               │                                            │
 │                               ▼                                            │
 │  ┌─────────────────────────────────────────────────────────────────────┐  │
 │  │              北向接口层 (interface/)                                    │  │
-│  │    FastAPI Server ← Facade ← Agent (Q&A / Planner / Executor)          │  │
+│  │    FastAPI Server ← Facade (V8.0) ← Agent (Q&A / Planner / Executor) │  │
+│  │    + LLMResponseMetadata（含 X-Astro-* 响应头）                         │  │
 │  └─────────────────────────────────────────────────────────────────────┘  │
 │                               │                                            │
 │                               ▼                                            │
@@ -380,23 +391,29 @@ GatewayResponse(
 │  │              分布式 LLM 网关 (infra/gateway/)                          │  │
 │  │                                                                         │  │
 │  │  ┌─────────────────────────────────────────────────────────────────┐  │  │
-│  │  │  意图检测 (agent_id/tags) → 异构算力路由                            │  │  │
+│  │  │  意图检测 (agent_id/tags) → 异构算力路由 (V8.0)                   │  │  │
 │  │  │  Planner Agent ──→ heavy (7B+)  │  Executor/QA ──→ light (1.5B)  │  │  │
+│  │  │  VRAM ≥ W_high → 透明降级 (qwen-7b → qwen-1.5b) + TimePriority   │  │  │
 │  │  └─────────────────────────────────────────────────────────────────┘  │  │
 │  │  PrefixAwareLoadBalancer ──→ VRAMWatermarkBreaker ──→ LLMInstancePool │  │
-│  │       (前缀哈希路由)              (优先级准入+动态降级)     (异构节点池)   │  │
+│  │       (复合路由键 prefix#cc)          (优先级准入+动态降级)    (异构节点池)   │  │
 │  │                                                                         │  │
 │  │  ┌────────────────────┐  ┌────────────────────┐                       │  │
 │  │  │  heavy 实例 (7B+)   │  │  light 实例 (1.5B) │  ← config.yaml        │  │
 │  │  │  SGLang / vLLM     │  │  Ollama / 小卡      │                       │  │
-│  │  │  localhost:11434   │  │  10.244.37.59:8000 │                       │  │
 │  │  └────────────────────┘  └────────────────────┘                       │  │
 │  └─────────────────────────────────────────────────────────────────────┘  │
 │                               │                                            │
 │                               ▼                                            │
 │  ┌─────────────────────────────────────────────────────────────────────┐  │
-│  │              内核调度层 (scheduler/)                                    │  │
+│  │              内核调度层 (scheduler/) (V8.0)                            │  │
 │  │   DAG Orchestrator → PriorityQueue → Worker Pool                       │  │
+│  │   ┌────────────────────────────────────────────────────────────────┐ │  │
+│  │   │  V8.0 OoO Scanner（后台主动乱序提取）                                │ │  │
+│  │   │  ActiveResourceTable（五层防死锁 + 超时自动释放）                    │ │  │
+│  │   │  Temporal Yield（asyncio.Future I/O 挂起）                        │ │  │
+│  │   │  Scheduling Latency（纳秒级埋点）                                   │ │  │
+│  │   └────────────────────────────────────────────────────────────────┘ │  │
 │  │   A2A Protocol │ VirtualBus │ Telemetry + Alarm                       │  │
 │  └─────────────────────────────────────────────────────────────────────┘  │
 │                               │                                            │
@@ -521,8 +538,9 @@ python demo/demo_mission.py --catalog ./my_labs --skills ./my_skills
 
 | 版本 | 日期 | 核心变化 |
 |------|------|----------|
-| **V7.5** | 2026-04-04 | 令牌桶带宽限流（QoS 三级队列）；AoI 遥测覆写（NORMAL 队列去重）；A2A 语义增量同步 `A2ASemanticDiff`（废弃全量发送）；`bytes_saved_by_aoi` / `critical_avg_queue_latency_ms` / `total_bytes_saved_by_diff` 埋点；OoO 乱序越级执行（ActiveResourceTable + 五层防死锁）；`wait_for_condition` 零开销事件驱动 I/O 挂起；动态子图挂载 `mount_sub_dag`；ResponseSanitizer（剥离 <think>/</think> 推理噪声）；**异构计算调度**（意图感知模型路由 Planner→heavy / Executor→light + compute_class 算力分级 + 动态透明降级 `compute_downgrade_count` / `light_model_routed_count` 指标） |
-| **V7.4** | 2026-04-04 | OoO 乱序越级执行（ActiveResourceTable + 三重准入门 + 五层防死锁）；`wait_for_condition` 零开销事件驱动 I/O 挂起（Pub/Sub + asyncio.Future）；动态子图挂载 `mount_sub_dag`（Kahn 拓扑实时重建）；`ooo_execution_count` / `io_compute_overlap_ms` 埋点 |
+| **V7.5** | 2026-04-04 | 令牌桶带宽限流（QoS 三级队列）；AoI 遥测覆写（NORMAL 队列去重）；A2A 语义增量同步 `A2ASemanticDiff`（废弃全量发送）；`bytes_saved_by_aoi` / `critical_avg_queue_latency_ms` / `total_bytes_saved_by_diff` 埋点；OoO 乱序越级执行（ActiveResourceTable + 五层防死锁）；`wait_for_condition` 零开销事件驱动 I/O 挂起；动态子图挂载 `mount_sub_dag`；ResponseSanitizer（剥离 <think>/</think> 推理噪声）；**异构计算调度**（意图感知模型路由 Planner→heavy / Executor→light + compute_class 算力分级 + 动态透明降级 + 时间维度优先级切换 + 模型名透明重写 + 复合路由键 `prefix_hash#compute_class` 联动 KV-Cache 隔离复用）；**权威指标评估体系**（Makespan 对比 / I/O-Compute Overlap Rate / Scheduling Latency 纳秒级 / Resource Utility CV 波动 / Consistency Check + AblationComparator）；**Facade X-Astro-\* 响应头**（OoO/Downgraded/Compute-Class/Model/Routing-Strategy/Time-Priority） |
+| **V8.0** | 2026-04-07 | V8.0 内核重写：OoO 后台主动扫描协程 + 资源正交性 R(v_k)∩R_active=∅ + 五层防死锁（超时自动释放）+ 时间维度挂起 asyncio.Future + 调度时延纳秒级埋点 + prefix_balancer 透明模型重写 + 时间维度优先级切换 + 权威指标体系（Makespan/I/O-Overlap/Latency/CV/Consistency）+ Facade X-Astro-\* 响应头 |
+| **V7.4** | 2026-04-04 | OoO 乱序越级执行（ActiveResourceTable + 三重准入门 + 五层防死锁）；`wait_for_condition` 零开销事件驱动 I/O 挂起（Pub/Sub + asyncio.Future）；动态子图挂载 `mount_sub_dag`（Kahn 拓扑实时重建）；`ooo_execution_count` / `io_compute_overlap_ms` 埋点（V8.0 重写为后台主动扫描 + 超时自动释放 + 纳秒级时延埋点） |
 | **V7.3** | 2026-04-04 | ResponseSanitizer（剥离 <think>/</think> 推理噪声）；强制 JSON 输出指令保护；`asyncio.get_running_loop().create_task()` 修复；流式 SSE chunk 净化；PromptTransformationPipeline RAG 确定性重排 + StaticMCP Schema 前缀锁 + SpeculativeWarmer 跨 Agent 预热；Task 0 强制 model 查表覆盖；`cross_agent_cache_hits` / `tool_schema_saved_tokens` 埋点 |
 | **V7.2** | 2026-04-04 | 分布式网关重构：移除单实例 `llm` 节点 → `gateway.backends[]` 多后端配置阵列；`config.yaml` 驱动 `init_distributed_gateway()`；移除 `create_llm()` LangChain 工厂；修复 `_check_instance` async lock 持有 bug |
 | **V7.1** | 2026-03 | 数据集评测 + LLM 算力埋点 + 物理模拟层 |

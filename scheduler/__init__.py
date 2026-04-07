@@ -13,5 +13,5 @@ AstroSASF Scheduler — 任务编排与协议控制内核
 所有模块均不含任何业务词汇，保持框架通用性。
 """
 
-__version__ = "7.5.0"
+__version__ = "8.0.0"
 __all__ = ["core", "models", "a2a_protocol", "virtual_bus", "telemetry"]
