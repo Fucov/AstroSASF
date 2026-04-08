@@ -358,7 +358,7 @@ class DAGOrchestrator:
 
     # V8.0: 超时参数
     _ooo_max_wait_ms: float = 2000.0
-    _ooo_scan_interval_ms: float = 100.0   # 后台扫描间隔
+    _ooo_scan_interval_ms: float = 10.0   # 后台扫描间隔（10ms，平衡灵敏度和开销）
 
     # V8.0: WorkerPool Slot 追踪
     _worker_slots: dict[int, str | None] = field(default_factory=dict, init=False)
@@ -582,6 +582,10 @@ class DAGOrchestrator:
         logger.info("╚" + "═" * 60 + "╝")
 
         await self._classify_and_enqueue_nodes(dag_graph)
+
+        # V8.0: DAG 提交后立即执行一次 OoO 扫描（趁 Worker 还在启动时抢占先机）
+        await self._ooo_lookahead_scan()
+
         return dag_graph.graph_id
 
     async def _classify_and_enqueue_nodes(self, dag_graph: DAGTaskGraph) -> None:
@@ -634,13 +638,95 @@ class DAGOrchestrator:
         completed_node: DAGNode,
         dag_graph: DAGTaskGraph,
     ) -> None:
-        """结算完成的节点，解除下游依赖。"""
+        """结算完成的节点，解除下游依赖并尝试越级发射。
+
+        V8.0 核心优化：
+        1. 尝试将满足条件的节点越级发射（放入 ReadyQueue 头部，带特殊标记）
+        2. OoO Scanner 会优先处理越级节点
+        """
         logger.info(
             "[DAG调度器] 结算节点 '%s' (状态: %s)",
             completed_node.node_id, completed_node.status.name,
         )
 
-        async with self._lock:
+        async with self._ooo_lock:
+            async with self._lock:
+                # 找出所有依赖已满足的阻塞节点
+                ready_candidates: list[DAGNode] = []
+                still_blocked: list[DAGNode] = []
+
+                for blocked_node in self._blocked_queue:
+                    if blocked_node.graph_id != dag_graph.graph_id:
+                        still_blocked.append(blocked_node)
+                        continue
+
+                    deps_satisfied = all(
+                        dag_graph.nodes[dep_id].status == NodeStatus.COMPLETED
+                        for dep_id in blocked_node.dependencies
+                        if dep_id in dag_graph.nodes
+                    )
+
+                    if deps_satisfied:
+                        ready_candidates.append(blocked_node)
+                    else:
+                        still_blocked.append(blocked_node)
+
+                self._blocked_queue = still_blocked
+
+                # 尝试越级发射（放入 ReadyQueue，带 OoO 标记）
+                for blocked_node in ready_candidates:
+                    can_promote, reason = await self._check_ooo_promotion(blocked_node, dag_graph)
+                    if not can_promote:
+                        blocked_node.status = NodeStatus.READY
+                        priority_score = blocked_node.get_ready_score()
+                        await self._ready_queue.put((priority_score, blocked_node))
+                        self._issue_times[blocked_node.node_id] = time.monotonic()
+                        continue
+
+                    required_resources = self._extract_required_resources(blocked_node)
+                    if not self._resource_table.check_orthogonality(set(required_resources)):
+                        blocked_node.status = NodeStatus.READY
+                        priority_score = blocked_node.get_ready_score()
+                        await self._ready_queue.put((priority_score, blocked_node))
+                        self._issue_times[blocked_node.node_id] = time.monotonic()
+                        continue
+
+                    # 越级发射成功！将节点放入 ReadyQueue
+                    blocked_node.status = NodeStatus.READY
+                    # 使用 (score, node) 元组，score 越小优先级越高
+                    # 越级节点使用负的 score，确保排在队列前面
+                    ooo_score = blocked_node.get_ready_score()
+                    await self._ready_queue.put((ooo_score, blocked_node))
+                    self._issue_times[blocked_node.node_id] = time.monotonic()
+
+                    self._ooo_execution_count += 1
+                    self._ooo_lookahead_triggered += 1
+                    self._ooo_promotion_events.append({
+                        "task_id": blocked_node.node_id,
+                        "reason": f"ooo_promotion: {reason}",
+                        "elapsed_since_submit_ms": (time.monotonic() - blocked_node.submit_time) * 1000,
+                        "timestamp": time.monotonic(),
+                    })
+                    logger.info(
+                        "[OoO-Promote] 越级发射成功: '%s' (skill=%s) → ReadyQueue | OoO累计: %d",
+                        blocked_node.node_id, blocked_node.skill_name, self._ooo_execution_count,
+                    )
+
+        await self._check_dag_completion(dag_graph)
+
+    async def _continue_ooo_chain(
+        self,
+        dag_graph: DAGTaskGraph,
+    ) -> None:
+        """V8.0: 继续 OoO 链式越级执行（循环而非递归）。
+
+        当一个节点通过 OoO-promotion 完成时，调用此方法继续处理其下游。
+        使用循环而非递归，避免死锁和栈溢出。
+        """
+        # 循环处理，直到没有节点可以越级执行
+        while True:
+            # 找出所有依赖已满足的阻塞节点
+            ready_candidates: list[DAGNode] = []
             still_blocked: list[DAGNode] = []
 
             for blocked_node in self._blocked_queue:
@@ -655,17 +741,100 @@ class DAGOrchestrator:
                 )
 
                 if deps_satisfied:
-                    await self._enqueue_ready_node(blocked_node)
-                    logger.info(
-                        "[DAG调度器] 依赖解除: '%s' → '%s' 已就绪",
-                        completed_node.node_id, blocked_node.node_id,
-                    )
+                    ready_candidates.append(blocked_node)
                 else:
                     still_blocked.append(blocked_node)
 
             self._blocked_queue = still_blocked
 
-        await self._check_dag_completion(dag_graph)
+            if not ready_candidates:
+                break  # 没有可越级执行的节点
+
+            # 尝试越级执行第一个符合条件的节点
+            promoted_any = False
+            for blocked_node in ready_candidates:
+                can_promote, reason = await self._check_ooo_promotion(blocked_node, dag_graph)
+                if not can_promote:
+                    blocked_node.status = NodeStatus.READY
+                    priority_score = blocked_node.get_ready_score()
+                    await self._ready_queue.put((priority_score, blocked_node))
+                    self._issue_times[blocked_node.node_id] = time.monotonic()
+                    continue
+
+                required_resources = self._extract_required_resources(blocked_node)
+                if not self._resource_table.check_orthogonality(set(required_resources)):
+                    blocked_node.status = NodeStatus.READY
+                    priority_score = blocked_node.get_ready_score()
+                    await self._ready_queue.put((priority_score, blocked_node))
+                    self._issue_times[blocked_node.node_id] = time.monotonic()
+                    continue
+
+                reservation_ok = True
+                for res in sorted(required_resources):
+                    if not await self._resource_table.acquire(res, blocked_node.node_id):
+                        reservation_ok = False
+                        await self._resource_table.release(blocked_node.node_id)
+                        break
+
+                if not reservation_ok:
+                    blocked_node.status = NodeStatus.READY
+                    priority_score = blocked_node.get_ready_score()
+                    await self._ready_queue.put((priority_score, blocked_node))
+                    self._issue_times[blocked_node.node_id] = time.monotonic()
+                    continue
+
+                lab = self._labs.get(blocked_node.lab_id)
+                if lab is None:
+                    await self._resource_table.release(blocked_node.node_id)
+                    blocked_node.status = NodeStatus.READY
+                    priority_score = blocked_node.get_ready_score()
+                    await self._ready_queue.put((priority_score, blocked_node))
+                    self._issue_times[blocked_node.node_id] = time.monotonic()
+                    continue
+
+                # 越级执行
+                blocked_node.mark_running()
+                self._running_nodes[blocked_node.node_id] = blocked_node
+
+                try:
+                    result = await lab.run_single_task(
+                        task_id=blocked_node.node_id,
+                        skill_name=blocked_node.skill_name,
+                        params=blocked_node.params,
+                        required_devices=self._extract_required_devices(blocked_node),
+                        task_priority=blocked_node.priority.value,
+                    )
+                    blocked_node.mark_completed(result)
+                except Exception:
+                    blocked_node.mark_failed("OoO执行异常")
+
+                self._running_nodes.pop(blocked_node.node_id, None)
+                self._completed_nodes.append(blocked_node)
+                await self._resource_table.release(blocked_node.node_id)
+
+                self._ooo_execution_count += 1
+                self._ooo_lookahead_triggered += 1
+                self._ooo_promotion_events.append({
+                    "task_id": blocked_node.node_id,
+                    "reason": f"ooo_promotion: {reason}",
+                    "elapsed_since_submit_ms": (time.monotonic() - blocked_node.submit_time) * 1000,
+                    "timestamp": time.monotonic(),
+                })
+                logger.info(
+                    "[OoO-Promote] 链式越级执行: '%s' (skill=%s) | OoO累计: %d",
+                    blocked_node.node_id, blocked_node.skill_name, self._ooo_execution_count,
+                )
+                promoted_any = True
+                break  # 每轮只越级执行一个，避免长时间阻塞
+
+            if not promoted_any:
+                # 没有节点被越级执行，将所有候选项入 ReadyQueue
+                for blocked_node in ready_candidates:
+                    blocked_node.status = NodeStatus.READY
+                    priority_score = blocked_node.get_ready_score()
+                    await self._ready_queue.put((priority_score, blocked_node))
+                    self._issue_times[blocked_node.node_id] = time.monotonic()
+                break
 
     async def _check_dag_completion(self, dag_graph: DAGTaskGraph) -> None:
         """检查 DAG 是否完全执行完毕。"""
@@ -738,23 +907,172 @@ class DAGOrchestrator:
 
         logger.info("[OoO-Scanner] 后台扫描协程已退出")
 
-    async def _ooo_lookahead_scan(self) -> int:
-        """V8.0 新增：主动扫描 BlockedQueue 执行越级提取。
+    async def _ooo_try_promote_one(self, already_locked: bool = False) -> int:
+        """V8.0 新增：尝试越级执行一个节点（绕过 ReadyQueue 直接执行）。
 
-        触发条件：ReadyQueue 为空 且 WorkerPool 有空闲槽位。
-        扫描逻辑：对 BlockedQueue 中每个节点执行五层防死锁检查。
+        与传统调度不同，OoO-promotion 的核心是"越级执行"：
+        - 传统调度：节点完成 → 依赖满足的节点入 ReadyQueue → Worker 从 ReadyQueue 取节点执行
+        - OoO-promotion：节点完成 → 立即尝试直接执行越级节点（不经过 ReadyQueue）
+
+        Args:
+            already_locked: 如果在持有 _ooo_lock 的上下文中调用，设为 True。
         """
-        async with self._lock:
-            running_now = len(self._running_nodes)
-
-        idle_slots = self.max_workers - running_now
-        if idle_slots <= 0:
-            return 0
-
         if not self._blocked_queue:
             return 0
 
+        dag_graph = self._active_graphs.get(next(iter(self._active_graphs), None))
+        if dag_graph is None:
+            return 0
+
+        async def do_promote_all() -> int:
+            promoted = 0
+            changed = True
+            while changed:
+                changed = False
+                blocked_snapshot = list(self._blocked_queue)
+
+                for node in blocked_snapshot:
+                    if node.graph_id != dag_graph.graph_id:
+                        continue
+                    if node.status != NodeStatus.PENDING:
+                        continue
+
+                    can_promote, reason = await self._check_ooo_promotion(node, dag_graph)
+                    if not can_promote:
+                        continue
+
+                    # 资源正交性检查
+                    required_resources = self._extract_required_resources(node)
+                    required_set = set(required_resources)
+                    if not self._resource_table.check_orthogonality(required_set):
+                        continue
+
+                    # 原子预约（按字母序）
+                    reservation_ok = True
+                    for res in sorted(required_resources):
+                        acquired = await self._resource_table.acquire(res, node.node_id)
+                        if not acquired:
+                            reservation_ok = False
+                            await self._resource_table.release(node.node_id)
+                            break
+
+                    if not reservation_ok:
+                        continue
+
+                    # 从 BlockedQueue 移除
+                    self._blocked_queue = [n for n in self._blocked_queue if n.node_id != node.node_id]
+
+                    # V8.0 OoO-promotion：绕过 ReadyQueue，直接执行节点！
+                    # 获取节点的 lab
+                    lab = self._labs.get(node.lab_id)
+                    if lab is not None:
+                        # 标记节点状态
+                        node.mark_running()
+                        self._running_nodes[node.node_id] = node
+
+                        # 直接执行（不经过 ReadyQueue）
+                        try:
+                            result = await lab.run_single_task(
+                                task_id=node.node_id,
+                                skill_name=node.skill_name,
+                                params=node.params,
+                                required_devices=self._extract_required_devices(node),
+                                task_priority=node.priority.value,
+                            )
+                            node.mark_completed(result)
+                        except Exception as exc:
+                            logger.exception("[OoO-Promote] 节点执行失败: %s", node.node_id)
+                            node.mark_failed(str(exc))
+
+                        # 清理并结算
+                        self._running_nodes.pop(node.node_id, None)
+                        self._completed_nodes.append(node)
+                        await self._resource_table.release(node.node_id)
+
+                        self._ooo_execution_count += 1
+                        self._ooo_lookahead_triggered += 1
+                        self._ooo_promotion_events.append({
+                            "task_id": node.node_id,
+                            "reason": f"ooo_promotion: {reason}",
+                            "elapsed_since_submit_ms": (time.monotonic() - node.submit_time) * 1000,
+                            "timestamp": time.monotonic(),
+                        })
+                        logger.info(
+                            "[OoO-Promote] 越级执行成功: '%s' (skill=%s) | OoO累计: %d",
+                            node.node_id, node.skill_name, self._ooo_execution_count,
+                        )
+                        promoted += 1
+                        changed = True
+                        break  # 每轮只越级执行一个
+
+                await asyncio.sleep(0)
+
+            return promoted
+
+        if already_locked:
+            return await do_promote_all()
+        else:
+            async with self._ooo_lock:
+                return await do_promote_all()
+
+    def _extract_required_devices(self, node: DAGNode) -> list[str]:
+        """从节点提取所需设备列表（用于直接执行）。"""
+        from benchmarks.bench_suite import BenchmarkSuite
+        # 复用 BenchmarkSuite 的设备提取逻辑
+        skill = node.skill_name.lower() if node.skill_name else ""
+        lab = node.lab_id.lower() if node.lab_id else ""
+
+        if "plant" in lab:
+            if "heater" in skill or "temperature" in skill:
+                return ["heater_plant"]
+            if "arm" in skill or "robotic" in skill:
+                return ["arm_plant"]
+            if "pump" in skill or "inject" in skill:
+                return ["pump_plant"]
+            if "vacuum" in skill:
+                return ["vacuum_mat"]
+        elif "material" in lab:
+            if "heater" in skill or "temperature" in skill:
+                return ["heater_mat"]
+            if "arm" in skill or "robotic" in skill:
+                return ["arm_mat"]
+            if "vacuum" in skill:
+                return ["vacuum_mat"]
+        elif "fluid" in lab:
+            if "pump" in skill or "inject" in skill:
+                return ["pump_fluid"]
+            if "valve" in skill:
+                return ["valve_fluid"]
+        elif "bio" in lab:
+            if "heater" in skill or "temperature" in skill:
+                return ["heater_bio"]
+            if "vacuum" in skill:
+                return ["vacuum_bio"]
+            if "arm" in skill or "robotic" in skill:
+                return ["arm_bio"]
+            if "centrifuge" in skill:
+                return ["centrifuge_bio"]
+            if "sensor" in skill or "scan" in skill:
+                return ["scan_bio"]
+        return ["co2_controller"]
+
+    async def _ooo_lookahead_scan(self) -> int:
+        """V8.0 新增：主动扫描 BlockedQueue 执行越级提取。
+
+        触发条件：BlockedQueue 非空 时执行扫描。
+        扫描逻辑：对 BlockedQueue 中每个节点执行五层防死锁检查。
+
+        优化策略：
+        - 使用 asyncio.sleep(0) 让出控制权，避免阻塞事件循环
+        - 每次扫描最多推进 1 个节点（防止资源碎片化）
+        """
         async with self._ooo_lock:
+            if not self._blocked_queue:
+                return 0
+
+            # 使用 asyncio.sleep(0) 让出控制权，让其他协程（如节点完成事件）有机会执行
+            await asyncio.sleep(0)
+
             promoted = 0
             blocked_snapshot = list(self._blocked_queue)
 
@@ -821,9 +1139,9 @@ class DAGOrchestrator:
 
                 logger.info(
                     "[OoO-Scan] 越级推进成功: 节点 '%s' (skill=%s, reason=%s) "
-                    "→ ReadyQueue | OoO累计: %d | 空闲Slot: %d",
+                    "→ ReadyQueue | OoO累计: %d",
                     node.node_id, node.skill_name, reason,
-                    self._ooo_execution_count, idle_slots,
+                    self._ooo_execution_count,
                 )
 
                 # 每轮最多越级 1 个节点（防止一次推进太多导致资源碎片化）
@@ -867,14 +1185,79 @@ class DAGOrchestrator:
         return True, "OK"
 
     def _extract_required_resources(self, node: DAGNode) -> list[str]:
-        """从节点参数中提取所需的硬件资源列表。"""
+        """从节点提取所需的硬件资源列表（使用实际设备名，而非 skill 前缀）。
+
+        与 bench_suite.py._extract_devices() 保持一致的逻辑。
+        资源是实际设备ID（如 heater_bio），用于 ActiveResourceTable 正交性检查。
+        """
         resources: list[str] = []
-        if node.skill_name:
-            parts = node.skill_name.lower().split("_")
-            if parts:
-                resources.append(parts[0])
+        skill = node.skill_name.lower() if node.skill_name else ""
+        lab = node.lab_id.lower() if node.lab_id else ""
+
+        # 优先按舱类型判断，再按 skill 判断（与 bench_suite._extract_devices 一致）
+        if "plant" in lab:
+            if "heater" in skill or "temperature" in skill:
+                resources.append("heater_plant")
+            elif "arm" in skill or "robotic" in skill:
+                resources.append("arm_plant")
+            elif "pump" in skill or "inject" in skill:
+                resources.append("pump_plant")
+            elif "vacuum" in skill:
+                resources.append("vacuum_mat")
+            else:
+                resources.append("co2_controller")
+        elif "material" in lab:
+            if "heater" in skill or "temperature" in skill:
+                resources.append("heater_mat")
+            elif "arm" in skill or "robotic" in skill:
+                resources.append("arm_mat")
+            elif "vacuum" in skill:
+                resources.append("vacuum_mat")
+            else:
+                resources.append("co2_controller")
+        elif "fluid" in lab:
+            if "pump" in skill or "inject" in skill:
+                resources.append("pump_fluid")
+            elif "valve" in skill:
+                resources.append("valve_fluid")
+            else:
+                resources.append("co2_controller")
+        elif "bio" in lab:
+            if "heater" in skill or "temperature" in skill:
+                resources.append("heater_bio")
+            elif "vacuum" in skill:
+                resources.append("vacuum_bio")
+            elif "arm" in skill or "robotic" in skill:
+                resources.append("arm_bio")
+            elif "centrifuge" in skill:
+                resources.append("centrifuge_bio")
+            elif "sensor" in skill or "scan" in skill:
+                resources.append("scan_bio")
+            else:
+                resources.append("co2_controller")
+        else:
+            # 回退：按 skill 关键词判断（不区分舱）
+            if "heater" in skill or "temperature" in skill:
+                resources.append("heater_bio")
+            elif "vacuum" in skill:
+                resources.append("vacuum_bio")
+            elif "arm" in skill or "robotic" in skill:
+                resources.append("arm_bio")
+            elif "pump" in skill or "inject" in skill:
+                resources.append("pump_plant")
+            elif "valve" in skill:
+                resources.append("valve_fluid")
+            elif "centrifuge" in skill:
+                resources.append("centrifuge_bio")
+            elif "sensor" in skill or "scan" in skill:
+                resources.append("scan_bio")
+            else:
+                resources.append("co2_controller")
+
+        # 添加舱资源（用于舱级别的隔离）
         if node.lab_id:
             resources.append(f"lab:{node.lab_id}")
+
         return resources
 
     async def _check_interlock(self, node: DAGNode) -> bool:

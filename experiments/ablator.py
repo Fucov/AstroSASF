@@ -94,6 +94,12 @@ SPATIAL_ABLATIONS = [
     ),
 ]
 
+FULL_BASELINE = AblationDim(
+    name="full_proposed",
+    description="完整算法基准（不做任何消融）",
+    removes=[],
+)
+
 FULL_ABLATION = AblationDim(
     name="full_ablated",
     description="去掉全部空间+时间维度机制",
@@ -121,6 +127,7 @@ class AblatorConfig:
     output_dir: Path = field(default_factory=lambda: Path("results/ablation"))
     use_dated_dir: bool = True  # 是否使用日期后缀区分实验
     physical_delay_scale: float = 0.01  # 物理延迟缩放因子（0.0-1.0，越小越快）
+    include_baseline: bool = True  # 是否同步跑完整原算法作为基准对照
 
 
 # ────────────────────────────────────────────────────────────────────────────── #
@@ -138,6 +145,7 @@ class Ablator:
         """运行完整消融实验。"""
         episodes = self.config.base_episodes
         experiments = self.config.ablation_experiments
+        include_baseline = self.config.include_baseline
 
         # 构建带日期的输出目录
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -164,11 +172,57 @@ class Ablator:
         print(f"\n{'='*70}")
         print(f"  AstroSASF 消融实验")
         print(f"  Episodes: {len(episodes)}")
-        print(f"  Experiments: {len(experiments)}")
+        print(f"  Ablation 实验: {len(experiments)}")
+        print(f"  包含基准对照: {'是' if include_baseline else '否'}")
         print(f"  输出目录: {output_dir}")
         print(f"  日志文件: {log_file}")
         print(f"{'='*70}\n")
 
+        # ── 第一步：跑完整原算法基准（仅当 include_baseline=True）─────────────────
+        baseline_results: list[dict[str, Any]] = []
+        if include_baseline:
+            print(f"\n{'─'*70}")
+            print(f"  ▶ Baseline: full_proposed (完整原算法，不做任何消融)")
+            print(f"{'─'*70}")
+
+            baseline_suite = _build_ablated_suite(
+                AblationExperiment(
+                    name="full_proposed",
+                    description="完整算法基准",
+                    ablated_dims=[],
+                ),
+                seed=self.config.seed,
+                physical_delay_scale=self.config.physical_delay_scale,
+            )
+
+            for ep in episodes:
+                print(f"  [Baseline] {ep.episode_id}")
+                result = await baseline_suite.run_episode(ep)
+                row = {
+                    "ablation": "full_proposed",
+                    "ablated_dims": "",
+                    "episode_id": ep.episode_id,
+                    "scenario_type": ep.scenario_type.value,
+                    "difficulty": ep.difficulty.value,
+                    "success": result.success,
+                    "makespan_s": result.metrics.get("makespan_s", 0),
+                    "success_rate": result.metrics.get("success_rate", 0),
+                    "overlap_ratio": result.metrics.get("overlap_ratio", 0),
+                    "conflict_stall_time_ms": result.metrics.get("conflict_stall_time_ms", 0),
+                    "ooo_promotion_count": result.metrics.get("ooo_promotion_count", 0),
+                    "cpu_busy_ratio": result.metrics.get("cpu_busy_ratio", 0),
+                    "avg_task_wait_time_ms": result.metrics.get("avg_task_wait_time_ms", 0),
+                    "alarm_response_latency_ms": result.metrics.get("alarm_response_latency_ms", 0),
+                    "safety_rejection_rate": result.metrics.get("safety_rejection_rate", 0),
+                    "jains_fairness": result.metrics.get("jains_fairness", 0),
+                    "error": result.error or "",
+                }
+                baseline_results.append(row)
+                self._append_csv_row(output_dir / "ablation_results.csv", row)
+
+            print(f"\n  ✅ Baseline 完成 ({len(episodes)} 条)")
+
+        # ── 第二步：跑各消融实验 ───────────────────────────────────────────────
         total_runs = len(experiments) * len(episodes)
         run_idx = 0
 
@@ -208,6 +262,9 @@ class Ablator:
                 }
                 self._results.append(row)
                 self._append_csv_row(output_dir / "ablation_results.csv", row)
+
+        # 合并基准结果到 _results（用于汇总计算）
+        self._results.extend(baseline_results)
 
         summary = self._compute_summary()
         self._save_summary(output_dir / "ablation_summary.json", summary)
