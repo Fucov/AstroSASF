@@ -92,14 +92,19 @@ class BenchmarkLabContext:
 
     async def run_single_task(
         self,
-        task_description: str,
-        skill_name: str,
-        params: dict[str, Any],
-        required_devices: list[str],
+        task_id: str | None = None,
+        skill_name: str = "",
+        params: dict[str, Any] | None = None,
+        required_devices: list[str] | None = None,
         task_priority: int = 2,
     ) -> dict[str, Any]:
-        """执行单个任务（含 metrics 埋点和 chaos 注入）。"""
-        task_id = self._next_task_id()
+        """执行单个任务（含 metrics 埋点和 chaos 注入）。
+
+        签名与 scheduler.core.DAGOrchestrator._execute_node() 保持一致。
+        """
+        task_id = task_id or self._next_task_id()
+        params = params or {}
+        required_devices = required_devices or []
         self.metrics.record_task_submit(task_id, self.lab_id, skill_name, task_priority)
         self.metrics.record_task_start(task_id)
 
@@ -414,7 +419,7 @@ class BenchmarkSuite:
 
             node.mark_running()
             await lab.run_single_task(
-                task_description=node.description,
+                task_id=node.node_id,
                 skill_name=node.skill_name,
                 params=node.params,
                 required_devices=self._extract_devices(node),
@@ -437,7 +442,7 @@ class BenchmarkSuite:
             lab = labs.get(node.lab_id, list(labs.values())[0])
             node.mark_running()
             await lab.run_single_task(
-                task_description=node.description,
+                task_id=node.node_id,
                 skill_name=node.skill_name,
                 params=node.params,
                 required_devices=self._extract_devices(node),
@@ -489,7 +494,7 @@ class BenchmarkSuite:
             # 通过 DeviceRuntime 执行（含锁获取/释放）
             devices = self._extract_devices(node)
             await lab.run_single_task(
-                task_description=node.description,
+                task_id=node.node_id,
                 skill_name=node.skill_name,
                 params=node.params,
                 required_devices=devices,
@@ -538,8 +543,7 @@ class BenchmarkSuite:
             await orchestrator.shutdown()
 
         # 同步 OoO 指标
-        metrics._ooo_promotions.extend(orchestrator._ooo_promotions or [])
-        for prom in metrics._ooo_promotions:
+        for prom in (orchestrator._ooo_promotion_events or []):
             metrics.record_ooo_promotion(
                 prom.get("task_id", ""),
                 prom.get("reason", "unknown"),

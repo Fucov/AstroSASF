@@ -92,9 +92,9 @@ class ActiveResourceTable:
     ) -> None:
         self._locks: dict[str, ResourceLock] = {}
         self._node_resources: dict[str, set[str]] = {}
-        self._lock_obj: asyncio.Lock = field(default_factory=asyncio.Lock)
+        self._lock_obj: asyncio.Lock = asyncio.Lock()
         self._lock_timeout: float = lock_timeout_seconds
-        self._gc_task: asyncio.Task | None = field(default=None, init=False)
+        self._gc_task: asyncio.Task | None = None
         self._running: bool = False
 
     async def start(self) -> None:
@@ -344,6 +344,7 @@ class DAGOrchestrator:
     _ooo_scanner_task: asyncio.Task | None = field(default=None, init=False)
     _ooo_lookahead_triggered: int = field(default=0, init=False)
     _ooo_execution_count: int = field(default=0, init=False)
+    _ooo_promotion_events: list[dict[str, Any]] = field(default_factory=list, init=False)
     _io_compute_overlap_ms: float = field(default=0.0, init=False)
     _active_io_windows: dict[str, float] = field(default_factory=dict, init=False)
 
@@ -800,6 +801,12 @@ class DAGOrchestrator:
 
                 self._ooo_execution_count += 1
                 self._ooo_lookahead_triggered += 1
+                self._ooo_promotion_events.append({
+                    "task_id": node.node_id,
+                    "reason": reason,
+                    "elapsed_since_submit_ms": (time.monotonic() - node.submit_time) * 1000,
+                    "timestamp": time.monotonic(),
+                })
                 promoted += 1
 
                 logger.info(
@@ -1112,6 +1119,11 @@ class DAGOrchestrator:
                     # V8.0: 不再主动触发 OoO（由后台 Scanner 接管）
                     continue
 
+                # 安全检查：过滤空节点（可能被 rebalance 队列放入的占位 None）
+                if node is None:
+                    self._ready_queue.task_done()
+                    continue
+
                 # V8.0: 记录调度时延
                 self.record_scheduling_latency(node.node_id)
 
@@ -1217,9 +1229,31 @@ class DAGOrchestrator:
             return
 
         try:
+            # 提取节点所需的设备（与 bench_suite._extract_devices 保持一致）
+            skill_lower = node.skill_name.lower()
+            if "heater" in skill_lower or "temperature" in skill_lower:
+                devices = ["heater_bio"] if "bio" in node.lab_id.lower() else ["heater_mat"]
+            elif "vacuum" in skill_lower:
+                devices = ["vacuum_bio"] if "bio" in node.lab_id.lower() else ["vacuum_mat"]
+            elif "arm" in skill_lower or "robotic" in skill_lower:
+                devices = ["arm_bio"] if "bio" in node.lab_id.lower() else (["arm_mat"] if "mat" in node.lab_id.lower() else ["arm_plant"])
+            elif "pump" in skill_lower or "inject" in skill_lower:
+                devices = ["pump_fluid"] if "fluid" in node.lab_id.lower() else ["pump_plant"]
+            elif "valve" in skill_lower:
+                devices = ["valve_fluid"]
+            elif "centrifuge" in skill_lower:
+                devices = ["centrifuge_bio"]
+            elif "sensor" in skill_lower or "scan" in skill_lower:
+                devices = ["scan_bio"]
+            else:
+                devices = ["co2_controller"]
+
             result = await env.run_single_task(
-                task_description=f"[{node.node_id}] {node.skill_name}",
-                suspend_event=None,
+                task_id=node.node_id,
+                skill_name=node.skill_name,
+                params=node.params,
+                required_devices=devices,
+                task_priority=node.priority.value,
             )
             node.mark_completed(result)
             async with self._lock:
