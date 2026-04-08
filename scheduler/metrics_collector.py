@@ -295,10 +295,10 @@ class MetricsCollector:
             overlap_ratio = 0.0
 
         # ── Metric 8: Conflict Stall Time ────────────────────────────────────────
+        # 使用实际的锁竞争等待时间（不包含设备执行时间）
         conflict_stall_ms = sum(
-            r.total_latency_ms
+            r.latency_components.get("contention_wait_ms", 0)
             for r in self._device_results
-            if r.wait_reason == "device_busy"
         )
 
         # ── Metric 9: Resume Latency ─────────────────────────────────────────────

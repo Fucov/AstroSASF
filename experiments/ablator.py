@@ -354,14 +354,38 @@ async def run_temporal_ablation(
     use_dated_dir: bool = True,
     physical_delay_scale: float = 0.01,
 ) -> dict[str, Any]:
-    """运行时间维度消融实验。"""
+    """运行时间维度消融实验。
+    
+    采样策略：从所有场景类型均匀采样，确保覆盖冲突和告警恢复场景。
+    """
     gen = BenchmarkGenerator(seed=42)
     all_eps = gen.generate_full_suite()
 
-    filtered = [
-        ep for ep in all_eps
-        if tiers is None or ep.scenario_type.value in tiers
-    ][:10]  # 最多 10 条
+    # 按场景类型分组
+    from collections import defaultdict
+    by_scenario: dict[str, list] = defaultdict(list)
+    for ep in all_eps:
+        by_scenario[ep.scenario_type.value].append(ep)
+
+    # 从所有场景类型均匀采样（确保包含冲突场景）
+    filtered: list = []
+    if tiers is None:
+        target_tiers = list(by_scenario.keys())
+    else:
+        target_tiers = tiers
+
+    for tier in target_tiers:
+        tier_eps = by_scenario.get(tier, [])
+        if not tier_eps:
+            continue
+        # 每个场景类型取 2-3 条
+        filtered.extend(tier_eps[:3])
+    
+    # 打印采样信息
+    scenario_counts = defaultdict(int)
+    for ep in filtered:
+        scenario_counts[ep.scenario_type.value] += 1
+    print(f"[采样信息] 共 {len(filtered)} 条: {dict(scenario_counts)}")
 
     experiments = [
         AblationExperiment(
@@ -391,14 +415,38 @@ async def run_spatial_ablation(
     use_dated_dir: bool = True,
     physical_delay_scale: float = 0.01,
 ) -> dict[str, Any]:
-    """运行空间维度消融实验。"""
+    """运行空间维度消融实验。
+    
+    采样策略：从所有场景类型均匀采样，确保覆盖冲突和告警恢复场景。
+    """
     gen = BenchmarkGenerator(seed=42)
     all_eps = gen.generate_full_suite()
 
-    filtered = [
-        ep for ep in all_eps
-        if tiers is None or ep.scenario_type.value in tiers
-    ][:10]
+    # 按场景类型分组
+    from collections import defaultdict
+    by_scenario: dict[str, list] = defaultdict(list)
+    for ep in all_eps:
+        by_scenario[ep.scenario_type.value].append(ep)
+
+    # 从所有场景类型均匀采样（确保包含冲突场景）
+    filtered: list = []
+    if tiers is None:
+        target_tiers = list(by_scenario.keys())
+    else:
+        target_tiers = tiers
+
+    for tier in target_tiers:
+        tier_eps = by_scenario.get(tier, [])
+        if not tier_eps:
+            continue
+        # 每个场景类型取 2-3 条
+        filtered.extend(tier_eps[:3])
+    
+    # 打印采样信息
+    scenario_counts = defaultdict(int)
+    for ep in filtered:
+        scenario_counts[ep.scenario_type.value] += 1
+    print(f"[采样信息] 共 {len(filtered)} 条: {dict(scenario_counts)}")
 
     experiments = [
         AblationExperiment(

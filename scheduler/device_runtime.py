@@ -228,21 +228,29 @@ class DeviceLockManager:
         device_id: str,
         task_id: str,
         timeout: float = 30.0,
-    ) -> bool:
-        """轮询等待设备锁释放（被 asyncio.sleep 打断时立即返回 False）。"""
+    ) -> tuple[bool, float]:
+        """轮询等待设备锁释放（被 asyncio.sleep 打断时立即返回 False）。
+
+        Returns
+        -------
+        tuple[bool, float]
+            (success, waited_ms) — 成功获取锁时返回等待时长（毫秒）
+        """
         wait_start = time.monotonic()
         total_wait = 0.0
         while True:
             async with self._lock:
                 if device_id not in self._locks:
-                    return True
+                    waited_ms = total_wait * 1000.0
+                    self._total_contention_wait_ms += waited_ms
+                    return True, waited_ms
             elapsed = time.monotonic() - wait_start
             if elapsed >= timeout:
-                return False
+                waited_ms = total_wait * 1000.0
+                return False, waited_ms
             sleep_t = min(0.05, timeout - elapsed)
             await asyncio.sleep(sleep_t)
             total_wait += sleep_t
-        return False
 
     def release(self, device_id: str, task_id: str) -> None:
         """释放设备锁（仅当持有者匹配时）。"""
@@ -409,10 +417,11 @@ class DeviceRuntime:
             task_id=task_id,
             lab_id=lab_id,
         )
+        contention_wait_ms = 0.0
         if not acquired:
             lock_owner = self._lock_mgr.get_lock_owner(device_id)
             wait_reason = "device_busy"
-            got_lock = await self._lock_mgr.wait_for_unlock(device_id, task_id)
+            got_lock, contention_wait_ms = await self._lock_mgr.wait_for_unlock(device_id, task_id)
             if not got_lock:
                 return DeviceResult(
                     device_id=device_id,
@@ -482,6 +491,7 @@ class DeviceRuntime:
             latency_components["chaos_delay_ms"] = (
                 (chaos_mult - 1.0) * base_ms if chaos_injected else 0.0
             )
+            latency_components["contention_wait_ms"] = contention_wait_ms  # 锁竞争等待时间
             scaled_ms = actual_ms * self._physical_delay_scale
             latency_components["total_physical_ms"] = actual_ms  # 原始物理时间（metrics 用）
             latency_components["scaled_physical_ms"] = scaled_ms  # 实际等待时间

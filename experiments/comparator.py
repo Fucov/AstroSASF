@@ -284,7 +284,13 @@ async def run_comparison(
     use_dated_dir: bool = True,
     physical_delay_scale: float = 0.01,
 ) -> dict[str, Any]:
-    """快速运行对比实验的便捷入口。"""
+    """快速运行对比实验的便捷入口。
+    
+    采样策略：
+    - tiers=None: 从所有场景类型均匀采样（每个场景类型 episodes_per_baseline 条）
+    - tiers=['xxx']': 从指定场景类型均匀采样
+    - difficulty 指定时：只从指定难度采样
+    """
     if baselines is None:
         baselines = [m for _, m in Comparator.ALL_BASELINES]
 
@@ -292,20 +298,59 @@ async def run_comparison(
     gen = BenchmarkGenerator(seed=42)
     all_eps = gen.generate_full_suite()
 
-    # 过滤
-    filtered = []
+    # 按场景类型分组
+    from collections import defaultdict
+    by_scenario: dict[str, list] = defaultdict(list)
     for ep in all_eps:
-        if tiers and ep.scenario_type.value not in tiers:
+        by_scenario[ep.scenario_type.value].append(ep)
+
+    # 过滤：根据场景类型和难度分组采样
+    filtered: list = []
+    
+    if tiers is None:
+        # 默认：从所有场景类型均匀采样
+        target_tiers = list(by_scenario.keys())
+    else:
+        target_tiers = tiers
+
+    for tier in target_tiers:
+        tier_eps = by_scenario.get(tier, [])
+        if not tier_eps:
             continue
-        if difficulty and ep.difficulty.value != difficulty:
-            continue
-        filtered.append(ep)
-        if len(filtered) >= episodes_per_baseline * len(tiers or ["all"]):
-            break
+        
+        # 按难度分组
+        by_difficulty: dict[str, list] = defaultdict(list)
+        for ep in tier_eps:
+            by_difficulty[ep.difficulty.value].append(ep)
+        
+        if difficulty:
+            # 只取指定难度
+            selected = by_difficulty.get(difficulty, [])
+        else:
+            # 均匀从各难度采样
+            selected = []
+            diffs = list(by_difficulty.keys())
+            per_diff = max(1, episodes_per_baseline // len(diffs))
+            for diff_eps in by_difficulty.values():
+                # 打乱顺序保证随机性
+                import random
+                random.seed(42)
+                shuffled = diff_eps.copy()
+                random.shuffle(shuffled)
+                selected.extend(shuffled[:per_diff])
+        
+        # 限制数量
+        filtered.extend(selected[:episodes_per_baseline])
+    
+    # 打印采样信息
+    scenario_counts = defaultdict(int)
+    for ep in filtered:
+        scenario_counts[ep.scenario_type.value] += 1
+    print(f"[采样信息] 共 {len(filtered)} 条: {dict(scenario_counts)}")
 
     config = ExperimentConfig(
         baselines=baselines,
-        episodes=filtered[:episodes_per_baseline],
+        episodes=filtered,
         seed=42,
         repeat=1,
         output_dir=Path(output_dir),
