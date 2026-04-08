@@ -40,6 +40,8 @@ import yaml
 
 if TYPE_CHECKING:
     from infra.llm.config_loader import SASFConfig
+    from scheduler.device_runtime import DeviceRuntime
+    from scheduler.metrics_collector import MetricsCollector
 
 from labs.interlock_engine import InterlockEngine, InterlockRule
 from labs.mcp_registry import MCPToolRegistry
@@ -92,19 +94,26 @@ class LabDescriptor:
 
 @dataclass
 class LabContext:
-    """内核级实验舱运行时上下文 (V7.2)。
+    """内核级实验舱运行时上下文 (V8.0)。
 
     仅包含调度/内核组件：
-    - registry : MCPToolRegistry — 工具注册（含 Guard 校验）
-    - engine   : InterlockEngine  — 正交联锁引擎
-    - bus      : TelemetryBus     — 遥测数据总线
-
-    认知层（LangGraph、SkillCatalog）由 Interface 层按需注入。
+    - registry      : MCPToolRegistry    — 工具注册（含 Guard 校验）
+    - engine        : InterlockEngine     — 正交联锁引擎
+    - bus           : TelemetryBus        — 遥测数据总线
+    - device_runtime: DeviceRuntime | None — 物理设备统一调用层（V8.0 新增）
+    - metrics       : MetricsCollector | None — 指标采集器（V8.0 新增）
     """
     descriptor: LabDescriptor
     registry: MCPToolRegistry
     engine: InterlockEngine
     bus: TelemetryBus
+    device_runtime: "DeviceRuntime | None" = None
+    metrics: "MetricsCollector | None" = None
+    lab_id: str | None = None  # 别名，等价于 descriptor.lab_id
+
+    def __post_init__(self) -> None:
+        if self.lab_id is None:
+            object.__setattr__(self, "lab_id", self.descriptor.lab_id)
 
 
 # --------------------------------------------------------------------------- #
@@ -225,6 +234,8 @@ class LabLoader:
         self,
         descriptor: LabDescriptor,
         shared_tools_module: Any = None,
+        device_runtime: Any = None,
+        metrics: Any = None,
     ) -> LabContext:
         """加载单个实验舱内核组件。
 
@@ -234,6 +245,10 @@ class LabLoader:
             实验舱描述符
         shared_tools_module : module, optional
             共享工具模块
+        device_runtime : DeviceRuntime, optional
+            物理设备统一调用层（V8.0，用于 benchmark 场景）
+        metrics : MetricsCollector, optional
+            指标采集器（V8.0，用于 benchmark 场景）
 
         Returns
         -------
@@ -314,6 +329,8 @@ class LabLoader:
             registry=registry,
             engine=engine,
             bus=bus,
+            device_runtime=device_runtime,
+            metrics=metrics,
         )
 
     def _import_tools_module(self, tools_path: Path) -> Any | None:
@@ -360,8 +377,17 @@ class LabLoader:
 
     async def discover_and_load(
         self,
+        device_runtime: Any = None,
+        metrics: Any = None,
     ) -> dict[str, LabContext]:
         """发现并加载所有实验舱。
+
+        Parameters
+        ----------
+        device_runtime : DeviceRuntime, optional
+            物理设备统一调用层（V8.0，用于 benchmark）
+        metrics : MetricsCollector, optional
+            指标采集器（V8.0，用于 benchmark）
 
         Returns
         -------
@@ -384,7 +410,12 @@ class LabLoader:
         self._loaded_labs.clear()
         for lab_id, descriptor in self._discovered_labs.items():
             try:
-                ctx = await self.load_lab(descriptor, shared_tools_module)
+                ctx = await self.load_lab(
+                    descriptor,
+                    shared_tools_module,
+                    device_runtime=device_runtime,
+                    metrics=metrics,
+                )
                 self._loaded_labs[lab_id] = ctx
             except Exception as exc:
                 logger.error("[LabLoader] 加载实验舱 '%s' 失败: %s", lab_id, exc)

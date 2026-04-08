@@ -221,7 +221,13 @@ class APIFacade:
             )
 
         from labs.mcp_registry import MCPToolContext
-        mcp_ctx = MCPToolContext(engine=ctx.engine, bus=ctx.bus, lab_id=lab_id)
+        mcp_ctx = MCPToolContext(
+            engine=ctx.engine,
+            bus=ctx.bus,
+            lab_id=lab_id,
+            device_runtime=getattr(ctx, "device_runtime", None),
+            metrics=getattr(ctx, "metrics", None),
+        )
 
         # 联锁预检查
         try:

@@ -45,6 +45,8 @@ class SpaceMCPGateway:
     codec: Any
     space_wire: Any
     a2a_router: A2ARouter
+    device_runtime: Any = None  # V8.0: 物理设备统一调用层
+    metrics: Any = None  # V8.0: 指标采集器
 
     def list_tools(self) -> list[dict[str, Any]]:
         return self.registry.list_tools()
@@ -98,7 +100,13 @@ class SpaceMCPGateway:
         # ── Phase 2: 联锁检查 + 执行 ── #
         from labs.interlock_engine import SecurityGuardrailException
         from labs.mcp_registry import MCPToolContext
-        context = MCPToolContext(engine=self.engine, bus=self.bus, lab_id=self.lab_id)
+        context = MCPToolContext(
+            engine=self.engine,
+            bus=self.bus,
+            lab_id=self.lab_id,
+            device_runtime=self.device_runtime,
+            metrics=self.metrics,
+        )
 
         try:
             telemetry = await self.bus.snapshot()

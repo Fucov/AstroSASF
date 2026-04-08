@@ -29,12 +29,29 @@ def _type_to_json_schema(py_type: type) -> str:
 
 
 class MCPToolContext:
-    """MCP Tool 执行上下文。"""
+    """MCP Tool 执行上下文（含 DeviceRuntime 支持）。
 
-    def __init__(self, engine: Any, bus: Any, lab_id: str) -> None:
+    V8.0 新增字段：
+    - device_runtime : DeviceRuntime | None  — 物理设备统一调用层
+    - current_task_id : str | None          — 当前执行任务的 ID（用于 metrics）
+    - metrics        : MetricsCollector | None — 指标采集器（可选）
+    """
+
+    def __init__(
+        self,
+        engine: Any,
+        bus: Any,
+        lab_id: str,
+        device_runtime: Any = None,
+        current_task_id: str | None = None,
+        metrics: Any = None,
+    ) -> None:
         self.engine = engine
         self.bus = bus
         self.lab_id = lab_id
+        self.device_runtime = device_runtime
+        self.current_task_id = current_task_id
+        self.metrics = metrics
 
     @property
     def fsm(self) -> Any:

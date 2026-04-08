@@ -1,25 +1,18 @@
-"""
-Benchmarks · 基准测试与指标评估体系 (V8.0)
-"""
-
-from benchmarks.metrics_collector import (
-    MetricsCollector,
-    MakespanMetrics,
-    IOComputeOverlapMetrics,
-    SchedulingLatencyMetrics,
-    ResourceUtilityMetrics,
-    ConsistencyCheckResult,
-    FullMetricsReport,
-    AblationComparator,
+"""AstroSASF Benchmarks."""
+from benchmarks.bench_generator import (
+    BenchmarkGenerator,
+    BenchmarkEpisode,
+    TaskNodeDef,
+    TaskGraphDef,
+    DeviceReqDef,
+    ChaosEventDef,
+    DifficultyLevel,
+    ScenarioType,
+    BENCHMARK_DEVICE_POOL,
 )
-
-__all__ = [
-    "MetricsCollector",
-    "MakespanMetrics",
-    "IOComputeOverlapMetrics",
-    "SchedulingLatencyMetrics",
-    "ResourceUtilityMetrics",
-    "ConsistencyCheckResult",
-    "FullMetricsReport",
-    "AblationComparator",
-]
+from benchmarks.bench_suite import (
+    BenchmarkSuite,
+    BenchmarkResult,
+    BenchmarkLabContext,
+    SchedulerMode,
+)
