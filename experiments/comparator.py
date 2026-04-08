@@ -21,10 +21,29 @@ import asyncio
 import csv
 import json
 import logging
+import os
 import sys
 import time
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
+
+
+class TeeWriter:
+    """同时输出到 stdout 和日志文件的 writer（用于 print 重定向）。"""
+    def __init__(self, stdout, log_path: Path):
+        self.stdout = stdout
+        self.log_path = log_path
+
+    def write(self, text):
+        self.stdout.write(text)
+        self.stdout.flush()
+        with open(self.log_path, "a", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+
+    def flush(self):
+        self.stdout.flush()
 
 # ── 动态项目根路径（支持 uv run / 直接 python / 任意 cwd）──
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -49,6 +68,8 @@ class ExperimentConfig:
     seed: int = 42
     repeat: int = 1  # 每组重复次数（用于抖动分析）
     output_dir: Path = field(default_factory=lambda: Path("results"))
+    use_dated_dir: bool = True  # 是否使用日期后缀区分实验
+    physical_delay_scale: float = 1.0  # 物理延迟缩放因子（0.0-1.0，越小越快）
 
 
 # ────────────────────────────────────────────────────────────────────────────── #
@@ -76,13 +97,43 @@ class Comparator:
         baselines = self.config.baselines
         episodes = self.config.episodes
         repeats = self.config.repeat
-        output_dir = self.config.output_dir
+
+        # 确保 output_dir 是 Path 对象
+        base_dir = Path(self.config.output_dir) if isinstance(self.config.output_dir, str) else self.config.output_dir
+
+        # 构建带日期的输出目录
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        if self.config.use_dated_dir:
+            output_dir = base_dir / f"comparison_{timestamp}"
+        else:
+            output_dir = base_dir
+
+        # 创建输出目录
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        # 设置日志重定向到文件（同时捕获 root logger 的所有日志）
+        log_file = output_dir / f"experiment_{timestamp}.log"
+        file_handler = logging.FileHandler(log_file, encoding="utf-8")
+        file_handler.setLevel(logging.DEBUG)
+        file_handler.setFormatter(logging.Formatter(
+            "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+            datefmt="%H:%M:%S"
+        ))
+        # 同时将 print 输出重定向到日志文件
+        original_stdout = sys.stdout
+        sys.stdout = TeeWriter(original_stdout, log_file)
+        
+        root_logger = logging.getLogger()
+        root_logger.setLevel(logging.DEBUG)
+        root_logger.addHandler(file_handler)
 
         print(f"\n{'='*70}")
         print(f"  AstroSASF 对比实验")
         print(f"  Baselines: {[b.value for b in baselines]}")
         print(f"  Episodes:  {len(episodes)}")
         print(f"  Repeats:   {repeats}")
+        print(f"  输出目录:   {output_dir}")
+        print(f"  日志文件:   {log_file}")
         print(f"{'='*70}\n")
 
         total_runs = len(baselines) * len(episodes) * repeats
@@ -98,6 +149,7 @@ class Comparator:
                 seed=self.config.seed,
                 max_workers=self.config.max_workers,
                 verbose=True,
+                physical_delay_scale=self.config.physical_delay_scale,
             )
 
             for rep in range(repeats):
@@ -142,6 +194,13 @@ class Comparator:
         self._save_summary(output_dir / "summary.json", summary)
         self._print_summary_table(summary)
 
+        # 移除临时日志文件处理器
+        sys.stdout = original_stdout
+        root_logger = logging.getLogger()
+        root_logger.removeHandler(file_handler)
+        file_handler.close()
+
+        print(f"\n日志已保存: {log_file}")
         return summary
 
     def _compute_summary(self) -> dict[str, Any]:
@@ -222,6 +281,8 @@ async def run_comparison(
     difficulty: str | None = None,
     episodes_per_baseline: int = 5,
     output_dir: str = "results/comparison",
+    use_dated_dir: bool = True,
+    physical_delay_scale: float = 0.01,
 ) -> dict[str, Any]:
     """快速运行对比实验的便捷入口。"""
     if baselines is None:
@@ -248,6 +309,8 @@ async def run_comparison(
         seed=42,
         repeat=1,
         output_dir=Path(output_dir),
+        use_dated_dir=use_dated_dir,
+        physical_delay_scale=physical_delay_scale,
     )
 
     comparator = Comparator(config)
@@ -278,14 +341,19 @@ async def main() -> None:
                         choices=["no_conflict", "light_conflict", "heavy_conflict", "alarm_recovery"])
     parser.add_argument("--episodes", type=int, default=3)
     parser.add_argument("--output-dir", default="results/comparison")
+    parser.add_argument("--no-dated", action="store_true", help="禁用日期后缀目录")
+    parser.add_argument("--speed", type=float, default=0.01,
+                        help="物理延迟缩放因子（0.0-1.0），越小实验越快，默认0.01")
     args = parser.parse_args()
 
-    await run_comparison(
+    summary = await run_comparison(
         tiers=args.tiers,
         episodes_per_baseline=args.episodes,
         output_dir=args.output_dir,
+        use_dated_dir=not args.no_dated,
+        physical_delay_scale=args.speed,
     )
-    print(f"\n实验完成，结果保存至 {args.output_dir}/")
+    print(f"\n实验完成！")
 
 
 if __name__ == "__main__":

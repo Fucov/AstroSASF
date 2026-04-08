@@ -20,6 +20,7 @@ import logging
 import sys
 from collections import defaultdict
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -118,6 +119,8 @@ class AblatorConfig:
     ablation_experiments: list[AblationExperiment]
     seed: int = 42
     output_dir: Path = field(default_factory=lambda: Path("results/ablation"))
+    use_dated_dir: bool = True  # 是否使用日期后缀区分实验
+    physical_delay_scale: float = 0.01  # 物理延迟缩放因子（0.0-1.0，越小越快）
 
 
 # ────────────────────────────────────────────────────────────────────────────── #
@@ -136,10 +139,34 @@ class Ablator:
         episodes = self.config.base_episodes
         experiments = self.config.ablation_experiments
 
+        # 构建带日期的输出目录
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        base_dir = Path(self.config.output_dir) if isinstance(self.config.output_dir, str) else self.config.output_dir
+        if self.config.use_dated_dir:
+            output_dir = base_dir / f"ablation_{timestamp}"
+        else:
+            output_dir = base_dir
+
+        # 创建输出目录
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        # 设置日志重定向到文件
+        log_file = output_dir / f"experiment_{timestamp}.log"
+        file_handler = logging.FileHandler(log_file, encoding="utf-8")
+        file_handler.setLevel(logging.DEBUG)
+        file_handler.setFormatter(logging.Formatter(
+            "%(asctime)s [%(levelname)s] %(message)s",
+            datefmt="%H:%M:%S"
+        ))
+        root_logger = logging.getLogger()
+        root_logger.addHandler(file_handler)
+
         print(f"\n{'='*70}")
         print(f"  AstroSASF 消融实验")
         print(f"  Episodes: {len(episodes)}")
         print(f"  Experiments: {len(experiments)}")
+        print(f"  输出目录: {output_dir}")
+        print(f"  日志文件: {log_file}")
         print(f"{'='*70}\n")
 
         total_runs = len(experiments) * len(episodes)
@@ -152,7 +179,7 @@ class Ablator:
             print(f"     消融: {exp.ablated_dims}")
             print(f"{'─'*70}")
 
-            suite = _build_ablated_suite(exp, seed=self.config.seed)
+            suite = _build_ablated_suite(exp, seed=self.config.seed, physical_delay_scale=self.config.physical_delay_scale)
 
             for ep in episodes:
                 run_idx += 1
@@ -180,12 +207,17 @@ class Ablator:
                     "error": result.error or "",
                 }
                 self._results.append(row)
-                self._append_csv_row(self.config.output_dir / "ablation_results.csv", row)
+                self._append_csv_row(output_dir / "ablation_results.csv", row)
 
         summary = self._compute_summary()
-        self._save_summary(self.config.output_dir / "ablation_summary.json", summary)
+        self._save_summary(output_dir / "ablation_summary.json", summary)
         self._print_ablation_table(summary)
 
+        # 移除临时日志文件处理器
+        root_logger.removeHandler(file_handler)
+        file_handler.close()
+
+        print(f"\n日志已保存: {log_file}")
         return summary
 
     def _compute_summary(self) -> dict[str, Any]:
@@ -260,7 +292,7 @@ class Ablator:
 #  Ablated Suite Builder                                                          #
 # ────────────────────────────────────────────────────────────────────────────── #
 
-def _build_ablated_suite(exp: AblationExperiment, seed: int) -> BenchmarkSuite:
+def _build_ablated_suite(exp: AblationExperiment, seed: int, physical_delay_scale: float = 0.01) -> BenchmarkSuite:
     """根据消融配置构建特定的 BenchmarkSuite。"""
 
     # 每个消融实验对应一个特定的 SchedulerMode 实现
@@ -308,6 +340,7 @@ def _build_ablated_suite(exp: AblationExperiment, seed: int) -> BenchmarkSuite:
         seed=seed,
         max_workers=3,
         verbose=False,
+        physical_delay_scale=physical_delay_scale,
     )
 
 
@@ -318,6 +351,8 @@ def _build_ablated_suite(exp: AblationExperiment, seed: int) -> BenchmarkSuite:
 async def run_temporal_ablation(
     tiers: list[str] | None = None,
     output_dir: str = "results/temporal_ablation",
+    use_dated_dir: bool = True,
+    physical_delay_scale: float = 0.01,
 ) -> dict[str, Any]:
     """运行时间维度消融实验。"""
     gen = BenchmarkGenerator(seed=42)
@@ -342,6 +377,8 @@ async def run_temporal_ablation(
         ablation_experiments=experiments,
         seed=42,
         output_dir=Path(output_dir),
+        use_dated_dir=use_dated_dir,
+        physical_delay_scale=physical_delay_scale,
     )
 
     ablator = Ablator(config)
@@ -351,6 +388,8 @@ async def run_temporal_ablation(
 async def run_spatial_ablation(
     tiers: list[str] | None = None,
     output_dir: str = "results/spatial_ablation",
+    use_dated_dir: bool = True,
+    physical_delay_scale: float = 0.01,
 ) -> dict[str, Any]:
     """运行空间维度消融实验。"""
     gen = BenchmarkGenerator(seed=42)
@@ -375,6 +414,8 @@ async def run_spatial_ablation(
         ablation_experiments=experiments,
         seed=42,
         output_dir=Path(output_dir),
+        use_dated_dir=use_dated_dir,
+        physical_delay_scale=physical_delay_scale,
     )
 
     ablator = Ablator(config)
@@ -411,10 +452,27 @@ async def main() -> None:
                         choices=["no_conflict", "light_conflict", "heavy_conflict", "alarm_recovery"])
     parser.add_argument("--episodes", type=int, default=5)
     parser.add_argument("--output-dir", default="results/ablation")
+    parser.add_argument("--no-dated", action="store_true", help="禁用日期后缀目录")
+    parser.add_argument("--spatial", action="store_true", help="运行空间维度消融实验（默认时间维度）")
+    parser.add_argument("--speed", type=float, default=0.01,
+                        help="物理延迟缩放因子（0.0-1.0），越小实验越快，默认0.01")
     args = parser.parse_args()
 
-    await run_temporal_ablation(tiers=args.tiers, output_dir=args.output_dir)
-    print(f"\n消融实验完成，结果保存至 {args.output_dir}/")
+    if args.spatial:
+        await run_spatial_ablation(
+            tiers=args.tiers,
+            output_dir=args.output_dir,
+            use_dated_dir=not args.no_dated,
+            physical_delay_scale=args.speed,
+        )
+    else:
+        await run_temporal_ablation(
+            tiers=args.tiers,
+            output_dir=args.output_dir,
+            use_dated_dir=not args.no_dated,
+            physical_delay_scale=args.speed,
+        )
+    print(f"\n消融实验完成！")
 
 
 if __name__ == "__main__":

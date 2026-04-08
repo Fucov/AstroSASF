@@ -71,8 +71,9 @@ class TaskLifecycle:
 class MetricsCollector:
     """14 个 benchmark 指标的统一采集器。"""
 
-    def __init__(self, experiment_name: str = "default") -> None:
+    def __init__(self, experiment_name: str = "default", max_workers: int = 3) -> None:
         self.experiment_name = experiment_name
+        self._max_workers = max_workers
         self._device_results: list[DeviceResult] = []
         self._task_lifecycles: dict[str, TaskLifecycle] = {}
         self._ooo_promotions: list[dict[str, Any]] = []
@@ -275,7 +276,7 @@ class MetricsCollector:
         device_util = total_device_s / max(0.001, makespan * num_devices)
 
         # ── Metric 5: CPU Busy Ratio ───────────────────────────────────────────
-        cpu_busy_ratio = self._total_compute_time_ms / max(1, makespan * 1000.0 * 3)
+        cpu_busy_ratio = self._total_compute_time_ms / max(1, makespan * 1000.0 * self._max_workers)
 
         # ── Metric 6: Average Task Waiting Time ─────────────────────────────────
         wait_times_ms: list[float] = []

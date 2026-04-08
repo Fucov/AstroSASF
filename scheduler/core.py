@@ -1231,20 +1231,48 @@ class DAGOrchestrator:
         try:
             # 提取节点所需的设备（与 bench_suite._extract_devices 保持一致）
             skill_lower = node.skill_name.lower()
-            if "heater" in skill_lower or "temperature" in skill_lower:
-                devices = ["heater_bio"] if "bio" in node.lab_id.lower() else ["heater_mat"]
-            elif "vacuum" in skill_lower:
-                devices = ["vacuum_bio"] if "bio" in node.lab_id.lower() else ["vacuum_mat"]
-            elif "arm" in skill_lower or "robotic" in skill_lower:
-                devices = ["arm_bio"] if "bio" in node.lab_id.lower() else (["arm_mat"] if "mat" in node.lab_id.lower() else ["arm_plant"])
-            elif "pump" in skill_lower or "inject" in skill_lower:
-                devices = ["pump_fluid"] if "fluid" in node.lab_id.lower() else ["pump_plant"]
-            elif "valve" in skill_lower:
-                devices = ["valve_fluid"]
-            elif "centrifuge" in skill_lower:
-                devices = ["centrifuge_bio"]
-            elif "sensor" in skill_lower or "scan" in skill_lower:
-                devices = ["scan_bio"]
+            lab_lower = node.lab_id.lower() if node.lab_id else ""
+
+            if "plant" in lab_lower:
+                if "heater" in skill_lower or "temperature" in skill_lower:
+                    devices = ["heater_plant"]
+                elif "arm" in skill_lower or "robotic" in skill_lower:
+                    devices = ["arm_plant"]
+                elif "pump" in skill_lower or "inject" in skill_lower:
+                    devices = ["pump_plant"]
+                elif "vacuum" in skill_lower:
+                    devices = ["vacuum_mat"]
+                else:
+                    devices = ["co2_controller"]
+            elif "material" in lab_lower:
+                if "heater" in skill_lower or "temperature" in skill_lower:
+                    devices = ["heater_mat"]
+                elif "arm" in skill_lower or "robotic" in skill_lower:
+                    devices = ["arm_mat"]
+                elif "vacuum" in skill_lower:
+                    devices = ["vacuum_mat"]
+                else:
+                    devices = ["co2_controller"]
+            elif "fluid" in lab_lower:
+                if "pump" in skill_lower or "inject" in skill_lower:
+                    devices = ["pump_fluid"]
+                elif "valve" in skill_lower:
+                    devices = ["valve_fluid"]
+                else:
+                    devices = ["co2_controller"]
+            elif "bio" in lab_lower:
+                if "heater" in skill_lower or "temperature" in skill_lower:
+                    devices = ["heater_bio"]
+                elif "vacuum" in skill_lower:
+                    devices = ["vacuum_bio"]
+                elif "arm" in skill_lower or "robotic" in skill_lower:
+                    devices = ["arm_bio"]
+                elif "centrifuge" in skill_lower:
+                    devices = ["centrifuge_bio"]
+                elif "sensor" in skill_lower or "scan" in skill_lower:
+                    devices = ["scan_bio"]
+                else:
+                    devices = ["co2_controller"]
             else:
                 devices = ["co2_controller"]
 

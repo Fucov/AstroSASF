@@ -488,7 +488,6 @@ class DeviceRuntime:
 
             # ── Step 5: 执行物理动作（真实 sleep，让出控制权）────────────────
             # physical_delay_scale ∈ [0,1]，用于实验变量控制（paper 实验设为 1.0）
-            scaled_ms = actual_ms * self._physical_delay_scale
             await asyncio.sleep(scaled_ms / 1000.0)
 
             self._invocation_count += 1

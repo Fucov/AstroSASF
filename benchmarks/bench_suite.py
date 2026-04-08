@@ -238,7 +238,7 @@ class BenchmarkSuite:
             seed=self._seed,
             physical_delay_scale=self._physical_delay_scale,
         )
-        metrics = MetricsCollector(experiment_name=f"{self.mode.value}")
+        metrics = MetricsCollector(experiment_name=f"{self.mode.value}", max_workers=self._max_workers)
         return runtime, metrics
 
     async def run_episode(
@@ -375,18 +375,27 @@ class BenchmarkSuite:
         dag_id = episode.episode_id
         dag = DAGTaskGraph(graph_id=dag_id, name=f"Bench-{dag_id}")
 
+        # 构建 lab_id 映射：node_id 前缀 → lab_id
+        lab_id_map: dict[str, str] = {}
+        for cabin in cabins:
+            for node_def in task_graph.nodes:
+                if node_def.task_id.startswith(cabin + "-"):
+                    lab_id_map[node_def.task_id] = cabin
+
+        priority_map = {"CRITICAL": TaskPriority.CRITICAL, "HIGH": TaskPriority.HIGH, "NORMAL": TaskPriority.NORMAL, "LOW": TaskPriority.LOW}
         node_map: dict[str, DAGNode] = {}
+
         for node_def in task_graph.nodes:
-            cabin = cabins[0] if cabins else "DemoBio"
+            # 优先使用 node_id 前缀匹配的 lab_id，再回退到 cabins[0]
+            cabin = lab_id_map.get(node_def.task_id, cabins[0] if cabins else "DemoBio")
             priority_str = node_def.priority.upper() if hasattr(node_def, "priority") else "NORMAL"
-            priority_map = {"CRITICAL": TaskPriority.CRITICAL, "HIGH": TaskPriority.HIGH, "NORMAL": TaskPriority.NORMAL, "LOW": TaskPriority.LOW}
             node_priority = priority_map.get(priority_str, TaskPriority.NORMAL)
 
             node = DAGNode(
                 node_id=node_def.task_id,
                 skill_name=node_def.skill_name,
                 params=node_def.params,
-                dependencies=[],  # 后面补边
+                dependencies=[],
                 priority=node_priority,
                 description=f"{node_def.skill_name} [{node_def.task_id}]",
                 lab_id=cabin,
@@ -554,20 +563,64 @@ class BenchmarkSuite:
     def _extract_devices(self, node: DAGNode) -> list[str]:
         """从节点提取所需设备（简单 heuristic）。"""
         skill = node.skill_name.lower()
+        lab = node.lab_id.lower() if node.lab_id else ""
+
+        # 优先按舱类型判断，再按 skill 判断
+        if "plant" in lab:
+            # DemoPlant 舱专用设备
+            if "heater" in skill or "temperature" in skill:
+                return ["heater_plant"]
+            if "arm" in skill or "robotic" in skill:
+                return ["arm_plant"]
+            if "pump" in skill or "inject" in skill:
+                return ["pump_plant"]
+            if "vacuum" in skill:
+                return ["vacuum_mat"]
+        elif "material" in lab:
+            # DemoMaterial 舱专用设备
+            if "heater" in skill or "temperature" in skill:
+                return ["heater_mat"]
+            if "arm" in skill or "robotic" in skill:
+                return ["arm_mat"]
+            if "vacuum" in skill:
+                return ["vacuum_mat"]
+        elif "fluid" in lab:
+            if "pump" in skill or "inject" in skill:
+                return ["pump_fluid"]
+            if "valve" in skill:
+                return ["valve_fluid"]
+        elif "bio" in lab:
+            # DemoBio 舱专用设备
+            if "heater" in skill or "temperature" in skill:
+                return ["heater_bio"]
+            if "vacuum" in skill:
+                return ["vacuum_bio"]
+            if "arm" in skill or "robotic" in skill:
+                return ["arm_bio"]
+            if "centrifuge" in skill:
+                return ["centrifuge_bio"]
+            if "sensor" in skill or "scan" in skill:
+                return ["scan_bio"]
+
+        # 回退到 skill 关键词（不区分舱）
         if "heater" in skill or "temperature" in skill:
-            if "bio" in node.lab_id.lower():
+            if "bio" in lab:
                 return ["heater_bio"]
             return ["heater_mat"]
         if "vacuum" in skill:
-            if "bio" in node.lab_id.lower():
+            if "bio" in lab:
                 return ["vacuum_bio"]
             return ["vacuum_mat"]
         if "arm" in skill or "robotic" in skill:
-            if "bio" in node.lab_id.lower():
+            if "bio" in lab:
                 return ["arm_bio"]
-            return ["arm_mat"]
+            if "mat" in lab:
+                return ["arm_mat"]
+            if "plant" in lab:
+                return ["arm_plant"]
+            return ["arm_bio"]
         if "pump" in skill or "inject" in skill:
-            if "fluid" in node.lab_id.lower():
+            if "fluid" in lab:
                 return ["pump_fluid"]
             return ["pump_plant"]
         if "valve" in skill:
