@@ -150,6 +150,7 @@ class Comparator:
                 max_workers=self.config.max_workers,
                 verbose=True,
                 physical_delay_scale=self.config.physical_delay_scale,
+                ablated_dims=set(),  # 对比实验不消融任何机制
             )
 
             for rep in range(repeats):

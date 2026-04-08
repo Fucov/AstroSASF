@@ -186,12 +186,14 @@ class BenchmarkSuite:
         max_workers: int = 3,
         verbose: bool = True,
         physical_delay_scale: float = 1.0,
+        ablated_dims: set | None = None,  # 消融维度集合，None 表示不消融
     ) -> None:
         self.mode = scheduler_mode
         self._seed = seed
         self._max_workers = max_workers
         self._verbose = verbose
         self._physical_delay_scale = physical_delay_scale
+        self._ablated_dims = ablated_dims if ablated_dims is not None else set()  # 确保是 set 类型
         self._results: list[BenchmarkResult] = []
 
     def _create_device_runtime(
@@ -290,8 +292,8 @@ class BenchmarkSuite:
             )
             lab_contexts[cabin] = ctx
 
-        # 创庺 DAGOrchestrator
-        orchestrator = DAGOrchestrator(max_workers=self._max_workers)
+        # 创建 DAGOrchestrator（消融实验时传入 ablated_dims）
+        orchestrator = DAGOrchestrator(max_workers=self._max_workers, ablated_dims=self._ablated_dims)
         for cabin, ctx in lab_contexts.items():
             orchestrator.register_lab(ctx)
 

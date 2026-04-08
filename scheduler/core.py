@@ -295,6 +295,7 @@ class DAGOrchestrator:
     """
 
     max_workers: int = 3
+    ablated_dims: set = field(default_factory=lambda: set())  # 消融维度集合，为空表示不消融
 
     # ── 实验柜注册 ── #
     _labs: dict[str, Any] = field(default_factory=dict, init=False)
@@ -643,11 +644,17 @@ class DAGOrchestrator:
         V8.0 核心优化：
         1. 尝试将满足条件的节点越级发射（放入 ReadyQueue 头部，带特殊标记）
         2. OoO Scanner 会优先处理越级节点
+
+        消融实验支持：
+        - 若 ablated_dims 包含 "event_wakeup" 或 "ooo_scanner"，则禁用越级发射
         """
         logger.info(
             "[DAG调度器] 结算节点 '%s' (状态: %s)",
             completed_node.node_id, completed_node.status.name,
         )
+
+        # 消融实验：若禁用 OoO Scanner，则跳过越级发射逻辑
+        skip_ooo_promotion = "event_wakeup" in self.ablated_dims or "ooo_scanner" in self.ablated_dims
 
         async with self._ooo_lock:
             async with self._lock:
@@ -673,6 +680,17 @@ class DAGOrchestrator:
 
                 self._blocked_queue = still_blocked
 
+                # 消融实验：禁用越级发射，直接将所有候选项加入 ReadyQueue
+                if skip_ooo_promotion:
+                    logger.debug("[DAG调度器] 消融实验：跳过 OoO 越级发射")
+                    for blocked_node in ready_candidates:
+                        blocked_node.status = NodeStatus.READY
+                        priority_score = blocked_node.get_ready_score()
+                        await self._ready_queue.put((priority_score, blocked_node))
+                        self._issue_times[blocked_node.node_id] = time.monotonic()
+                    await self._check_dag_completion(dag_graph)
+                    return
+
                 # 尝试越级发射（放入 ReadyQueue，带 OoO 标记）
                 for blocked_node in ready_candidates:
                     can_promote, reason = await self._check_ooo_promotion(blocked_node, dag_graph)
@@ -684,7 +702,9 @@ class DAGOrchestrator:
                         continue
 
                     required_resources = self._extract_required_resources(blocked_node)
-                    if not self._resource_table.check_orthogonality(set(required_resources)):
+                    # 消融实验：若禁用正交性检查，则跳过检查强制越级
+                    skip_ortho_check = "orthogonality_check" in self.ablated_dims
+                    if not skip_ortho_check and not self._resource_table.check_orthogonality(set(required_resources)):
                         blocked_node.status = NodeStatus.READY
                         priority_score = blocked_node.get_ready_score()
                         await self._ready_queue.put((priority_score, blocked_node))
@@ -694,7 +714,6 @@ class DAGOrchestrator:
                     # 越级发射成功！将节点放入 ReadyQueue
                     blocked_node.status = NodeStatus.READY
                     # 使用 (score, node) 元组，score 越小优先级越高
-                    # 越级节点使用负的 score，确保排在队列前面
                     ooo_score = blocked_node.get_ready_score()
                     await self._ready_queue.put((ooo_score, blocked_node))
                     self._issue_times[blocked_node.node_id] = time.monotonic()
@@ -876,7 +895,15 @@ class DAGOrchestrator:
         优化为"按需唤醒"模式：
         - 当有阻塞节点且 Worker 空闲时才唤醒扫描
         - 无事可做时自动进入长时间休眠
+
+        消融实验支持：
+        - 若 ablated_dims 包含 "event_wakeup"，则禁用 OoO Scanner
         """
+        # 消融实验：禁用 OoO Scanner
+        if "event_wakeup" in self.ablated_dims or "ooo_scanner" in self.ablated_dims:
+            logger.info("[OoO-Scanner] 消融实验：OoO Scanner 已禁用 (event_wakeup in ablated_dims)")
+            return
+
         logger.info(
             "[OoO-Scanner] 后台扫描协程启动 (interval=%.1fms, max_wait=%.1fms)",
             self._ooo_scan_interval_ms, self._ooo_max_wait_ms,
@@ -944,8 +971,10 @@ class DAGOrchestrator:
                     # 资源正交性检查
                     required_resources = self._extract_required_resources(node)
                     required_set = set(required_resources)
-                    if not self._resource_table.check_orthogonality(required_set):
-                        continue
+                    # 消融实验：若禁用正交性检查，则跳过此检查
+                    if "orthogonality_check" not in self.ablated_dims:
+                        if not self._resource_table.check_orthogonality(required_set):
+                            continue
 
                     # 原子预约（按字母序）
                     reservation_ok = True
@@ -1065,6 +1094,9 @@ class DAGOrchestrator:
         优化策略：
         - 使用 asyncio.sleep(0) 让出控制权，避免阻塞事件循环
         - 每次扫描最多推进 1 个节点（防止资源碎片化）
+
+        消融实验支持：
+        - 若 ablated_dims 包含 "orthogonality_check"，则跳过资源正交性检查
         """
         async with self._ooo_lock:
             if not self._blocked_queue:
@@ -1096,7 +1128,11 @@ class DAGOrchestrator:
                 required_set = set(required_resources)
 
                 # V8.0: 空间维度正交性检查 R(v_k) ∩ R_active = ∅
-                if not self._resource_table.check_orthogonality(required_set):
+                # 消融实验：若禁用正交性检查或禁用 OoO Scanner，则跳过此检查
+                skip_ortho_check = "orthogonality_check" in self.ablated_dims or \
+                                   "event_wakeup" in self.ablated_dims or \
+                                   "ooo_scanner" in self.ablated_dims
+                if not skip_ortho_check and not self._resource_table.check_orthogonality(required_set):
                     logger.debug(
                         "[OoO-Scan] 节点 '%s' 资源正交性检查失败 (R(v_k)=%s)",
                         node.node_id, required_set,
@@ -1402,11 +1438,15 @@ class DAGOrchestrator:
             name="aging-rebalance",
         )
 
-        # V8.0: 启动后台 OoO Scanner 协程
-        self._ooo_scanner_task = asyncio.get_running_loop().create_task(
-            self._ooo_scanner_loop(),
-            name="ooo-scanner",
-        )
+        # V8.0: 启动后台 OoO Scanner 协程（消融实验时可禁用）
+        if "event_wakeup" not in self.ablated_dims and "ooo_scanner" not in self.ablated_dims:
+            self._ooo_scanner_task = asyncio.get_running_loop().create_task(
+                self._ooo_scanner_loop(),
+                name="ooo-scanner",
+            )
+        else:
+            self._ooo_scanner_task = None
+            logger.info("[OoO-Scanner] 消融实验：OoO Scanner 已禁用")
 
         # 启动 Worker Pool
         for i in range(self.max_workers):
@@ -1509,7 +1549,11 @@ class DAGOrchestrator:
                         timeout=1.0,
                     )
                 except asyncio.TimeoutError:
-                    # V8.0: 不再主动触发 OoO（由后台 Scanner 接管）
+                    # V8.0: Worker 空闲时主动推进阻塞节点（OoO Scanner 禁用时的后备）
+                    if "event_wakeup" in self.ablated_dims or "ooo_scanner" in self.ablated_dims:
+                        promoted = await self._ooo_lookahead_scan()
+                        if promoted > 0:
+                            logger.info("[Worker-%d] 空闲时主动推进 %d 个节点", worker_id, promoted)
                     continue
 
                 # 安全检查：过滤空节点（可能被 rebalance 队列放入的占位 None）

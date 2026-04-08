@@ -185,14 +185,14 @@ class Ablator:
             print(f"  ▶ Baseline: full_proposed (完整原算法，不做任何消融)")
             print(f"{'─'*70}")
 
-            baseline_suite = _build_ablated_suite(
-                AblationExperiment(
-                    name="full_proposed",
-                    description="完整算法基准",
-                    ablated_dims=[],
-                ),
+            # 直接使用 BenchmarkSuite，不传 ablated_dims 表示完整原算法
+            baseline_suite = BenchmarkSuite(
+                scheduler_mode=SchedulerMode.OOO_PROPOSED,
                 seed=self.config.seed,
+                max_workers=3,
+                verbose=False,
                 physical_delay_scale=self.config.physical_delay_scale,
+                ablated_dims=set(),  # 空集 = 不消融任何机制
             )
 
             for ep in episodes:
@@ -209,7 +209,7 @@ class Ablator:
                     "success_rate": result.metrics.get("success_rate", 0),
                     "overlap_ratio": result.metrics.get("overlap_ratio", 0),
                     "conflict_stall_time_ms": result.metrics.get("conflict_stall_time_ms", 0),
-                    "ooo_promotion_count": result.metrics.get("ooo_promotion_count", 0),
+                    "ooo_promotion_count": result.ooo_promotion_count,
                     "cpu_busy_ratio": result.metrics.get("cpu_busy_ratio", 0),
                     "avg_task_wait_time_ms": result.metrics.get("avg_task_wait_time_ms", 0),
                     "alarm_response_latency_ms": result.metrics.get("alarm_response_latency_ms", 0),
@@ -233,7 +233,15 @@ class Ablator:
             print(f"     消融: {exp.ablated_dims}")
             print(f"{'─'*70}")
 
-            suite = _build_ablated_suite(exp, seed=self.config.seed, physical_delay_scale=self.config.physical_delay_scale)
+            # 直接使用 BenchmarkSuite，传入消融维度
+            suite = BenchmarkSuite(
+                scheduler_mode=SchedulerMode.OOO_PROPOSED,
+                seed=self.config.seed,
+                max_workers=3,
+                verbose=False,
+                physical_delay_scale=self.config.physical_delay_scale,
+                ablated_dims=set(exp.ablated_dims),  # 传入消融维度
+            )
 
             for ep in episodes:
                 run_idx += 1
@@ -252,7 +260,7 @@ class Ablator:
                     "success_rate": result.metrics.get("success_rate", 0),
                     "overlap_ratio": result.metrics.get("overlap_ratio", 0),
                     "conflict_stall_time_ms": result.metrics.get("conflict_stall_time_ms", 0),
-                    "ooo_promotion_count": result.metrics.get("ooo_promotion_count", 0),
+                    "ooo_promotion_count": result.ooo_promotion_count,
                     "cpu_busy_ratio": result.metrics.get("cpu_busy_ratio", 0),
                     "avg_task_wait_time_ms": result.metrics.get("avg_task_wait_time_ms", 0),
                     "alarm_response_latency_ms": result.metrics.get("alarm_response_latency_ms", 0),
@@ -298,6 +306,23 @@ class Ablator:
                 for m, vals in metrics.items()
             }
             summary[name]["_count"] = len(next(iter(metrics.values())))
+
+        # ── 计算各消融维度相对于基准的 delta ──────────────────────────────
+        baseline_metrics = summary.get("full_proposed", {})
+        if baseline_metrics:
+            for name, metrics in summary.items():
+                if name == "full_proposed":
+                    metrics["_is_baseline"] = True
+                    continue
+                for m in metric_keys:
+                    base_val = baseline_metrics.get(m, 0)
+                    ablated_val = metrics.get(m, 0)
+                    if base_val != 0:
+                        # delta 用百分比表示（正=变差，负=变好）
+                        metrics[f"{m}_delta_pct"] = ((ablated_val - base_val) / base_val) * 100
+                    else:
+                        metrics[f"{m}_delta_pct"] = 0.0
+
         return summary
 
     def _append_csv_row(self, path: Path, row: dict) -> None:
@@ -317,88 +342,59 @@ class Ablator:
         print(f"\n✅ 消融汇总已保存 → {path}")
 
     def _print_ablation_table(self, summary: dict) -> None:
-        """打印消融实验汇总表。"""
-        print(f"\n{'='*100}")
-        print(f"  消融实验汇总表")
-        print(f"{'='*100}")
-        print(f"{'Ablation':<25} {'Makespan':>10} {'SuccRate':>10} {'Overlap':>10} "
-              f"{'Conflict(ms)':>15} {'OoO#':>8} {'CPU%':>8} {'Wait(ms)':>12}")
-        print(f"{'-'*100}")
+        """打印消融实验汇总表（含基准对照和相对 delta）。"""
+        print(f"\n{'='*120}")
+        print(f"  消融实验汇总表（相对于 full_proposed 基准）")
+        print(f"{'='*120}")
+        print(f"{'Ablation':<22} {'Makespan':>10} {'ΔMakespan':>11} {'SuccRate':>9} "
+              f"{'Overlap':>9} {'ΔOverlap':>10} {'OoO#':>6} {'CPU%':>7} {'Wait(ms)':>10}")
+        print(f"{'-'*120}")
+
+        baseline = summary.get("full_proposed", {})
+        has_baseline = bool(baseline)
 
         for name, metrics in summary.items():
+            is_baseline = metrics.get("_is_baseline", False)
+            prefix = "★ " if is_baseline else "  "
+
+            makespan = metrics.get("makespan_s", 0)
+            succ = metrics.get("success_rate", 0)
+            overlap = metrics.get("overlap_ratio", 0)
+            ooo = metrics.get("ooo_promotion_count", 0)
+            cpu = metrics.get("cpu_busy_ratio", 0)
+            wait = metrics.get("avg_task_wait_time_ms", 0)
+
+            if has_baseline and not is_baseline:
+                delta_ms = metrics.get("makespan_s_delta_pct", 0)
+                delta_ov = metrics.get("overlap_ratio_delta_pct", 0)
+                delta_str = f"{delta_ms:>+10.1f}%"
+                delta_ov_str = f"{delta_ov:>+9.1f}%"
+            else:
+                delta_str = f"{'':>11}"
+                delta_ov_str = f"{'':>10}"
+
             print(
-                f"{name:<25} "
-                f"{metrics.get('makespan_s', 0):>10.3f} "
-                f"{metrics.get('success_rate', 0):>10.1%} "
-                f"{metrics.get('overlap_ratio', 0):>10.1%} "
-                f"{metrics.get('conflict_stall_time_ms', 0):>15.1f} "
-                f"{metrics.get('ooo_promotion_count', 0):>8.0f} "
-                f"{metrics.get('cpu_busy_ratio', 0) * 100:>7.1f}% "
-                f"{metrics.get('avg_task_wait_time_ms', 0):>12.1f}"
+                f"{prefix}{name:<20} "
+                f"{makespan:>10.3f}s "
+                f"{delta_str} "
+                f"{succ:>8.1%} "
+                f"{overlap:>8.1%} "
+                f"{delta_ov_str} "
+                f"{ooo:>6.0f} "
+                f"{cpu * 100:>6.1f}% "
+                f"{wait:>10.1f}"
             )
 
-        print(f"{'='*100}")
+        print(f"{'='*120}")
+        if has_baseline:
+            print("\n★ = full_proposed 基准行（完整算法，不做任何消融）")
+            print("ΔMakespan: 消融相对于基准的变化（正值=变慢/变差，负值=变快/变好）")
+            print("ΔOverlap: 重叠率变化（正值=并行度提升，负值=并行度下降）")
         print("\n解读指南：")
-        print("  - no_checkpoint: 去掉后 Success Rate 应显著下降（Tier-4 尤其明显）")
+        print("  - no_checkpoint: 去掉后 SuccRate 下降说明 Tier-4 告警恢复能力受损")
         print("  - no_event_wakeup: 去掉后 CPU Busy Ratio 上升，Overlap Ratio 下降")
         print("  - no_orthogonality_check: 去掉后 Conflict Stall Time 暴增")
         print("  - no_priority_lock: 去掉后 Jain's Fairness 下降，高优先级任务等待增加")
-
-
-# ────────────────────────────────────────────────────────────────────────────── #
-#  Ablated Suite Builder                                                          #
-# ────────────────────────────────────────────────────────────────────────────── #
-
-def _build_ablated_suite(exp: AblationExperiment, seed: int, physical_delay_scale: float = 0.01) -> BenchmarkSuite:
-    """根据消融配置构建特定的 BenchmarkSuite。"""
-
-    # 每个消融实验对应一个特定的 SchedulerMode 实现
-    # 在实际运行时，suite._run_ooo_proposed 会根据 ablated_dims 做分支
-
-    class AblatedSuite(BenchmarkSuite):
-        def __init__(self2, **kw):
-            super().__init__(**kw)
-            self2._ablated_dims = set(exp.ablated_dims)
-
-        async def _run_ooo_proposed(self2, dag, labs, metrics, orchestrator, runtime):
-            """消融版本的 OoO-proposed。"""
-            await orchestrator.start()
-
-            # 根据消融维度调整行为
-            if "orthogonality_check" in self2._ablated_dims:
-                # 跳过正交性检查：所有节点都能越级发射
-                orchestrator._ooo_lock = asyncio.Lock()
-
-            if "prefix_routing" in self2._ablated_dims:
-                # 跳过 prefix routing：每次全量推理
-                metrics._prefix_hits = 0
-                metrics._prefix_misses = 0
-
-            if "checkpoint" in self2._ablated_dims:
-                # 跳过 checkpoint
-                pass
-
-            if "event_wakeup" in self2._ablated_dims:
-                # 使用轮询而非 asyncio.Future
-                orchestrator._ooo_scanner_task = None
-
-            await orchestrator.submit_dag(dag)
-            try:
-                await asyncio.wait_for(orchestrator._dag_complete_event.wait(), timeout=300.0)
-            except asyncio.TimeoutError:
-                pass
-            finally:
-                await orchestrator.shutdown()
-
-            metrics.add_compute_time(100.0 * len(dag.nodes))
-
-    return AblatedSuite(
-        scheduler_mode=SchedulerMode.OOO_PROPOSED,
-        seed=seed,
-        max_workers=3,
-        verbose=False,
-        physical_delay_scale=physical_delay_scale,
-    )
 
 
 # ────────────────────────────────────────────────────────────────────────────── #
@@ -411,10 +407,8 @@ async def run_temporal_ablation(
     use_dated_dir: bool = True,
     physical_delay_scale: float = 0.01,
 ) -> dict[str, Any]:
-    """运行时间维度消融实验。
-    
-    采样策略：从所有场景类型均匀采样，确保覆盖冲突和告警恢复场景。
-    """
+    """运行时间维度消融实验（自动包含 full_proposed 基准）。"""
+
     gen = BenchmarkGenerator(seed=42)
     all_eps = gen.generate_full_suite()
 
@@ -424,7 +418,7 @@ async def run_temporal_ablation(
     for ep in all_eps:
         by_scenario[ep.scenario_type.value].append(ep)
 
-    # 从所有场景类型均匀采样（确保包含冲突场景）
+    # 从所有场景类型均匀采样
     filtered: list = []
     if tiers is None:
         target_tiers = list(by_scenario.keys())
@@ -435,15 +429,14 @@ async def run_temporal_ablation(
         tier_eps = by_scenario.get(tier, [])
         if not tier_eps:
             continue
-        # 每个场景类型取 2-3 条
         filtered.extend(tier_eps[:3])
-    
-    # 打印采样信息
+
     scenario_counts = defaultdict(int)
     for ep in filtered:
         scenario_counts[ep.scenario_type.value] += 1
     print(f"[采样信息] 共 {len(filtered)} 条: {dict(scenario_counts)}")
 
+    # full_proposed 基准由 include_baseline=True 自动运行，不重复加入
     experiments = [
         AblationExperiment(
             name=dim.name,
@@ -460,6 +453,7 @@ async def run_temporal_ablation(
         output_dir=Path(output_dir),
         use_dated_dir=use_dated_dir,
         physical_delay_scale=physical_delay_scale,
+        include_baseline=True,  # 自动跑 full_proposed 基准
     )
 
     ablator = Ablator(config)
@@ -472,20 +466,16 @@ async def run_spatial_ablation(
     use_dated_dir: bool = True,
     physical_delay_scale: float = 0.01,
 ) -> dict[str, Any]:
-    """运行空间维度消融实验。
-    
-    采样策略：从所有场景类型均匀采样，确保覆盖冲突和告警恢复场景。
-    """
+    """运行空间维度消融实验（自动包含 full_proposed 基准）。"""
+
     gen = BenchmarkGenerator(seed=42)
     all_eps = gen.generate_full_suite()
 
-    # 按场景类型分组
     from collections import defaultdict
     by_scenario: dict[str, list] = defaultdict(list)
     for ep in all_eps:
         by_scenario[ep.scenario_type.value].append(ep)
 
-    # 从所有场景类型均匀采样（确保包含冲突场景）
     filtered: list = []
     if tiers is None:
         target_tiers = list(by_scenario.keys())
@@ -496,15 +486,14 @@ async def run_spatial_ablation(
         tier_eps = by_scenario.get(tier, [])
         if not tier_eps:
             continue
-        # 每个场景类型取 2-3 条
         filtered.extend(tier_eps[:3])
-    
-    # 打印采样信息
+
     scenario_counts = defaultdict(int)
     for ep in filtered:
         scenario_counts[ep.scenario_type.value] += 1
     print(f"[采样信息] 共 {len(filtered)} 条: {dict(scenario_counts)}")
 
+    # full_proposed 基准由 include_baseline=True 自动运行，不重复加入
     experiments = [
         AblationExperiment(
             name=dim.name,
@@ -521,6 +510,7 @@ async def run_spatial_ablation(
         output_dir=Path(output_dir),
         use_dated_dir=use_dated_dir,
         physical_delay_scale=physical_delay_scale,
+        include_baseline=True,  # 自动跑 full_proposed 基准
     )
 
     ablator = Ablator(config)
