@@ -164,6 +164,8 @@ class LLMInstancePool:
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False, repr=False)
     _http_client: httpx.AsyncClient | None = field(default=None, init=False, repr=False)
     _on_status_change: list[Callable] = field(default_factory=list, init=False, repr=False)
+    # 每个实例的最大并发连接数（用于路由超载检测）
+    max_connections_per_instance: int = 100
 
     def register_instance(self, config: LLMInstanceConfig) -> None:
         """注册一个 LLM 实例。"""

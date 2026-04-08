@@ -21,16 +21,30 @@ logger = logging.getLogger(__name__)
 _PLANNER_SYSTEM_PROMPT = """你是一个专业的实验任务规划 Agent。
 你的职责是将一个高层任务分解为严格有序的 MCP Tool 调用序列。
 
-已知 MCP Tools（白名单）：
-{tool_list}
+**【强制约束】你必须严格按照下面每个 Tool 的 JSON Schema 中的参数名生成，**
+**禁止使用任何变体、同义词或自创的参数名。**
+例如：若 schema 定义了参数名为 `temperature`，你绝不能使用 `target_temperature`、`temp`、`setting` 等变体。
+若 schema 定义了参数名为 `volume`，你绝不能使用 `amount`、`nutrient_volume`、`ml` 等变体。
+若 schema 定义了参数名为 `activate`（bool），你绝不能使用 `state`、`enabled`、`switch` 等变体。
 
-约束：
-1. 每步只能调用一个 Tool
-2. 必须严格按顺序执行
-3. 关注 FSM 状态转换
-4. 遵循联锁规则
+已知 MCP Tools（包含完整参数 Schema）：
 
-输出格式（JSON数组，每项为 {{"step": 1, "tool": "xxx", "params": {{...}}}}）：
+{tool_schemas}
+
+每个 Tool 的输出格式必须严格为 JSON 数组，每项包含以下三个字段：
+{{"step": 整数序号, "tool": "精确工具名", "params": {{精确参数名: 值}}}}
+
+**禁止**在 params 中添加 Schema 中不存在的参数。
+**禁止**修改任何参数名。
+**禁止**在输出中混入任何解释性文字。
+
+示例（正确）：
+[{{"step": 1, "tool": "set_temperature", "params": {{"temperature": 37.0}}}},
+ {{"step": 2, "tool": "inject_nutrient", "params": {{"volume": 50.0}}}}]
+
+示例（错误 — 违反参数名约束）：
+[{{"step": 1, "tool": "set_temperature", "params": {{"target_temperature": 37.0}}}}]
+[{{"step": 2, "tool": "inject_nutrient", "params": {{"amount": 50}}}}]
 """
 
 
@@ -168,13 +182,42 @@ class PlannerAgent(BaseAgent):
             logger.warning("[Planner] 获取工具列表失败: %s", exc)
             tools = []
 
-        tool_list = "\n".join(
-            f"- {t['name']}: {t['description']}"
-            for t in tools
-        ) if tools else "(无法获取工具列表)"
+        # 构建包含完整 JSON Schema 的工具描述（供 LLM 精确匹配参数名）
+        tool_schemas_lines: list[str] = []
+        for t in tools:
+            name = t.get("name", "unknown")
+            desc = t.get("description", "")
+            json_schema = t.get("json_schema", {})
+
+            schema_lines = [f"  Tool: {name}", f"  Description: {desc}"]
+
+            # json_schema 格式: {type: "function", function: {parameters: {type, properties, required}}}
+            func_def = json_schema.get("function", {}) if isinstance(json_schema, dict) else {}
+            params_obj = func_def.get("parameters", {}) if isinstance(func_def, dict) else {}
+            props = params_obj.get("properties", {}) if isinstance(params_obj, dict) else {}
+            required = params_obj.get("required", []) if isinstance(params_obj, dict) else []
+
+            if props:
+                schema_lines.append("  Parameters (JSON Schema):")
+                for pname, pdesc in props.items():
+                    ptype = pdesc.get("type", "any") if isinstance(pdesc, dict) else "any"
+                    is_required = pname in required
+                    req_marker = "[REQUIRED]" if is_required else "[OPTIONAL]"
+                    if isinstance(pdesc, dict) and "description" in pdesc:
+                        schema_lines.append(
+                            f"    - {pname}: {ptype} {req_marker} — {pdesc['description']}"
+                        )
+                    else:
+                        schema_lines.append(f"    - {pname}: {ptype} {req_marker}")
+            else:
+                schema_lines.append("  Parameters: (无固定参数)")
+
+            tool_schemas_lines.append("\n".join(schema_lines))
+
+        tool_schemas = "\n\n".join(tool_schemas_lines)
 
         # ── Step 3: LLM 生成工具调用计划 ── #
-        system_prompt = _PLANNER_SYSTEM_PROMPT.format(tool_list=tool_list)
+        system_prompt = _PLANNER_SYSTEM_PROMPT.format(tool_schemas=tool_schemas)
         user_prompt = (
             f"实验舱: {lab_id}\n"
             f"任务: {task_desc}\n\n"

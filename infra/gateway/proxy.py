@@ -29,10 +29,10 @@ from infra.llm.config_loader import (
     GatewayConfig,
     GatewayBackendConfig,
     IntentRoutingConfig,
-    LLMInstanceConfig,
-    load_gateway_config,
+    SASFConfig,
+    load_config,
 )
-from infra.llm.instance_pool import LLMInstancePool
+from infra.llm.instance_pool import LLMInstancePool, LLMInstanceConfig
 from infra.routing import (
     PrefixAwareLoadBalancer,
     RoutingStrategy,
@@ -74,13 +74,13 @@ class GatewayResponse:
     """LLM 网关响应（V7.5 增强：异构降级标记）。"""
     content: str
     model: str
-    usage: dict | None = None
-    finish_reason: str | None = None
     request_id: str
     routed_to: str
     routing_strategy: str
     prefix_hash: str
     latency_ms: float
+    usage: dict | None = None
+    finish_reason: str | None = None
     streamed: bool = False
     # V7.5 新增：异构算力降级标记
     downgraded: bool = False                       # 是否经历透明算力降级
@@ -91,7 +91,7 @@ class GatewayResponse:
 @dataclass
 class GatewayError:
     error: str
-    error_code: str
+    error_code: str = "UNKNOWN"
     retry_after: float | None = None
 
 
