@@ -283,7 +283,8 @@ async def run_comparison(
     episodes_per_baseline: int = 5,
     output_dir: str = "results/comparison",
     use_dated_dir: bool = True,
-    physical_delay_scale: float = 0.01,
+    physical_delay_scale: float = 0.1,
+    benchmark_file: str | None = None,  # 新增：从文件加载 benchmark
 ) -> dict[str, Any]:
     """快速运行对比实验的便捷入口。
     
@@ -291,13 +292,21 @@ async def run_comparison(
     - tiers=None: 从所有场景类型均匀采样（每个场景类型 episodes_per_baseline 条）
     - tiers=['xxx']': 从指定场景类型均匀采样
     - difficulty 指定时：只从指定难度采样
+    - benchmark_file 指定时：从文件加载 benchmark，忽略 tiers 参数
     """
     if baselines is None:
         baselines = [m for _, m in Comparator.ALL_BASELINES]
 
-    # 生成 benchmark
-    gen = BenchmarkGenerator(seed=42)
-    all_eps = gen.generate_full_suite()
+    # 加载 benchmark
+    from benchmarks.bench_generator import BenchmarkGenerator
+    if benchmark_file:
+        # 从文件加载
+        all_eps = BenchmarkGenerator.load(Path(benchmark_file))
+        print(f"[加载] 从文件 {benchmark_file} 加载了 {len(all_eps)} 条 benchmark")
+    else:
+        # 动态生成
+        gen = BenchmarkGenerator(seed=42)
+        all_eps = gen.generate_full_suite()
 
     # 按场景类型分组
     from collections import defaultdict
@@ -384,12 +393,15 @@ async def main() -> None:
 
     parser = argparse.ArgumentParser(description="AstroSASF 对比实验")
     parser.add_argument("--tiers", nargs="+", default=None,
-                        choices=["no_conflict", "light_conflict", "heavy_conflict", "alarm_recovery"])
+                        choices=["no_conflict", "light_conflict", "heavy_conflict", "alarm_recovery", 
+                                 "global_shared", "diamond_deep"])
     parser.add_argument("--episodes", type=int, default=3)
     parser.add_argument("--output-dir", default="results/comparison")
     parser.add_argument("--no-dated", action="store_true", help="禁用日期后缀目录")
-    parser.add_argument("--speed", type=float, default=0.01,
-                        help="物理延迟缩放因子（0.0-1.0），越小实验越快，默认0.01")
+    parser.add_argument("--speed", type=float, default=0.1,
+                        help="物理延迟缩放因子（0.0-1.0），越小实验越快，默认0.1")
+    parser.add_argument("--benchmark-file", type=str, default=None,
+                        help="从指定文件加载 benchmark（JSONL 格式）")
     args = parser.parse_args()
 
     summary = await run_comparison(
@@ -398,6 +410,7 @@ async def main() -> None:
         output_dir=args.output_dir,
         use_dated_dir=not args.no_dated,
         physical_delay_scale=args.speed,
+        benchmark_file=args.benchmark_file,
     )
     print(f"\n实验完成！")
 

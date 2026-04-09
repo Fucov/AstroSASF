@@ -54,6 +54,9 @@ class ScenarioType(Enum):
     HEAVY_CONFLICT = "heavy_conflict" # 宽 DAG，每层同设备竞争 2~4 节点
     ALARM_RECOVERY = "alarm_recovery"  # 含 telemetry_alarm，触发抢占
     OOO_STRESS = "ooo_stress"          # 深层宽 DAG，每层强制同设备竞争 + chaos
+    # ── 新增极端场景 ──────────────────────────────────────────────────────
+    GLOBAL_SHARED = "global_shared"     # 全局共享设备竞争（co2_controller）
+    DIAMOND_DEEP = "diamond_deep"      # 深层钻石形依赖（测试 OoO 越级能力）
 
 
 # ────────────────────────────────────────────────────────────────────────────── #
@@ -541,6 +544,204 @@ class BenchmarkGenerator:
             episodes.append(episode)
         return episodes
 
+    # ═══════════════════════════════════════════════════════════════════════════ #
+    #  Extreme Tier: 极端场景（真正测试 OoO 越级调度能力）                        #
+    # ═══════════════════════════════════════════════════════════════════════════ #
+
+    def generate_extreme_shared(self, count: int = 5, difficulty: DifficultyLevel = DifficultyLevel.HARD) -> list[BenchmarkEpisode]:
+        """极端场景：全局共享设备竞争。
+
+        设计目标：让 co2_controller 成为全局瓶颈，所有任务竞争这一个设备。
+        这迫使 OoO Scanner 必须主动越级调度，否则大部分 Worker 会一直阻塞等待。
+
+        DAG 结构：
+        - 深层 DAG（12~15 层）
+        - 每层 4~6 个节点
+        - 所有节点都需要 co2_controller（全局共享）
+        - 钻石形依赖确保大量"等待但可越级"的场景
+
+        预期效果：
+        - sequential: 任务串行执行，Worker 大部分时间阻塞在 co2_controller 上
+        - ooo_proposed: OoO Scanner 主动发现空闲 Worker 并越级调度其他可用任务
+        - 预期提升：30~50% 的 makespan 减少
+        """
+        episodes = []
+        dag_depth_map = {
+            DifficultyLevel.EASY:   12,
+            DifficultyLevel.MEDIUM: 14,
+            DifficultyLevel.HARD:   15,
+        }
+        nodes_per_level_map = {
+            DifficultyLevel.EASY:   4,
+            DifficultyLevel.MEDIUM: 5,
+            DifficultyLevel.HARD:   6,
+        }
+
+        dag_depth = dag_depth_map[difficulty]
+        num_per_level = nodes_per_level_map[difficulty]
+        delay_mult = {"Easy": 2.0, "Medium": 3.0, "Hard": 4.0}[difficulty.value]
+
+        # 使用一个舱，所有节点都竞争 co2_controller
+        lab = "DemoBio"
+        devices = ["co2_controller"]  # 全局共享设备
+
+        for i in range(count):
+            ep_id = f"ext-shared-{difficulty.value}-{i+1:02d}"
+
+            nodes, edges = self._build_dag(
+                lab_id=lab,
+                devices=devices,
+                depth=dag_depth,
+                include_shared=True,              # 启用全局共享设备
+                shared_device="co2_controller",  # 全局共享设备
+                min_nodes_per_level=num_per_level,
+                max_nodes_per_level=num_per_level,  # 每层固定数量
+                force_competition_per_level=num_per_level,  # 全层竞争
+                diamond_mode=True,                 # 钻石形全连接
+            )
+
+            episode = BenchmarkEpisode(
+                episode_id=ep_id,
+                scenario_type=ScenarioType.GLOBAL_SHARED,
+                difficulty=difficulty,
+                description=f"[Extreme] {difficulty.value} 全局共享设备竞争：{dag_depth}层×{num_per_level}节点，全员竞争co2_controller，OoO越级核心测试",
+                cabins=[lab],
+                task_graph=TaskGraphDef(nodes=nodes, edges=edges),
+                device_requirements=self._build_device_reqs(
+                    exclusive_devices=[],
+                    cabins=[lab],
+                    shared=True,
+                    shared_device="co2_controller",
+                ),
+                initial_telemetry=self._default_telemetry(lab),
+                chaos_events=[
+                    ChaosEventDef(
+                        trigger_time_sec=self._random_float(dag_depth * 0.4, dag_depth * 0.6),
+                        type="hardware_delay",
+                        target_tool="co2_controller",
+                        delay_multiplier=delay_mult,
+                    ),
+                ],
+                expected_outcomes={
+                    "success_rate": 0.85,
+                    "ooo_promotion_min": dag_depth * 2,  # 期望至少 2x 深度的越级次数
+                    "overlap_ratio_min": 0.40,
+                },
+                evaluation_tags=["extreme", difficulty.value.lower(), "global_shared", "co2_bottleneck"],
+                seed=self._seed + i + 300,
+            )
+            episodes.append(episode)
+        return episodes
+
+    def generate_extreme_diamond(self, count: int = 5, difficulty: DifficultyLevel = DifficultyLevel.HARD) -> list[BenchmarkEpisode]:
+        """极端场景：深层钻石形依赖。
+
+        设计目标：制造大量"条件满足但资源被占"的场景，让 OoO Scanner 必须越级。
+
+        DAG 结构：
+        - 超深 DAG（15~20 层）
+        - 宽钻石形：每层 4~6 个节点
+        - 全连接依赖：每个节点依赖上一层所有节点
+        - 故意使用长延迟设备（centrifuge_bio: 3~5 秒）
+
+        关键特性：
+        1. 钻石形依赖 → 大量等待节点（上游完成但资源被占）
+        2. 长延迟设备 → 资源持有时间长，越级收益高
+        3. 超深 DAG → OoO Scanner 有更多越级机会
+
+        预期效果：
+        - sequential: 严格串行，centrifuge 延迟主导总时间
+        - async_only: 层内并行好，但等待队列堆积
+        - ooo_proposed: 主动越级调度，重叠率显著提升
+        - 预期提升：40~60% 的 makespan 减少
+        """
+        episodes = []
+        dag_depth_map = {
+            DifficultyLevel.EASY:   15,
+            DifficultyLevel.MEDIUM: 17,
+            DifficultyLevel.HARD:   20,
+        }
+        nodes_per_level_map = {
+            DifficultyLevel.EASY:   4,
+            DifficultyLevel.MEDIUM: 5,
+            DifficultyLevel.HARD:   6,
+        }
+
+        dag_depth = dag_depth_map[difficulty]
+        num_per_level = nodes_per_level_map[difficulty]
+        delay_mult = {"Easy": 2.5, "Medium": 3.5, "Hard": 5.0}[difficulty.value]
+
+        # 长延迟设备列表
+        long_delay_devices = ["centrifuge_bio", "scan_bio", "vacuum_bio"]
+
+        labs = self._random_choice(list(self.LAB_DEVICE_MAP.keys()), k=2)
+
+        for i in range(count):
+            ep_id = f"ext-diamond-{difficulty.value}-{i+1:02d}"
+            long_dev = long_delay_devices[i % len(long_delay_devices)]
+
+            all_nodes = []
+            all_edges = []
+            for lab in labs:
+                devices = list(self.LAB_DEVICE_MAP[lab])
+                nodes, edges = self._build_dag(
+                    lab_id=lab,
+                    devices=devices,
+                    depth=dag_depth,
+                    include_shared=False,
+                    force_device=long_dev,                   # 强制长延迟设备
+                    min_nodes_per_level=num_per_level,
+                    max_nodes_per_level=num_per_level,
+                    force_competition_per_level=num_per_level,  # 全层竞争
+                    diamond_mode=True,                         # 钻石形全连接
+                )
+                all_nodes.extend(nodes)
+                all_edges.extend(edges)
+
+            episode = BenchmarkEpisode(
+                episode_id=ep_id,
+                scenario_type=ScenarioType.DIAMOND_DEEP,
+                difficulty=difficulty,
+                description=f"[Extreme] {difficulty.value} 深层钻石DAG：{dag_depth}层×{num_per_level}节点，{long_dev}长延迟，OoO越级极限测试",
+                cabins=labs,
+                task_graph=TaskGraphDef(nodes=all_nodes, edges=all_edges),
+                device_requirements=self._build_device_reqs([], labs, shared=False),
+                initial_telemetry=self._default_telemetry(labs[0]),
+                chaos_events=[
+                    ChaosEventDef(
+                        trigger_time_sec=self._random_float(dag_depth * 0.3, dag_depth * 0.5),
+                        type="hardware_delay",
+                        target_tool=long_dev,
+                        delay_multiplier=delay_mult,
+                    ),
+                ],
+                expected_outcomes={
+                    "success_rate": 0.80,
+                    "ooo_promotion_min": dag_depth * 3,  # 期望至少 3x 深度的越级次数
+                    "overlap_ratio_min": 0.50,
+                },
+                evaluation_tags=["extreme", difficulty.value.lower(), "deep_diamond", f"long_delay_{long_dev}"],
+                seed=self._seed + i + 400,
+            )
+            episodes.append(episode)
+        return episodes
+
+    def generate_extreme_full_suite(self) -> list[BenchmarkEpisode]:
+        """生成完整极端场景 benchmark（2 scenario × 3 level × 5 episodes = 30 条）。"""
+        episodes = []
+        difficulties = [
+            DifficultyLevel.EASY,
+            DifficultyLevel.MEDIUM,
+            DifficultyLevel.HARD,
+        ]
+        for diff in difficulties:
+            eps = self.generate_extreme_shared(count=5, difficulty=diff)
+            episodes.extend(eps)
+        for diff in difficulties:
+            eps = self.generate_extreme_diamond(count=5, difficulty=diff)
+            episodes.extend(eps)
+        return episodes
+
     # ── 辅助方法 ─────────────────────────────────────────────────────────────
 
     def _build_dag(
@@ -568,6 +769,7 @@ class BenchmarkGenerator:
         2. 故意让同层节点使用相同设备，制造资源锁争用
         3. 钻石形依赖：同一层的多个节点共享上游，形成「扇入」结构
         4. chaos event 在设备持有期间触发，测试 OoO Scanner 的越级能力
+        5. 全局共享设备（include_shared=True）：所有节点都竞争同一个设备
 
         示例（宽 DAG + 钻石形）：
             L0: [A] ──→ L1: [C] ──→ L2: [E]
@@ -594,6 +796,8 @@ class BenchmarkGenerator:
             "valve_fluid":    "control_valve",
             "centrifuge_bio": "control_centrifuge",
             "scan_bio":       "read_sensor",
+            "co2_controller": "control_co2",
+            "water_pump_global": "control_water_pump",
         }
 
         # V8.0: 按设备类型分组（同类型设备才能在同一层制造竞争）
@@ -649,7 +853,7 @@ class BenchmarkGenerator:
             level_ids: list[str] = []
             for j in range(num_in_level):
                 device = level_devices[j]
-                if force_device and d == depth // 2:
+                if force_device:
                     device = force_device
 
                 skill = skill_map.get(device, "generic_action")
@@ -665,8 +869,9 @@ class BenchmarkGenerator:
                     resumable=True,
                 )
 
-                # 全局共享设备（增加资源竞争）
-                if include_shared and shared_device and rng.random() < 0.5:
+                # ── 全局共享设备：所有节点都添加共享设备 ─────────────────────
+                if include_shared and shared_device:
+                    # 全局共享设备竞争模式：每个节点都竞争同一个设备
                     node.required_devices.append(shared_device)
 
                 nodes.append(node)
@@ -819,7 +1024,7 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output", default="datasets/astro_bench_v2.jsonl")
     parser.add_argument("--tier", default=None,
-                        choices=["tier1", "tier2", "tier3", "tier4"])
+                        choices=["tier1", "tier2", "tier3", "tier4", "ext-shared", "ext-diamond", "extreme"])
     parser.add_argument("--count", type=int, default=5,
                         help="每难度级别的 episode 数量")
     args = parser.parse_args()
@@ -834,6 +1039,12 @@ def main() -> None:
         episodes = gen.generate_tier3(count=args.count)
     elif args.tier == "tier4":
         episodes = gen.generate_tier4(count=args.count)
+    elif args.tier == "ext-shared":
+        episodes = gen.generate_extreme_shared(count=args.count)
+    elif args.tier == "ext-diamond":
+        episodes = gen.generate_extreme_diamond(count=args.count)
+    elif args.tier == "extreme":
+        episodes = gen.generate_extreme_full_suite()
     else:
         episodes = gen.generate_full_suite()
 

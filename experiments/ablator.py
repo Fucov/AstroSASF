@@ -126,7 +126,7 @@ class AblatorConfig:
     seed: int = 42
     output_dir: Path = field(default_factory=lambda: Path("results/ablation"))
     use_dated_dir: bool = True  # 是否使用日期后缀区分实验
-    physical_delay_scale: float = 0.01  # 物理延迟缩放因子（0.0-1.0，越小越快）
+    physical_delay_scale: float = 0.1  # 物理延迟缩放因子（0.0-1.0，越小越快）
     include_baseline: bool = True  # 是否同步跑完整原算法作为基准对照
 
 
@@ -405,7 +405,7 @@ async def run_temporal_ablation(
     tiers: list[str] | None = None,
     output_dir: str = "results/temporal_ablation",
     use_dated_dir: bool = True,
-    physical_delay_scale: float = 0.01,
+    physical_delay_scale: float = 0.1,
 ) -> dict[str, Any]:
     """运行时间维度消融实验（自动包含 full_proposed 基准）。"""
 
@@ -464,7 +464,7 @@ async def run_spatial_ablation(
     tiers: list[str] | None = None,
     output_dir: str = "results/spatial_ablation",
     use_dated_dir: bool = True,
-    physical_delay_scale: float = 0.01,
+    physical_delay_scale: float = 0.1,
 ) -> dict[str, Any]:
     """运行空间维度消融实验（自动包含 full_proposed 基准）。"""
 
@@ -549,8 +549,8 @@ async def main() -> None:
     parser.add_argument("--output-dir", default="results/ablation")
     parser.add_argument("--no-dated", action="store_true", help="禁用日期后缀目录")
     parser.add_argument("--spatial", action="store_true", help="运行空间维度消融实验（默认时间维度）")
-    parser.add_argument("--speed", type=float, default=0.01,
-                        help="物理延迟缩放因子（0.0-1.0），越小实验越快，默认0.01")
+    parser.add_argument("--speed", type=float, default=0.1,
+                        help="物理延迟缩放因子（0.0-1.0），越小实验越快，默认0.1")
     args = parser.parse_args()
 
     if args.spatial:
