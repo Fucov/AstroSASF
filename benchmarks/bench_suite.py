@@ -54,12 +54,45 @@ logger = logging.getLogger(__name__)
 # ────────────────────────────────────────────────────────────────────────────── #
 
 class SchedulerMode(Enum):
+    """
+    调度器模式枚举。
+
+    论文级定义（对应三层实验结构）：
+
+    【主实验 / Main Comparison】
+    - SEQUENTIAL         ：严格顺序执行，同一时刻最多一个节点运行，无并发。
+    - TRADITIONAL_DAG    ：遵循 DAG 拓扑约束，同层 ready 节点全部并发提交（asyncio.gather），
+                          但不具备：①乱序恢复（阻塞节点不会绕道执行其他就绪节点）、
+                          ②事件驱动唤醒（恢复依赖轮询或简单 await）、
+                          ③资源感知时空优化（无 ART / checkpoint / prefix routing）。
+                          实现对应：ASYNC_ONLY。
+
+    【机制拆解 / Component-wise Comparison】
+    - ASYNC_ONLY  → 仅有异步提交能力（无 OoO scanner，无事件驱动，无 ART 资源感知）
+                    即"裸并发层"，用于隔离层的并发推进本身对性能的影响。
+    - LOCK_ONLY   → 仅有 DeviceRuntime 资源锁（顺序推进，无并发，无恢复）
+                    用于证明仅靠锁机制不足以实现高效调度。
+    - RESUME_ONLY → 启用 orchestrator + 事件条件等待，但禁用 OoO Scanner（无乱序 promotion）
+                    用于区分"事件恢复"和"乱序调度"各自独立的贡献。
+    - OOO_PROPOSED：完整方案，全部机制启用。
+    """
     SEQUENTIAL = "sequential"
-    ASYNC_ONLY = "async_only"
-    OOO_LITE = "ooo_lite"
+    TRADITIONAL_DAG = "traditional_dag"  # 论文主实验：传统 DAG 调度（对应原 ASYNC_ONLY）
+    ASYNC_ONLY = "async_only"            # 机制拆解：仅有异步提交
     OOO_PROPOSED = "ooo_proposed"
     LOCK_ONLY = "lock_only"
     RESUME_ONLY = "resume_only"
+
+    def display_name(self) -> str:
+        """论文级展示名称（用于表格和图表）。"""
+        return {
+            "sequential": "Sequential",
+            "traditional_dag": "Traditional DAG",
+            "async_only": "Async-only",
+            "ooo_proposed": "OoO-proposed",
+            "lock_only": "Lock-only",
+            "resume_only": "Resume-only",
+        }.get(self.value, self.value)
 
 
 
@@ -320,10 +353,12 @@ class BenchmarkSuite:
         try:
             if self.mode == SchedulerMode.SEQUENTIAL:
                 await self._run_sequential(dag, lab_contexts, metrics)
+            elif self.mode == SchedulerMode.TRADITIONAL_DAG:
+                # TRADITIONAL_DAG = 论文中 Traditional DAG
+                # 行为与 ASYNC_ONLY 完全一致（按层并发），仅语义不同（后者用于机制拆解）
+                await self._run_async_only(dag, lab_contexts, metrics)
             elif self.mode == SchedulerMode.ASYNC_ONLY:
                 await self._run_async_only(dag, lab_contexts, metrics)
-            elif self.mode == SchedulerMode.OOO_LITE:
-                await self._run_ooo_lite(dag, lab_contexts, metrics, orchestrator)
             elif self.mode == SchedulerMode.LOCK_ONLY:
                 await self._run_lock_only(dag, lab_contexts, metrics, runtime)
             elif self.mode == SchedulerMode.RESUME_ONLY:
@@ -468,26 +503,6 @@ class BenchmarkSuite:
             level_tasks = [run_and_wait(n) for n in level if n.status == NodeStatus.PENDING]
             if level_tasks:
                 await asyncio.gather(*level_tasks, return_exceptions=True)
-
-    async def _run_ooo_lite(
-        self,
-        dag: DAGTaskGraph,
-        labs: dict[str, BenchmarkLabContext],
-        metrics: MetricsCollector,
-        orchestrator: DAGOrchestrator,
-    ) -> None:
-        """OoO-lite：有事件驱动恢复，无空间/时间维度机制。"""
-        orchestrator._ooo_max_wait_ms = 500.0  # 短等待窗口
-        await orchestrator.start()
-        await orchestrator.submit_dag(dag)
-        try:
-            await asyncio.wait_for(orchestrator._dag_complete_event.wait(), timeout=300.0)
-        except asyncio.TimeoutError:
-            pass
-        finally:
-            await orchestrator.shutdown()
-        # 同步 metrics
-        metrics.add_compute_time(100.0 * len(dag.nodes))
 
     async def _run_lock_only(
         self,
