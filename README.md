@@ -46,6 +46,216 @@ uv run python demo/demo_mission.py --lab DemoBio --mission "将培养舱温度�
 
 > **LLM 服务（可选）**：如果未启动 LLM 服务，Planner Agent 会自动降级为关键词匹配模式（demo-safe）。如需真实 LLM 推理，请确保 `config.yaml` 中配置的后端地址可达（Ollama / SGLang / vLLM）。
 
+---
+
+## 实验运行（论文级验证）
+
+AstroSASF 提供两套完整的论文级实验框架，用于验证 OoO-proposed 的性能优势。
+
+### 实验结构总览
+
+| 实验类型 | 入口文件 | 目的 | 输出表格 |
+|---------|---------|------|---------|
+| **主对比实验** | `experiments/comparator.py` | OoO-proposed vs 基线方法 | Table 1: 主对比 |
+| **消融实验** | `experiments/ablator.py` | 验证各内部机制的独立贡献 | Table 3: 消融 |
+
+**三种调度器模式（对应论文方法）：**
+
+| 模式 | 内部名称 | 含义 |
+|------|---------|------|
+| `Sequential` | `sequential` | 严格顺序执行，理论下界 |
+| `Traditional DAG` | `traditional_dag` | 层并发（asyncio.gather），无乱序/事件驱动 |
+| `OoO-proposed` | `ooo_proposed` | 完整乱序调度框架（全部机制启用） |
+
+---
+
+### 主对比实验（Main Comparison）
+
+**回答问题：** OoO-proposed 比传统基线好多少？
+
+**运行方式：**
+
+```bash
+# 方式一：命令行参数（推荐，快速验证）
+uv run python experiments/comparator.py \
+    --scenarios heavy_conflict global_shared diamond_deep \
+    --episodes 3 \
+    --speed 0.1
+
+# 方式二：编程调用（灵活定制）
+uv run python -c "
+import asyncio
+from experiments.comparator import run_main_comparison
+asyncio.run(run_main_comparison(
+    scenarios=['heavy_conflict', 'global_shared'],
+    episodes_per_scenario=3,
+    physical_delay_scale=0.1,
+    seed=42,
+))
+"
+
+# 方式三：指定输出目录
+uv run python experiments/comparator.py \
+    --output-dir results/my_main_exp \
+    --scenarios heavy_conflict \
+    --episodes 5
+```
+
+**参数说明：**
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--scenarios` | heavy_conflict, global_shared, diamond_deep | 场景类型列表 |
+| `--episodes` | 3 | 每个场景采样的 episode 数量 |
+| `--speed` | 0.1 | 物理延迟缩放因子（0.05~0.2，越小调度开销越明显） |
+| `--output-dir` | results/main_comparison | 输出目录 |
+| `--seed` | 42 | 随机种子（保证可复现） |
+
+**可用场景类型：**
+
+| 场景 | 说明 | 区分度 |
+|------|------|--------|
+| `no_conflict` | 线性 DAG，无资源竞争 | 低 |
+| `light_conflict` | 每层 2~3 节点同设备竞争 | 中 |
+| `heavy_conflict` | 每层 3~4 节点同设备竞争 | 高 |
+| `alarm_recovery` | 含 telemetry_alarm，触发抢占 | 高 |
+| `ooo_stress` | 深层宽 DAG，强制同设备竞争 + chaos | 最高 |
+| `global_shared` | 全局共享设备竞争（co2_controller） | 最高 |
+| `diamond_deep` | 深层钻石形依赖 | 最高 |
+
+---
+
+### 消融实验（Ablation）
+
+**回答问题：** OoO 内部的哪个机制贡献最大？
+
+**运行方式：**
+
+```bash
+# 方式一：命令行参数（推荐）
+uv run python experiments/ablator.py \
+    --scenarios heavy_conflict alarm_recovery diamond_deep \
+    --episodes 3 \
+    --speed 0.1
+
+# 方式二：编程调用
+uv run python -c "
+import asyncio
+from experiments.ablator import run_targeted_ablation
+asyncio.run(run_targeted_ablation(
+    scenarios=['heavy_conflict', 'global_shared'],
+    episodes_per_scenario=3,
+    physical_delay_scale=0.1,
+    seed=42,
+))
+"
+```
+
+**消融维度（当前已实现）：**
+
+| 维度 | 消融内容 | 论文展示名称 |
+|------|---------|------------|
+| `no_event_wakeup` | 禁用 OoO Scanner，改为轮询/阻塞等待 | No Event-Wakeup |
+| `no_orthogonality_check` | 禁用资源正交性检查，强制越级发射 | No Orthogonality Check |
+
+**实验结构（每次运行包含）：**
+
+1. **Sequential** 基线（理论下界）
+2. **Traditional DAG** 基线（层并发参照）
+3. 各**消融变体**（禁用特定机制）
+4. **★ Full Proposed** 完整方案（基准）
+
+---
+
+### 输出文件
+
+运行后结果保存在 `results/` 目录下（含时间戳）：
+
+```
+results/
+├── main_comparison_YYYYMMDD_HHMMSS/
+│   ├── all_results.csv     # 逐 episode 详细记录
+│   └── summary.json        # 汇总指标（含 speedup_vs_seq）
+├── ablation_YYYYMMDD_HHMMSS/
+│   ├── ablation_results.csv
+│   └── ablation_summary.json
+```
+
+**核心指标说明：**
+
+| 指标 | 说明 | 目标方向 |
+|------|------|---------|
+| `makespan_s` | 总执行时长（秒） | 越小越好 |
+| `overlap_ratio` | I/O-Compute 并行效率（0~1） | 越大越好 |
+| `ooo_promotion_count` | 越级调度次数 | 越多越好 |
+| `conflict_stall_time_ms` | 资源竞争导致的等待时间 | 越小越好 |
+| `speedup_vs_seq` | 相对于 Sequential 的加速比 | 越大越好 |
+| `success_rate` | 任务成功率 | 越大越好 |
+
+---
+
+### 实验设计原则
+
+1. **物理延迟缩放**：`physical_delay_scale` 控制模拟延迟倍率。设为 0.1 表示物理动作耗时为原始的 10%，调度开销占比更明显；设为 0.05 时物理动作更快，调度开销占比更大
+2. **场景选择**：论文主实验推荐使用 `heavy_conflict`、`global_shared`、`diamond_deep` 三个高区分度场景
+3. **Episode 数量**：快速验证用 `--episodes 1`，论文级结果建议 `--episodes 5`
+4. **随机种子**：`--seed 42` 保证结果可复现，论文投稿前建议用不同 seed 多次验证
+
+---
+
+### 实验示例输出
+
+**主对比表格（Table 1）示例：**
+
+```
+========================================================================================================
+  Table 1: 主实验结果 (Main Comparison, speed=0.1)
+========================================================================================================
+
+Scenario               Method              Makespan   SuccRate  Overlap  Conf.Stall  Promo#  Speedup
+----------------------------------------------------------------------------------------------------
+heavy_conflict        Sequential           12.340s     100.0%     0.0%    0.0           0    1.00x
+                      Traditional DAG      8.210s     100.0%    75.3%  10500.0       0    1.50x
+                      ★ Full Proposed      6.850s     100.0%    83.1%   3700.0      24    1.80x
+
+─────────────────────────────────────────────────────────────────────────────────────────────────────
+  OoO-proposed 相对于 Traditional DAG 的加速比（Makespan 降低）:
+─────────────────────────────────────────────────────────────────────────────────────────────────────
+  heavy_conflict        :   -16.6%  (8.210s → 6.850s)
+========================================================================================================
+```
+
+**消融表格（Table 3）示例：**
+
+```
+==============================================================================================================
+  Table 3: 消融实验 + 基线对比 (speed=0.1)
+==============================================================================================================
+
+  Part 1: 主对比（OoO-proposed vs 基线方法）
+--------------------------------------------------------------------------------------------------------------
+
+Variant                Makespan   SuccRate  Overlap  Conf.Stall  Promo#  Speedup
+----------------------------------------------------------------------------------------------------
+  Sequential           12.340s    100.0%     0.0%    0.0          0    1.00x
+  Traditional DAG       8.210s    100.0%    75.3%  10500.0       0    1.50x
+  ★ Full Proposed       6.850s    100.0%    83.1%   3700.0      24    1.80x
+
+  Part 2: 消融变体（验证内部机制贡献，相对 ★ Full Proposed）
+--------------------------------------------------------------------------------------------------------------
+
+Variant                Makespan    ΔMakespan   SuccRate  Overlap  Conf.Stall  Promo#  Speedup
+----------------------------------------------------------------------------------------------------
+  No Event-Wakeup      10.520s      +53.6%    100.0%    12.3%   8200.0       0    1.17x
+  No Orthogonality Check 8.940s   +30.5%    95.0%    68.0%  11500.0       0    1.38x
+==============================================================================================================
+
+★ = Full Proposed 基准行（完整方案）
+ΔMakespan: 消融相对于基准的变化（正值=变慢/变差，负值=变快/变好）
+Speedup: 相对于 Sequential 基线的加速比（越大越好）
+==============================================================================================================
+```
+
 
 ---
 

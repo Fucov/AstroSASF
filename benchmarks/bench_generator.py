@@ -315,7 +315,7 @@ class BenchmarkGenerator:
     def generate_tier2(self, count: int = 5, difficulty: DifficultyLevel = DifficultyLevel.MEDIUM) -> list[BenchmarkEpisode]:
         """Tier-2: 宽 DAG + 层内同设备竞争（激发 OoO Scanner 越级调度）。
 
-        关键设计：每层 2~3 个节点故意使用相同设备，在舱内制造资源竞争，
+        关键设计：每层 3~4 个节点故意使用相同设备，在舱内制造资源竞争，
         而非依赖跨舱共享设备。hardware_delay 在中间层触发，测试 OoO Scanner
         在设备持有期间发现并越级处理等待节点的能力。
         """
@@ -342,15 +342,15 @@ class BenchmarkGenerator:
             all_edges = []
             for lab in labs:
                 devices = list(self.LAB_DEVICE_MAP[lab])
-                # 强制同层竞争：每层 2~3 节点，全部用同一个设备类型
+                # 强制同层竞争：每层 3~4 节点，全部用同一个设备类型
                 nodes, edges = self._build_dag(
                     lab_id=lab,
                     devices=devices,
                     depth=dag_depth,
                     include_shared=False,
-                    min_nodes_per_level=2,
-                    max_nodes_per_level=3,
-                    force_competition_per_level=2,  # 每层强制 2 个节点竞争同设备
+                    min_nodes_per_level=3,
+                    max_nodes_per_level=4,
+                    force_competition_per_level=3,  # 每层强制 3 个节点竞争同设备
                 )
                 all_nodes.extend(nodes)
                 all_edges.extend(edges)
@@ -572,9 +572,9 @@ class BenchmarkGenerator:
             DifficultyLevel.HARD:   15,
         }
         nodes_per_level_map = {
-            DifficultyLevel.EASY:   4,
-            DifficultyLevel.MEDIUM: 5,
-            DifficultyLevel.HARD:   6,
+            DifficultyLevel.EASY:   5,
+            DifficultyLevel.MEDIUM: 6,
+            DifficultyLevel.HARD:   8,
         }
 
         dag_depth = dag_depth_map[difficulty]
@@ -859,11 +859,26 @@ class BenchmarkGenerator:
                 skill = skill_map.get(device, "generic_action")
                 node_id = f"{lab_id}-L{d}N{j}"
 
+                # ── 正确填充 required_devices ───────────────────────────────────
+                # force_device 是设备类型前缀（如 "vacuum"），需映射到舱专用设备 ID
+                base_type = force_device if force_device else device.split("_")[0] if "_" in device else device
+                cabin_dev_map: dict[str, dict[str, str]] = {
+                    "DemoBio":     {"heater": "heater_bio", "vacuum": "vacuum_bio", "arm": "arm_bio", "centrifuge": "centrifuge_bio", "sensor": "scan_bio", "co2": "co2_controller", "pump": "pump_bio"},
+                    "DemoMaterial":{"heater": "heater_mat", "vacuum": "vacuum_mat", "arm": "arm_mat"},
+                    "DemoFluid":   {"pump": "pump_fluid", "valve": "valve_fluid"},
+                    "DemoPlant":   {"heater": "heater_plant", "arm": "arm_plant", "pump": "pump_plant"},
+                }
+                # 若 base_type 是完整设备 ID（如 vacuum_bio），直接用
+                matched_dev = cabin_dev_map.get(lab_id, {}).get(base_type, base_type)
+                # 若找不到，尝试直接用 base_type（可能是完整设备 ID）
+                if matched_dev not in BENCHMARK_DEVICE_POOL:
+                    matched_dev = base_type
+
                 node = TaskNodeDef(
                     task_id=node_id,
                     skill_name=skill,
                     params=self._device_params(skill, device),
-                    required_devices=[device],
+                    required_devices=[matched_dev],
                     estimated_compute_ms=rng.uniform(30.0, 100.0),
                     priority=rng.choice(["NORMAL", "NORMAL", "HIGH"]),
                     resumable=True,

@@ -354,6 +354,9 @@ class MetricsCollector:
             "resume_latency_ms": round(avg_resume_latency_ms, 3),
             "prefix_routing_hit_rate": round(prefix_hit_rate, 4),
             "alarm_response_latency_ms": round(avg_alarm_ms, 3),
+            # ── 对比基线（speedup 需要外部传入 sequential_makespan_s）───────────────
+            "total_physical_ms": round(total_physical_ms, 3),
+            "device_util": round(device_util, 4),
             # ── 安全/稳定性 ───────────────────────────────────────────────────
             "success_rate": round(success_rate, 4),
             "safety_rejection_rate": round(safety_rejection_rate, 4),

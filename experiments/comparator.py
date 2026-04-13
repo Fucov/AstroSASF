@@ -12,9 +12,10 @@ AstroSASF · Experiments · Comparator
 - 每个场景类型均匀采样，确保可复现性
 - 输出适合直接写入论文的汇总表格
 - 物理延迟缩放因子 speed=0.1（中等速度，调度开销占比合理）
+- 计算 speedup_vs_seq（相对于 Sequential 基线的加速比）
 
 Author: AstroSASF Team
-Version: 9.0
+Version: 10.0
 """
 
 from __future__ import annotations
@@ -192,7 +193,10 @@ class Comparator:
         return out
 
     def _compute_summary(self) -> dict[str, Any]:
-        """按 baseline × scenario_type 汇总（均值）。"""
+        """按 baseline × scenario_type 汇总（均值），并计算 speedup_vs_seq。
+
+        speedup_vs_seq = sequential_makespan / method_makespan（越大越好）
+        """
         from collections import defaultdict
         groups: dict[str, dict[str, list]] = defaultdict(lambda: defaultdict(list))
 
@@ -211,6 +215,22 @@ class Comparator:
             if bs not in summary:
                 summary[bs] = {}
             summary[bs][sc] = {m: (sum(v) / len(v) if v else 0) for m, v in metrics.items()}
+
+        # 计算 speedup_vs_seq（相对于 Sequential）
+        all_scenarios = set()
+        for bs_data in summary.values():
+            all_scenarios.update(bs_data.keys())
+
+        for sc in all_scenarios:
+            seq_mk = summary.get("Sequential", {}).get(sc, {}).get("makespan_s", 0)
+            for bs, bs_data in summary.items():
+                if sc in bs_data:
+                    mk = bs_data[sc].get("makespan_s", 0)
+                    if seq_mk > 0 and mk > 0:
+                        bs_data[sc]["speedup_vs_seq"] = round(seq_mk / mk, 3)
+                    else:
+                        bs_data[sc]["speedup_vs_seq"] = 0.0
+
         return summary
 
     def _append_csv_row(self, path: Path, row: dict[str, Any]) -> None:
@@ -238,14 +258,14 @@ class Comparator:
             all_scenarios.update(bs_data.keys())
         scenarios_sorted = sorted(all_scenarios)
 
-        print(f"\n{'='*90}")
+        print(f"\n{'='*100}")
         print(f"  Table 1: 主实验结果 (Main Comparison, speed={self.config.physical_delay_scale})")
-        print(f"{'='*90}")
+        print(f"{'='*100}")
 
         # 表头
         print(f"\n{'Scenario':<22} {'Method':<18} {'Makespan':>9} {'SuccRate':>9} "
-              f"{'Overlap':>9} {'Conf.Stall':>12} {'Promo#':>7}")
-        print(f"{'-'*90}")
+              f"{'Overlap':>9} {'Conf.Stall':>11} {'Promo#':>7} {'Speedup':>8}")
+        print(f"{'-'*100}")
 
         for sc in scenarios_sorted:
             first = True
@@ -258,30 +278,33 @@ class Comparator:
                 count += 1
                 sc_label = sc if first else ""
                 bs_label = bs if count == 1 else bs
+                speedup = metrics.get("speedup_vs_seq", 0.0)
+                speedup_str = f"{speedup:>7.2f}x" if speedup > 0 else f"{'':>8}"
                 print(
                     f"{sc_label:<22} {bs_label:<18} "
                     f"{metrics.get('makespan_s', 0):>9.3f}s "
                     f"{metrics.get('success_rate', 0):>8.1%} "
                     f"{metrics.get('overlap_ratio', 0):>8.1%} "
-                    f"{metrics.get('conflict_stall_time_ms', 0):>11.1f} "
-                    f"{metrics.get('ooo_promotion_count', 0):>7.0f}"
+                    f"{metrics.get('conflict_stall_time_ms', 0):>10.1f} "
+                    f"{metrics.get('ooo_promotion_count', 0):>7.0f} "
+                    f"{speedup_str}"
                 )
                 if count == 1:
                     first = False
 
-        print(f"{'='*90}")
+        print(f"{'='*100}")
 
         # 打印 OoO-proposed vs Traditional DAG 的加速比
-        print(f"\n{'─'*90}")
+        print(f"\n{'─'*100}")
         print(f"  OoO-proposed 相对于 Traditional DAG 的加速比（Makespan 降低）:")
-        print(f"{'─'*90}")
+        print(f"{'─'*100}")
         for sc in scenarios_sorted:
             td = summary.get("Traditional DAG", {}).get(sc, {}).get("makespan_s", 0)
             oo = summary.get("OoO-proposed", {}).get(sc, {}).get("makespan_s", 0)
             if td > 0 and oo > 0:
                 improvement = (td - oo) / td * 100
-                print(f"  {sc:<22}: {improvement:>+.1f}%  ({td:.3f}s → {oo:.3f}s)")
-        print(f"{'─'*90}")
+                print(f"  {sc:<22}: {improvement:>+7.1f}%  ({td:.3f}s → {oo:.3f}s)")
+        print(f"{'─'*100}")
 
 
 # ────────────────────────────────────────────────────────────────────────────── #

@@ -464,6 +464,7 @@ class BenchmarkSuite:
                 continue
 
             node.mark_running()
+            metrics.record_task_submit(node.node_id, node.lab_id, node.skill_name, node.priority.value)
             await lab.run_single_task(
                 task_id=node.node_id,
                 skill_name=node.skill_name,
@@ -480,29 +481,41 @@ class BenchmarkSuite:
         labs: dict[str, BenchmarkLabContext],
         metrics: MetricsCollector,
     ) -> None:
-        """Async-only：异步提交但不乱序恢复。"""
-        ready = dag.get_ready_nodes()
-        tasks = []
+        """Async-only：按 DAG 层并发，同层 ready 节点全部并发提交（asyncio.gather）。
 
-        async def run_and_wait(node: DAGNode):
-            lab = labs.get(node.lab_id, list(labs.values())[0])
-            node.mark_running()
-            await lab.run_single_task(
-                task_id=node.node_id,
-                skill_name=node.skill_name,
-                params=node.params,
-                required_devices=self._extract_devices(node),
-                task_priority=node.priority.value,
-            )
-            node.mark_completed()
-            metrics.add_compute_time(node.params.get("estimated_compute_ms", 50.0))
-
-        # 逐层执行（有 DAG 依赖）
+        与 Traditional DAG 行为一致，仅用于机制拆解对比。
+        """
         levels = dag.get_execution_levels()
+
         for level in levels:
-            level_tasks = [run_and_wait(n) for n in level if n.status == NodeStatus.PENDING]
+            level_tasks = []
+            for n in level:
+                if n.status != NodeStatus.PENDING:
+                    continue
+                n.mark_running()
+                metrics.record_task_submit(n.node_id, n.lab_id, n.skill_name, n.priority.value)
+                level_tasks.append(self._async_only_node_task(n, labs, metrics))
+
             if level_tasks:
                 await asyncio.gather(*level_tasks, return_exceptions=True)
+
+    async def _async_only_node_task(
+        self,
+        node: DAGNode,
+        labs: dict[str, BenchmarkLabContext],
+        metrics: MetricsCollector,
+    ) -> None:
+        """Async-only 辅助：执行单个节点并埋点。"""
+        lab = labs.get(node.lab_id, list(labs.values())[0])
+        await lab.run_single_task(
+            task_id=node.node_id,
+            skill_name=node.skill_name,
+            params=node.params,
+            required_devices=self._extract_devices(node),
+            task_priority=node.priority.value,
+        )
+        node.mark_completed()
+        metrics.add_compute_time(node.params.get("estimated_compute_ms", 50.0))
 
     async def _run_lock_only(
         self,
@@ -516,6 +529,7 @@ class BenchmarkSuite:
         for node in sorted_nodes:
             lab = labs.get(node.lab_id, list(labs.values())[0])
             node.mark_running()
+            metrics.record_task_submit(node.node_id, node.lab_id, node.skill_name, node.priority.value)
 
             # 通过 DeviceRuntime 执行（含锁获取/释放）
             devices = self._extract_devices(node)
