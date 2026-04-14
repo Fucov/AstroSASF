@@ -393,37 +393,38 @@ class BenchmarkGenerator:
     ) -> list[BenchmarkEpisode]:
         """Tier-3-Mixed: 多设备混合竞争（OoO 越级核心测试场景）。
 
-        关键设计（使 OoO 明显领先 Traditional DAG）：
-        - 每层包含多种设备类型的节点（heater / vacuum / arm）
+        关键设计（确保 OoO 明显领先 Traditional DAG）：
+        - 每层包含多种设备类型的节点（heater / vacuum / arm / centrifuge）
+        - 增加长延迟设备比例（centrifuge: 60s, scan: 37s）
         - 设备多样性：不同设备节点可并行执行，不受同一资源限制
-        - OoO 优势：节点完成时立即越级执行，零等待
+        - OoO 优势：节点完成时立即越级执行空闲设备，零等待
         - Traditional DAG 劣势：必须等 Worker 从 ReadyQueue 取，有调度等待开销
 
         DAG 结构：
-        - depth 5~8 层，每层 4~6 个节点
-        - 每层包含 3~4 种不同设备类型
+        - depth 8~10 层，每层 5~8 个节点
+        - 每层包含 3~5 种不同设备类型
         - 钻石形依赖（diamond_mode）
         """
         episodes = []
         dag_depth_map = {
+            DifficultyLevel.EASY:   8,
+            DifficultyLevel.MEDIUM: 10,
+            DifficultyLevel.HARD:   12,
+        }
+        nodes_per_level_map = {
             DifficultyLevel.EASY:   5,
             DifficultyLevel.MEDIUM: 6,
             DifficultyLevel.HARD:   8,
         }
-        nodes_per_level_map = {
-            DifficultyLevel.EASY:   4,
-            DifficultyLevel.MEDIUM: 5,
-            DifficultyLevel.HARD:   6,
-        }
         delay_mult_map = {
-            DifficultyLevel.EASY:   1.5,
-            DifficultyLevel.MEDIUM: 2.0,
-            DifficultyLevel.HARD:   3.0,
+            DifficultyLevel.EASY:   2.0,
+            DifficultyLevel.MEDIUM: 3.0,
+            DifficultyLevel.HARD:   4.0,
         }
         chaos_mult_map = {
-            DifficultyLevel.EASY:   1.0,
-            DifficultyLevel.MEDIUM: 1.5,
-            DifficultyLevel.HARD:   2.5,
+            DifficultyLevel.EASY:   1.5,
+            DifficultyLevel.MEDIUM: 2.5,
+            DifficultyLevel.HARD:   4.0,
         }
 
         dag_depth = dag_depth_map[difficulty]
@@ -431,10 +432,10 @@ class BenchmarkGenerator:
         delay_mult = delay_mult_map[difficulty]
         chaos_mult = chaos_mult_map[difficulty]
 
-        # 使用 DemoBio（支持 heater/vacuum/arm，延迟适中）
+        # 使用 DemoBio（支持 heater/vacuum/arm/centrifuge/scan）
         labs = ["DemoBio"]
-        # 优先用低延迟设备：heater(10ms), arm(10ms), vacuum(20ms)，避免 centrifuge(500ms)
-        lab_devices = ["heater_bio", "vacuum_bio", "arm_bio"]
+        # 增加长延迟设备比例：centrifuge(60s), scan(37s)
+        lab_devices = ["heater_bio", "vacuum_bio", "arm_bio", "centrifuge_bio", "scan_bio"]
 
         for i in range(count):
             ep_id = f"t3-mixed-{difficulty.value}-{i+1:02d}"
@@ -460,11 +461,17 @@ class BenchmarkGenerator:
                     ChaosEventDef(
                         trigger_time_sec=self._random_float(1.0, 2.5),
                         type="hardware_delay",
-                        target_tool="heater_bio",
+                        target_tool="centrifuge_bio",
                         delay_multiplier=delay_mult,
                     ),
                     ChaosEventDef(
                         trigger_time_sec=self._random_float(2.0, 3.5),
+                        type="hardware_delay",
+                        target_tool="scan_bio",
+                        delay_multiplier=chaos_mult,
+                    ),
+                    ChaosEventDef(
+                        trigger_time_sec=self._random_float(3.0, 4.5),
                         type="hardware_delay",
                         target_tool="arm_bio",
                         delay_multiplier=chaos_mult,
@@ -548,47 +555,44 @@ class BenchmarkGenerator:
     def generate_tier3(self, count: int = 5, difficulty: DifficultyLevel = DifficultyLevel.MEDIUM) -> list[BenchmarkEpisode]:
         """Tier-3: 深层宽 DAG + 钻石形依赖（最强 OoO 激发场景）。
 
-        关键设计：
-        - depth 6~8 层，每层 3~4 个节点（大量节点）
+        关键设计（确保 OoO 明显领先 Traditional DAG）：
+        - depth 8~10 层，每层 4~6 个节点（大量节点）
+        - 每层使用多种设备（heater/vacuum/arm/centrifuge），增加并行机会
         - diamond_mode=True：所有节点依赖上一层所有节点（全连接扇入）
-        - 同层竞争 + 跨层钻石形，制造大量"条件满足但资源被占"的场景
-        - 长延迟设备 + hardware_delay，延长资源持有时间
+        - 同层多设备竞争 + 跨层钻石形，制造大量"条件满足但资源被占"的场景
         """
         episodes = []
-        long_devices = ["vacuum_bio", "centrifuge_bio", "vacuum_mat"]
-        delay_map = {
-            DifficultyLevel.EASY:   2.5,
-            DifficultyLevel.MEDIUM: 3.0,
-            DifficultyLevel.HARD:   4.0,
-        }
+        # 多种设备混合：heater(短), vacuum(中), arm(短), centrifuge(长), scan(长)
+        mixed_devices = ["heater_bio", "vacuum_bio", "arm_bio", "centrifuge_bio", "scan_bio"]
         dag_depth_map = {
-            DifficultyLevel.EASY:   6,
-            DifficultyLevel.MEDIUM: 7,
-            DifficultyLevel.HARD:   8,
+            DifficultyLevel.EASY:   8,
+            DifficultyLevel.MEDIUM: 10,
+            DifficultyLevel.HARD:   12,
+        }
+        nodes_per_level_map = {
+            DifficultyLevel.EASY:   4,
+            DifficultyLevel.MEDIUM: 5,
+            DifficultyLevel.HARD:   6,
         }
 
-        delay_mult = delay_map[difficulty]
         dag_depth = dag_depth_map[difficulty]
+        num_per_level = nodes_per_level_map[difficulty]
         labs = self._random_choice(list(self.LAB_DEVICE_MAP.keys()), k=2)
 
         for i in range(count):
             ep_id = f"t3-diamond-{difficulty.value}-{i+1:02d}"
-            long_dev = self._random_choice(long_devices)
 
             all_nodes = []
             all_edges = []
             for lab in labs:
                 devices = list(self.LAB_DEVICE_MAP[lab])
-                nodes, edges = self._build_dag(
+                # 使用混合设备构建 DAG，每层循环分配不同设备
+                nodes, edges = self._build_dag_mixed(
                     lab_id=lab,
-                    devices=devices,
+                    devices=mixed_devices,
                     depth=dag_depth,
-                    include_shared=False,
-                    force_device=long_dev,          # 强制使用长延迟设备
-                    min_nodes_per_level=3,
-                    max_nodes_per_level=4,
-                    force_competition_per_level=3,   # 每层 3 个节点强竞争
-                    diamond_mode=True,               # 钻石形全连接依赖
+                    nodes_per_level=num_per_level,
+                    diamond_mode=True,
                 )
                 all_nodes.extend(nodes)
                 all_edges.extend(edges)
@@ -597,7 +601,7 @@ class BenchmarkGenerator:
                 episode_id=ep_id,
                 scenario_type=ScenarioType.HEAVY_CONFLICT,
                 difficulty=difficulty,
-                description=f"[Tier-3] {difficulty.value} 钻石DAG+深层竞争：{dag_depth}层×3~4节点，{long_dev}长延迟，OoO越级核心测试",
+                description=f"[Tier-3] {difficulty.value} 钻石DAG+深层竞争：{dag_depth}层×{num_per_level}节点，多设备混合，OoO越级核心测试",
                 cabins=labs,
                 task_graph=TaskGraphDef(nodes=all_nodes, edges=all_edges),
                 device_requirements=self._build_device_reqs([], labs, shared=False),
@@ -606,8 +610,8 @@ class BenchmarkGenerator:
                     ChaosEventDef(
                         trigger_time_sec=self._random_float(2.0, 4.0),
                         type="hardware_delay",
-                        target_tool=long_dev,
-                        delay_multiplier=delay_mult,
+                        target_tool="centrifuge_bio",
+                        delay_multiplier=4.0,
                     )
                 ],
                 expected_outcomes={

@@ -34,6 +34,7 @@ if str(_PROJECT_ROOT) not in sys.path:
 
 from scheduler.core import DAGNode, DAGOrchestrator, DAGTaskGraph, NodeStatus, TaskPriority
 from scheduler.device_model import (
+    DEFAULT_DEVICE_REGISTRY,
     DeviceScope,
     DeviceType,
 )
@@ -130,8 +131,15 @@ class BenchmarkLabContext:
         params: dict[str, Any] | None = None,
         required_devices: list[str] | None = None,
         task_priority: int = 2,
+        blocking: bool = True,
     ) -> dict[str, Any]:
         """执行单个任务（含 metrics 埋点和 chaos 注入）。
+
+        Parameters
+        ----------
+        blocking : bool
+            True = 阻塞等待锁释放（默认行为）
+            False = 非阻塞，设备忙时立即返回失败（用于 OoO 越级调度）
 
         签名与 scheduler.core.DAGOrchestrator._execute_node() 保持一致。
         """
@@ -161,6 +169,7 @@ class BenchmarkLabContext:
                 lab_id=self.lab_id,
                 cabin_id=self.lab_id,
                 telemetry_snapshot=dict(self._telemetry),
+                blocking=blocking,
             )
 
             # 更新遥测
@@ -236,13 +245,18 @@ class BenchmarkSuite:
         chaos_events: list[Any],
     ) -> tuple[DeviceRuntime, MetricsCollector]:
         """创建 DeviceRuntime + MetricsCollector。"""
-        # 选择性注入设备（只注入本 episode 需要的）
-        registry = {}
+        # 首先添加所有默认设备（确保基础设备始终可用）
+        registry: dict[str, Any] = {}
+        for dev_id, schema in DEFAULT_DEVICE_REGISTRY.items():
+            registry[dev_id] = schema
+
+        # 然后添加 benchmark 专用设备（会覆盖默认设备）
+        for dev_id, schema in BENCHMARK_DEVICE_POOL.items():
+            registry[dev_id] = schema
+
+        # 最后添加本 episode 需要的设备（兜底，防止遗漏）
         for dev_id in device_ids:
-            if dev_id in BENCHMARK_DEVICE_POOL:
-                registry[dev_id] = BENCHMARK_DEVICE_POOL[dev_id]
-            else:
-                # 未知设备，使用默认 generic schema
+            if dev_id not in registry:
                 registry[dev_id] = type("GenericDevice", (), {
                     "device_id": dev_id,
                     "device_type": DeviceType.GENERIC,

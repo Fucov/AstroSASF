@@ -197,20 +197,22 @@ class DeviceLockManager:
         lab_id: str,
         priority: int = 2,
         timeout: float = 30.0,
+        blocking: bool = True,
     ) -> tuple[bool, str | None]:
-        """尝试原子获取设备锁。
+        """尝试获取设备锁。
 
-        Returns
-        -------
-        tuple[bool, str | None]
-            (acquired, wait_reason)
-            acquired=True → 成功
-            acquired=False, "device_busy" → 设备被占用
-            acquired=False, "scope_denied" → 舱无权限（由 DeviceRuntime 在调用前检查）
+        Parameters
+        ----------
+        blocking : bool
+            True = 阻塞等待锁释放（默认行为）
+            False = 非阻塞，立即返回（用于 OoO 越级调度）
         """
         async with self._lock:
             entry = self._locks.get(device_id)
             if entry is not None:
+                if not blocking:
+                    # 非阻塞模式：立即返回失败，不等待
+                    return False, "device_busy"
                 self._total_contention_events += 1
                 return False, "device_busy"
 
@@ -354,8 +356,15 @@ class DeviceRuntime:
         lab_id: str,
         cabin_id: str,
         telemetry_snapshot: dict[str, Any] | None = None,
+        blocking: bool = True,
     ) -> DeviceResult:
         """统一设备调用入口。
+
+        Parameters
+        ----------
+        blocking : bool
+            True = 阻塞等待锁释放（默认行为）
+            False = 非阻塞，立即返回失败（用于 OoO 越级调度）
 
         完整调用链：
         1. scope 检查（cabin_exclusive / white-list）
@@ -416,13 +425,32 @@ class DeviceRuntime:
             device_id=device_id,
             task_id=task_id,
             lab_id=lab_id,
+            blocking=blocking,
         )
         contention_wait_ms = 0.0
         if not acquired:
-            lock_owner = self._lock_mgr.get_lock_owner(device_id)
-            wait_reason = "device_busy"
-            got_lock, contention_wait_ms = await self._lock_mgr.wait_for_unlock(device_id, task_id)
-            if not got_lock:
+            if blocking:
+                # 阻塞模式：等待锁释放
+                lock_owner = self._lock_mgr.get_lock_owner(device_id)
+                wait_reason = "device_busy"
+                got_lock, contention_wait_ms = await self._lock_mgr.wait_for_unlock(device_id, task_id)
+                if not got_lock:
+                    return DeviceResult(
+                        device_id=device_id,
+                        action=action,
+                        params=params,
+                        task_id=task_id,
+                        lab_id=lab_id,
+                        start_ts=start_ts,
+                        end_ts=time.monotonic(),
+                        wait_reason="timeout",
+                        lock_owner=lock_owner,
+                        status="timeout",
+                    )
+                lock_owner = None
+            else:
+                # 非阻塞模式：立即返回
+                lock_owner = self._lock_mgr.get_lock_owner(device_id)
                 return DeviceResult(
                     device_id=device_id,
                     action=action,
@@ -431,11 +459,10 @@ class DeviceRuntime:
                     lab_id=lab_id,
                     start_ts=start_ts,
                     end_ts=time.monotonic(),
-                    wait_reason="timeout",
+                    wait_reason="device_busy",
                     lock_owner=lock_owner,
-                    status="timeout",
+                    status="device_busy",
                 )
-            lock_owner = None
 
         try:
             # ── Step 3: Chaos 注入检查 ──────────────────────────────────────────

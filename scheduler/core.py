@@ -753,16 +753,20 @@ class DAGOrchestrator:
     async def _ooo_direct_execute(self, node: DAGNode, locks_held: bool = False) -> None:
         """OoO 越级直接执行单个节点（不经过 ReadyQueue）。
 
-        与 Worker 执行的区别：直接调用 lab.run_single_task()，
-        不从 ReadyQueue 取节点，没有调度等待开销。
+        关键：使用非阻塞锁获取（blocking=False）。
+        如果设备正忙，立即返回 False，让节点回到 ReadyQueue 等待。
+        这使得 OoO 真正"越级"执行空闲设备上的任务，而不是等待被占用的设备。
         """
         lab = self._labs.get(node.lab_id)
         if lab is None:
             await self._resource_table.release(node.node_id)
             node.status = NodeStatus.READY
             return
+
         node.mark_running()
         self._running_nodes[node.node_id] = node
+
+        # 使用非阻塞模式：设备忙时立即返回，不等待
         try:
             result = await lab.run_single_task(
                 task_id=node.node_id,
@@ -770,7 +774,22 @@ class DAGOrchestrator:
                 params=node.params,
                 required_devices=self._extract_required_devices(node),
                 task_priority=node.priority.value,
+                blocking=False,  # 非阻塞：设备忙时立即失败
             )
+
+            # 检查结果：如果设备忙，返回 ReadyQueue
+            if isinstance(result, dict) and result.get("status") == "device_busy":
+                # 设备正忙，释放 ART 锁，将节点放回 ReadyQueue
+                node.status = NodeStatus.READY
+                await self._ready_queue.put((node.get_ready_score(), node))
+                self._running_nodes.pop(node.node_id, None)
+                await self._resource_table.release(node.node_id)
+                logger.debug(
+                    "[OoO-Direct] 设备忙，跳过: '%s' (skill=%s)",
+                    node.node_id, node.skill_name,
+                )
+                return
+
             node.mark_completed(result)
         except Exception:
             node.mark_failed("OoO越级执行异常")
@@ -965,9 +984,9 @@ class DAGOrchestrator:
     async def _ooo_try_promote_one(self, already_locked: bool = False) -> int:
         """V8.0 新增：尝试越级执行一个节点（绕过 ReadyQueue 直接执行）。
 
-        与传统调度不同，OoO-promotion 的核心是"越级执行"：
+        关键改进：使用非阻塞锁获取（blocking=False）。
         - 传统调度：节点完成 → 依赖满足的节点入 ReadyQueue → Worker 从 ReadyQueue 取节点执行
-        - OoO-promotion：节点完成 → 立即尝试直接执行越级节点（不经过 ReadyQueue）
+        - OoO-promotion：节点完成 → 立即尝试非阻塞越级执行 → 设备空闲则执行，设备忙则跳过
 
         Args:
             already_locked: 如果在持有 _ooo_lock 的上下文中调用，设为 True。
@@ -1019,15 +1038,13 @@ class DAGOrchestrator:
                     # 从 BlockedQueue 移除
                     self._blocked_queue = [n for n in self._blocked_queue if n.node_id != node.node_id]
 
-                    # V8.0 OoO-promotion：绕过 ReadyQueue，直接执行节点！
-                    # 获取节点的 lab
+                    # V8.0 OoO-promotion：绕过 ReadyQueue，使用非阻塞锁直接执行！
                     lab = self._labs.get(node.lab_id)
                     if lab is not None:
-                        # 标记节点状态
                         node.mark_running()
                         self._running_nodes[node.node_id] = node
 
-                        # 直接执行（不经过 ReadyQueue）
+                        # 非阻塞执行：设备忙时立即返回
                         try:
                             result = await lab.run_single_task(
                                 task_id=node.node_id,
@@ -1035,13 +1052,22 @@ class DAGOrchestrator:
                                 params=node.params,
                                 required_devices=self._extract_required_devices(node),
                                 task_priority=node.priority.value,
+                                blocking=False,  # 非阻塞：核心优化！
                             )
+
+                            # 检查结果：设备忙时放回 ReadyQueue
+                            if isinstance(result, dict) and result.get("status") == "device_busy":
+                                node.status = NodeStatus.READY
+                                await self._ready_queue.put((node.get_ready_score(), node))
+                                self._running_nodes.pop(node.node_id, None)
+                                await self._resource_table.release(node.node_id)
+                                continue
+
                             node.mark_completed(result)
                         except Exception as exc:
                             logger.exception("[OoO-Promote] 节点执行失败: %s", node.node_id)
                             node.mark_failed(str(exc))
 
-                        # 清理并结算
                         self._running_nodes.pop(node.node_id, None)
                         self._completed_nodes.append(node)
                         await self._resource_table.release(node.node_id)
