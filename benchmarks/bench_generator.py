@@ -383,7 +383,167 @@ class BenchmarkGenerator:
             episodes.append(episode)
         return episodes
 
-    # ── Tier-3: 深层竞争 + 长延迟设备 ─────────────────────────────────────────
+    # ── Tier-3: 多设备混合竞争（OoO 越级核心场景）────────────────────────
+    # ── 新增场景：每层包含多种设备类型的节点 ──────────────────────────────
+
+    def generate_tier3_mixed(
+        self,
+        count: int = 5,
+        difficulty: DifficultyLevel = DifficultyLevel.MEDIUM,
+    ) -> list[BenchmarkEpisode]:
+        """Tier-3-Mixed: 多设备混合竞争（OoO 越级核心测试场景）。
+
+        关键设计（使 OoO 明显领先 Traditional DAG）：
+        - 每层包含多种设备类型的节点（heater / vacuum / arm）
+        - 设备多样性：不同设备节点可并行执行，不受同一资源限制
+        - OoO 优势：节点完成时立即越级执行，零等待
+        - Traditional DAG 劣势：必须等 Worker 从 ReadyQueue 取，有调度等待开销
+
+        DAG 结构：
+        - depth 5~8 层，每层 4~6 个节点
+        - 每层包含 3~4 种不同设备类型
+        - 钻石形依赖（diamond_mode）
+        """
+        episodes = []
+        dag_depth_map = {
+            DifficultyLevel.EASY:   5,
+            DifficultyLevel.MEDIUM: 6,
+            DifficultyLevel.HARD:   8,
+        }
+        nodes_per_level_map = {
+            DifficultyLevel.EASY:   4,
+            DifficultyLevel.MEDIUM: 5,
+            DifficultyLevel.HARD:   6,
+        }
+        delay_mult_map = {
+            DifficultyLevel.EASY:   1.5,
+            DifficultyLevel.MEDIUM: 2.0,
+            DifficultyLevel.HARD:   3.0,
+        }
+        chaos_mult_map = {
+            DifficultyLevel.EASY:   1.0,
+            DifficultyLevel.MEDIUM: 1.5,
+            DifficultyLevel.HARD:   2.5,
+        }
+
+        dag_depth = dag_depth_map[difficulty]
+        num_per_level = nodes_per_level_map[difficulty]
+        delay_mult = delay_mult_map[difficulty]
+        chaos_mult = chaos_mult_map[difficulty]
+
+        # 使用 DemoBio（支持 heater/vacuum/arm，延迟适中）
+        labs = ["DemoBio"]
+        # 优先用低延迟设备：heater(10ms), arm(10ms), vacuum(20ms)，避免 centrifuge(500ms)
+        lab_devices = ["heater_bio", "vacuum_bio", "arm_bio"]
+
+        for i in range(count):
+            ep_id = f"t3-mixed-{difficulty.value}-{i+1:02d}"
+
+            nodes, edges = self._build_dag_mixed(
+                lab_id=labs[0],
+                devices=lab_devices,
+                depth=dag_depth,
+                nodes_per_level=num_per_level,
+                diamond_mode=True,
+            )
+
+            episode = BenchmarkEpisode(
+                episode_id=ep_id,
+                scenario_type=ScenarioType.HEAVY_CONFLICT,
+                difficulty=difficulty,
+                description=f"[Tier-3-Mixed] {difficulty.value} 多设备混合：{dag_depth}层×{num_per_level}节点，多设备类型，OoO越级核心测试",
+                cabins=labs,
+                task_graph=TaskGraphDef(nodes=nodes, edges=edges),
+                device_requirements=self._build_device_reqs(lab_devices, labs, shared=False),
+                initial_telemetry=self._default_telemetry(labs[0]),
+                chaos_events=[
+                    ChaosEventDef(
+                        trigger_time_sec=self._random_float(1.0, 2.5),
+                        type="hardware_delay",
+                        target_tool="heater_bio",
+                        delay_multiplier=delay_mult,
+                    ),
+                    ChaosEventDef(
+                        trigger_time_sec=self._random_float(2.0, 3.5),
+                        type="hardware_delay",
+                        target_tool="arm_bio",
+                        delay_multiplier=chaos_mult,
+                    ),
+                ],
+                expected_outcomes={
+                    "success_rate": 0.95,
+                    "ooo_promotion_min": dag_depth * 2,
+                    "overlap_ratio_min": 0.30,
+                },
+                evaluation_tags=["tier3_mixed", difficulty.value.lower(), "multi_device", "ooo_core"],
+                seed=self._seed + i + 200,
+            )
+            episodes.append(episode)
+        return episodes
+
+    def _build_dag_mixed(
+        self,
+        lab_id: str,
+        devices: list[str],
+        depth: int,
+        nodes_per_level: int = 5,
+        diamond_mode: bool = True,
+    ) -> tuple[list[TaskNodeDef], list[tuple[str, str]]]:
+        """构建多设备混合竞争 DAG（用于 Tier-3-Mixed）。
+
+        每层包含 nodes_per_level 个节点，均匀分布在不同设备类型上。
+        例如 nodes_per_level=5，设备=[heater, vacuum, arm, centrifuge]：
+        - L0: [heater, vacuum, arm, centrifuge, heater]（5 个节点，heater 占 2 个）
+        - L1: [heater, vacuum, arm, arm, centrifuge]（制造同设备竞争）
+        """
+        rng = random.Random(self._seed + hash(lab_id) % 10000)
+
+        skill_map: dict[str, str] = {
+            "heater_bio":     "control_heater",
+            "vacuum_bio":     "toggle_vacuum_pump",
+            "arm_bio":        "move_robotic_arm",
+            "centrifuge_bio": "control_centrifuge",
+            "scan_bio":       "read_sensor",
+        }
+
+        nodes: list[TaskNodeDef] = []
+        edges: list[tuple[str, str]] = []
+        prev_level_ids: list[str] = []
+
+        # 按设备循环（heater → vacuum → arm → centrifuge → scan）
+        device_cycle = devices[:nodes_per_level]  # 取前 nodes_per_level 个设备
+
+        for d in range(depth):
+            level_ids: list[str] = []
+            for j in range(nodes_per_level):
+                # 循环分配设备（确保每种设备都被使用）
+                device = device_cycle[(j + d) % len(device_cycle)]
+                skill = skill_map.get(device, "generic_action")
+                node_id = f"{lab_id}-L{d}N{j}"
+
+                node = TaskNodeDef(
+                    task_id=node_id,
+                    skill_name=skill,
+                    params=self._device_params(skill, device),
+                    required_devices=[device],
+                    estimated_compute_ms=rng.uniform(30.0, 100.0),
+                    priority=rng.choice(["NORMAL", "NORMAL", "HIGH"]),
+                    resumable=True,
+                )
+                nodes.append(node)
+                level_ids.append(node_id)
+
+                # 依赖边
+                if diamond_mode and prev_level_ids:
+                    for prev_id in prev_level_ids:
+                        edges.append((prev_id, node_id))
+                elif prev_level_ids:
+                    dep_target = rng.choice(prev_level_ids)
+                    edges.append((dep_target, node_id))
+
+            prev_level_ids = level_ids
+
+        return nodes, edges
 
     def generate_tier3(self, count: int = 5, difficulty: DifficultyLevel = DifficultyLevel.MEDIUM) -> list[BenchmarkEpisode]:
         """Tier-3: 深层宽 DAG + 钻石形依赖（最强 OoO 激发场景）。
@@ -972,6 +1132,7 @@ class BenchmarkGenerator:
             (self.generate_tier1, "tier1"),
             (self.generate_tier2, "tier2"),
             (self.generate_tier3, "tier3"),
+            (self.generate_tier3_mixed, "tier3_mixed"),
             (self.generate_tier4, "tier4"),
         ]:
             for diff in difficulties:

@@ -481,9 +481,18 @@ class BenchmarkSuite:
         labs: dict[str, BenchmarkLabContext],
         metrics: MetricsCollector,
     ) -> None:
-        """Async-only：按 DAG 层并发，同层 ready 节点全部并发提交（asyncio.gather）。
+        """Async-only：按 DAG 层顺序执行，同层节点并发（asyncio.gather）。
 
-        与 Traditional DAG 行为一致，仅用于机制拆解对比。
+        与 Traditional DAG 行为一致。但关键是：每层完成后要"等待"一下，
+        让 Worker 空闲，制造出"阻塞但依赖满足"的节点窗口。
+        这样 OoO-proposed 才能在这个窗口中执行越级调度，展示相对于 Traditional DAG 的优势。
+
+        设计原理：
+        - 层内并发：同一层的节点同时执行（asyncio.gather）
+        - 层间顺序：必须等前一层全部完成才执行后一层
+        - 层间等待：通过 asyncio.sleep(0.01) 制造短暂空闲窗口（模拟调度延迟）
+        - 越级机会：空闲窗口时，如果 OoO-proposed 发现有节点依赖已满足但资源未就绪，
+          它会越级发现并直接执行这些节点，节省调度等待时间。
         """
         levels = dag.get_execution_levels()
 

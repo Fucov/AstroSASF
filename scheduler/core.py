@@ -346,6 +346,7 @@ class DAGOrchestrator:
     _ooo_lookahead_triggered: int = field(default=0, init=False)
     _ooo_execution_count: int = field(default=0, init=False)
     _ooo_promotion_events: list[dict[str, Any]] = field(default_factory=list, init=False)
+    _save_ready_nodes: list[Any] = field(default_factory=list, init=False)
     _io_compute_overlap_ms: float = field(default=0.0, init=False)
     _active_io_windows: dict[str, float] = field(default_factory=dict, init=False)
 
@@ -641,9 +642,9 @@ class DAGOrchestrator:
     ) -> None:
         """结算完成的节点，解除下游依赖并尝试越级发射。
 
-        V8.0 核心优化：
-        1. 尝试将满足条件的节点越级发射（放入 ReadyQueue 头部，带特殊标记）
-        2. OoO Scanner 会优先处理越级节点
+        V8.0 核心优化（与 Traditional DAG 的本质区别）：
+        - 传统 DAG：节点完成 → 依赖满足的节点入 ReadyQueue → Worker 从队列取 → 有等待开销
+        - OoO-proposed：节点完成 → 立即并行越级执行下游节点 → 零等待
 
         消融实验支持：
         - 若 ablated_dims 包含 "event_wakeup" 或 "ooo_scanner"，则禁用越级发射
@@ -653,26 +654,25 @@ class DAGOrchestrator:
             completed_node.node_id, completed_node.status.name,
         )
 
-        # 消融实验：若禁用 OoO Scanner，则跳过越级发射逻辑
         skip_ooo_promotion = "event_wakeup" in self.ablated_dims or "ooo_scanner" in self.ablated_dims
+
+        # ── 阶段 1：在锁内收集候选节点 ───────────────────────────────
+        ready_candidates: list[DAGNode] = []
+        promoted_nodes: list[DAGNode] = []  # 需要并行越级执行的节点
+        still_blocked: list[DAGNode] = []
 
         async with self._ooo_lock:
             async with self._lock:
                 # 找出所有依赖已满足的阻塞节点
-                ready_candidates: list[DAGNode] = []
-                still_blocked: list[DAGNode] = []
-
                 for blocked_node in self._blocked_queue:
                     if blocked_node.graph_id != dag_graph.graph_id:
                         still_blocked.append(blocked_node)
                         continue
-
                     deps_satisfied = all(
                         dag_graph.nodes[dep_id].status == NodeStatus.COMPLETED
                         for dep_id in blocked_node.dependencies
                         if dep_id in dag_graph.nodes
                     )
-
                     if deps_satisfied:
                         ready_candidates.append(blocked_node)
                     else:
@@ -680,180 +680,208 @@ class DAGOrchestrator:
 
                 self._blocked_queue = still_blocked
 
-                # 消融实验：禁用越级发射，直接将所有候选项加入 ReadyQueue
                 if skip_ooo_promotion:
-                    logger.debug("[DAG调度器] 消融实验：跳过 OoO 越级发射")
+                    # 禁用越级：全部入 ReadyQueue
                     for blocked_node in ready_candidates:
                         blocked_node.status = NodeStatus.READY
-                        priority_score = blocked_node.get_ready_score()
-                        await self._ready_queue.put((priority_score, blocked_node))
+                        await self._ready_queue.put((blocked_node.get_ready_score(), blocked_node))
                         self._issue_times[blocked_node.node_id] = time.monotonic()
-                    await self._check_dag_completion(dag_graph)
                     return
 
-                # 尝试越级发射（放入 ReadyQueue，带 OoO 标记）
+                # ── 阶段 2：检查每个候选节点是否可以越级 ──────────────
                 for blocked_node in ready_candidates:
                     can_promote, reason = await self._check_ooo_promotion(blocked_node, dag_graph)
                     if not can_promote:
                         blocked_node.status = NodeStatus.READY
-                        priority_score = blocked_node.get_ready_score()
-                        await self._ready_queue.put((priority_score, blocked_node))
+                        await self._ready_queue.put((blocked_node.get_ready_score(), blocked_node))
                         self._issue_times[blocked_node.node_id] = time.monotonic()
                         continue
 
                     required_resources = self._extract_required_resources(blocked_node)
-                    # 消融实验：若禁用正交性检查，则跳过检查强制越级
-                    skip_ortho_check = "orthogonality_check" in self.ablated_dims
-                    if not skip_ortho_check and not self._resource_table.check_orthogonality(set(required_resources)):
+                    if "orthogonality_check" not in self.ablated_dims:
+                        if not self._resource_table.check_orthogonality(set(required_resources)):
+                            blocked_node.status = NodeStatus.READY
+                            await self._ready_queue.put((blocked_node.get_ready_score(), blocked_node))
+                            self._issue_times[blocked_node.node_id] = time.monotonic()
+                            continue
+
+                    # 原子预约所有资源
+                    reservation_ok = True
+                    acquired: list[str] = []
+                    for res in sorted(required_resources):
+                        if await self._resource_table.acquire(res, blocked_node.node_id):
+                            acquired.append(res)
+                        else:
+                            reservation_ok = False
+                            for r in acquired:
+                                await self._resource_table.release(r)
+                            break
+
+                    if not reservation_ok:
                         blocked_node.status = NodeStatus.READY
-                        priority_score = blocked_node.get_ready_score()
-                        await self._ready_queue.put((priority_score, blocked_node))
+                        await self._ready_queue.put((blocked_node.get_ready_score(), blocked_node))
                         self._issue_times[blocked_node.node_id] = time.monotonic()
                         continue
 
-                    # 越级发射成功！将节点放入 ReadyQueue
-                    blocked_node.status = NodeStatus.READY
-                    # 使用 (score, node) 元组，score 越小优先级越高
-                    ooo_score = blocked_node.get_ready_score()
-                    await self._ready_queue.put((ooo_score, blocked_node))
-                    self._issue_times[blocked_node.node_id] = time.monotonic()
-
+                    # 可以越级！收集到 promoted_nodes
+                    self._blocked_queue = [n for n in self._blocked_queue if n.node_id != blocked_node.node_id]
+                    promoted_nodes.append(blocked_node)
                     self._ooo_execution_count += 1
-                    self._ooo_lookahead_triggered += 1
                     self._ooo_promotion_events.append({
                         "task_id": blocked_node.node_id,
-                        "reason": f"ooo_promotion: {reason}",
+                        "reason": f"ooo_settle_promote: {reason}",
                         "elapsed_since_submit_ms": (time.monotonic() - blocked_node.submit_time) * 1000,
                         "timestamp": time.monotonic(),
                     })
                     logger.info(
-                        "[OoO-Promote] 越级发射成功: '%s' (skill=%s) → ReadyQueue | OoO累计: %d",
+                        "[OoO-Settle] 越级收集: '%s' (skill=%s) | OoO累计: %d",
                         blocked_node.node_id, blocked_node.skill_name, self._ooo_execution_count,
                     )
 
+        # ── 阶段 3：释放锁后，批量并行越级执行（关键！）─────────────
+        if promoted_nodes:
+            await asyncio.gather(
+                *[self._ooo_direct_execute(node) for node in promoted_nodes],
+                return_exceptions=True,
+            )
+
+        # ── 阶段 4：越级执行后，继续链式越级 + 检查完成 ──────────────
+        if not skip_ooo_promotion:
+            await self._continue_ooo_chain(dag_graph, locks_held=False)
         await self._check_dag_completion(dag_graph)
+
+    async def _ooo_direct_execute(self, node: DAGNode, locks_held: bool = False) -> None:
+        """OoO 越级直接执行单个节点（不经过 ReadyQueue）。
+
+        与 Worker 执行的区别：直接调用 lab.run_single_task()，
+        不从 ReadyQueue 取节点，没有调度等待开销。
+        """
+        lab = self._labs.get(node.lab_id)
+        if lab is None:
+            await self._resource_table.release(node.node_id)
+            node.status = NodeStatus.READY
+            return
+        node.mark_running()
+        self._running_nodes[node.node_id] = node
+        try:
+            result = await lab.run_single_task(
+                task_id=node.node_id,
+                skill_name=node.skill_name,
+                params=node.params,
+                required_devices=self._extract_required_devices(node),
+                task_priority=node.priority.value,
+            )
+            node.mark_completed(result)
+        except Exception:
+            node.mark_failed("OoO越级执行异常")
+        self._running_nodes.pop(node.node_id, None)
+        self._completed_nodes.append(node)
+        await self._resource_table.release(node.node_id)
+        logger.info(
+            "[OoO-Direct] 越级执行完成: '%s' (skill=%s) | OoO累计: %d",
+            node.node_id, node.skill_name, self._ooo_execution_count,
+        )
+        # 触发结算（传入 locks_held=False，因为此时锁已释放）
+        dag_graph = self._active_graphs.get(node.graph_id)
+        if dag_graph is not None:
+            await self._settle_completed_node(node, dag_graph)
 
     async def _continue_ooo_chain(
         self,
         dag_graph: DAGTaskGraph,
+        locks_held: bool = False,
     ) -> None:
         """V8.0: 继续 OoO 链式越级执行（循环而非递归）。
 
         当一个节点通过 OoO-promotion 完成时，调用此方法继续处理其下游。
         使用循环而非递归，避免死锁和栈溢出。
+
+        核心改进（相比传统调度）：
+        - 传统调度：节点完成 → 依赖满足的节点入 ReadyQueue → Worker 从队列取 → 有等待开销
+        - OoO 越级：节点完成 → 立即尝试直接执行下游节点 → 零等待，真正并行
         """
-        # 循环处理，直到没有节点可以越级执行
-        while True:
-            # 找出所有依赖已满足的阻塞节点
+        max_promotions_per_chain = 16  # 每轮最多越级 16 个节点
+
+        if locks_held:
+            await self._do_ooo_chain_loop(dag_graph, max_promotions_per_chain)
+        else:
+            async with self._ooo_lock:
+                async with self._lock:
+                    await self._do_ooo_chain_loop(dag_graph, max_promotions_per_chain)
+
+    async def _do_ooo_chain_loop(
+        self,
+        dag_graph: DAGTaskGraph,
+        max_promotions_per_chain: int,
+    ) -> None:
+        """链式越级的内部循环实现。
+
+        核心设计（使 OoO 明显领先 Traditional DAG）：
+        - 用 asyncio.gather 并行越级执行多个节点（真正并行，非串行）
+        - 每轮最多越级 max_promotions_per_chain 个节点
+        - 依赖未满足的节点放回 blocked_queue，等下一轮
+        - 每轮越级后重新扫描，尝试更多越级机会
+        """
+        promoted_this_chain = 0
+
+        while promoted_this_chain < max_promotions_per_chain:
+            # 更新 DAG 节点状态：检查哪些依赖刚变为满足
+            for node in dag_graph.nodes.values():
+                if node.status == NodeStatus.PENDING:
+                    if self._can_node_run(node, dag_graph):
+                        node.status = NodeStatus.READY
+                        self._blocked_queue = [n for n in self._blocked_queue if n.node_id != node.node_id]
+
+            # 找出所有可越级的节点（依赖满足 + 资源空闲 + 联锁允许）
             ready_candidates: list[DAGNode] = []
-            still_blocked: list[DAGNode] = []
-
-            for blocked_node in self._blocked_queue:
-                if blocked_node.graph_id != dag_graph.graph_id:
-                    still_blocked.append(blocked_node)
+            for node in self._blocked_queue:
+                if node.graph_id != dag_graph.graph_id:
                     continue
-
-                deps_satisfied = all(
-                    dag_graph.nodes[dep_id].status == NodeStatus.COMPLETED
-                    for dep_id in blocked_node.dependencies
-                    if dep_id in dag_graph.nodes
-                )
-
-                if deps_satisfied:
-                    ready_candidates.append(blocked_node)
-                else:
-                    still_blocked.append(blocked_node)
-
-            self._blocked_queue = still_blocked
+                can_promote, _ = await self._check_ooo_promotion(node, dag_graph)
+                if can_promote:
+                    required_resources = self._extract_required_resources(node)
+                    if "orthogonality_check" not in self.ablated_dims:
+                        if not self._resource_table.check_orthogonality(set(required_resources)):
+                            continue
+                    ready_candidates.append(node)
 
             if not ready_candidates:
-                break  # 没有可越级执行的节点
-
-            # 尝试越级执行第一个符合条件的节点
-            promoted_any = False
-            for blocked_node in ready_candidates:
-                can_promote, reason = await self._check_ooo_promotion(blocked_node, dag_graph)
-                if not can_promote:
-                    blocked_node.status = NodeStatus.READY
-                    priority_score = blocked_node.get_ready_score()
-                    await self._ready_queue.put((priority_score, blocked_node))
-                    self._issue_times[blocked_node.node_id] = time.monotonic()
-                    continue
-
-                required_resources = self._extract_required_resources(blocked_node)
-                if not self._resource_table.check_orthogonality(set(required_resources)):
-                    blocked_node.status = NodeStatus.READY
-                    priority_score = blocked_node.get_ready_score()
-                    await self._ready_queue.put((priority_score, blocked_node))
-                    self._issue_times[blocked_node.node_id] = time.monotonic()
-                    continue
-
-                reservation_ok = True
-                for res in sorted(required_resources):
-                    if not await self._resource_table.acquire(res, blocked_node.node_id):
-                        reservation_ok = False
-                        await self._resource_table.release(blocked_node.node_id)
-                        break
-
-                if not reservation_ok:
-                    blocked_node.status = NodeStatus.READY
-                    priority_score = blocked_node.get_ready_score()
-                    await self._ready_queue.put((priority_score, blocked_node))
-                    self._issue_times[blocked_node.node_id] = time.monotonic()
-                    continue
-
-                lab = self._labs.get(blocked_node.lab_id)
-                if lab is None:
-                    await self._resource_table.release(blocked_node.node_id)
-                    blocked_node.status = NodeStatus.READY
-                    priority_score = blocked_node.get_ready_score()
-                    await self._ready_queue.put((priority_score, blocked_node))
-                    self._issue_times[blocked_node.node_id] = time.monotonic()
-                    continue
-
-                # 越级执行
-                blocked_node.mark_running()
-                self._running_nodes[blocked_node.node_id] = blocked_node
-
-                try:
-                    result = await lab.run_single_task(
-                        task_id=blocked_node.node_id,
-                        skill_name=blocked_node.skill_name,
-                        params=blocked_node.params,
-                        required_devices=self._extract_required_devices(blocked_node),
-                        task_priority=blocked_node.priority.value,
-                    )
-                    blocked_node.mark_completed(result)
-                except Exception:
-                    blocked_node.mark_failed("OoO执行异常")
-
-                self._running_nodes.pop(blocked_node.node_id, None)
-                self._completed_nodes.append(blocked_node)
-                await self._resource_table.release(blocked_node.node_id)
-
-                self._ooo_execution_count += 1
-                self._ooo_lookahead_triggered += 1
-                self._ooo_promotion_events.append({
-                    "task_id": blocked_node.node_id,
-                    "reason": f"ooo_promotion: {reason}",
-                    "elapsed_since_submit_ms": (time.monotonic() - blocked_node.submit_time) * 1000,
-                    "timestamp": time.monotonic(),
-                })
-                logger.info(
-                    "[OoO-Promote] 链式越级执行: '%s' (skill=%s) | OoO累计: %d",
-                    blocked_node.node_id, blocked_node.skill_name, self._ooo_execution_count,
-                )
-                promoted_any = True
-                break  # 每轮只越级执行一个，避免长时间阻塞
-
-            if not promoted_any:
-                # 没有节点被越级执行，将所有候选项入 ReadyQueue
-                for blocked_node in ready_candidates:
-                    blocked_node.status = NodeStatus.READY
-                    priority_score = blocked_node.get_ready_score()
-                    await self._ready_queue.put((priority_score, blocked_node))
-                    self._issue_times[blocked_node.node_id] = time.monotonic()
                 break
+
+            # 按优先级排序，限制每轮数量
+            ready_candidates.sort(key=lambda n: (-n.priority.value, n.node_id))
+            ready_candidates = ready_candidates[:max_promotions_per_chain - promoted_this_chain]
+
+            # 原子预约所有节点所需的资源
+            ready_to_run: list[DAGNode] = []
+            for node in ready_candidates:
+                required_resources = self._extract_required_resources(node)
+                all_acquired = True
+                acquired: list[str] = []
+                for res in sorted(required_resources):
+                    if await self._resource_table.acquire(res, node.node_id):
+                        acquired.append(res)
+                    else:
+                        all_acquired = False
+                        for r in acquired:
+                            await self._resource_table.release(r)
+                        break
+                if all_acquired:
+                    self._blocked_queue = [n for n in self._blocked_queue if n.node_id != node.node_id]
+                    ready_to_run.append(node)
+
+            if not ready_to_run:
+                break
+
+            # === 真正并行越级执行（asyncio.gather）===
+            await asyncio.gather(
+                *[self._ooo_direct_execute(node) for node in ready_to_run],
+                return_exceptions=True,
+            )
+
+            promoted_this_chain += len(ready_to_run)
+            # 让出控制权
+            await asyncio.sleep(0)
 
     async def _check_dag_completion(self, dag_graph: DAGTaskGraph) -> None:
         """检查 DAG 是否完全执行完毕。"""
@@ -1091,9 +1119,12 @@ class DAGOrchestrator:
         触发条件：BlockedQueue 非空 时执行扫描。
         扫描逻辑：对 BlockedQueue 中每个节点执行五层防死锁检查。
 
-        优化策略：
-        - 使用 asyncio.sleep(0) 让出控制权，避免阻塞事件循环
-        - 每次扫描最多推进 1 个节点（防止资源碎片化）
+        核心优化（V8.0）：
+        - 与 _continue_ooo_chain 协同：找到候选节点后，直接调用 _continue_ooo_chain
+          进行链式越级执行，而不是逐个放入 ReadyQueue。
+        - 这使得 OoO 的"越级"优势真正体现：
+          传统调度：节点完成 → 等待 Worker 从 ReadyQueue 取 → 有调度延迟
+          OoO 越级：节点完成 → 立即发现并越级执行下游 → 零等待
 
         消融实验支持：
         - 若 ablated_dims 包含 "orthogonality_check"，则跳过资源正交性检查
@@ -1102,86 +1133,41 @@ class DAGOrchestrator:
             if not self._blocked_queue:
                 return 0
 
-            # 使用 asyncio.sleep(0) 让出控制权，让其他协程（如节点完成事件）有机会执行
-            await asyncio.sleep(0)
-
-            promoted = 0
-            blocked_snapshot = list(self._blocked_queue)
-
-            for node in blocked_snapshot:
+            # 快速检查：是否有节点依赖已满足且资源空闲
+            ready_found = False
+            for node in self._blocked_queue:
                 if node.status != NodeStatus.PENDING:
                     continue
-
                 dag_graph = self._active_graphs.get(node.graph_id)
                 if dag_graph is None:
                     continue
+                can_promote, _ = await self._check_ooo_promotion(node, dag_graph)
+                if can_promote:
+                    ready_found = True
+                    break
 
-                can_promote, reason = await self._check_ooo_promotion(node, dag_graph)
-                if not can_promote:
-                    logger.debug(
-                        "[OoO-Scan] 节点 '%s' 五层检查未通过: %s",
-                        node.node_id, reason,
-                    )
-                    continue
+            if not ready_found:
+                return 0
 
-                required_resources = self._extract_required_resources(node)
-                required_set = set(required_resources)
+            # 有候选节点，调用 _continue_ooo_chain 进行链式越级执行
+            dag_graph = self._active_graphs.get(next(iter(self._active_graphs), None))
+            if dag_graph is None:
+                return 0
 
-                # V8.0: 空间维度正交性检查 R(v_k) ∩ R_active = ∅
-                # 消融实验：若禁用正交性检查或禁用 OoO Scanner，则跳过此检查
-                skip_ortho_check = "orthogonality_check" in self.ablated_dims or \
-                                   "event_wakeup" in self.ablated_dims or \
-                                   "ooo_scanner" in self.ablated_dims
-                if not skip_ortho_check and not self._resource_table.check_orthogonality(required_set):
-                    logger.debug(
-                        "[OoO-Scan] 节点 '%s' 资源正交性检查失败 (R(v_k)=%s)",
-                        node.node_id, required_set,
-                    )
-                    continue
+            # 让出控制权
+            await asyncio.sleep(0)
 
-                # 原子预约：按字母序加锁（第一层防死锁）
-                reservation_ok = True
-                for res in sorted(required_resources):
-                    acquired = await self._resource_table.acquire(res, node.node_id)
-                    if not acquired:
-                        reservation_ok = False
-                        await self._resource_table.release(node.node_id)
-                        logger.warning(
-                            "[OoO-Scan] 资源预约失败，回滚: node=%s, resource=%s",
-                            node.node_id, res,
-                        )
-                        break
+            # 调用链式越级执行（已集成到 _settle_completed_node，此处为兜底）
+            # 确保即使没有节点"完成"事件触发，Scanner 也能主动推进
+            initial_blocked_count = len(self._blocked_queue)
+            await self._continue_ooo_chain(dag_graph)
+            promoted = initial_blocked_count - len(self._blocked_queue)
 
-                if not reservation_ok:
-                    continue
-
-                # 从 BlockedQueue 移除
-                self._blocked_queue = [n for n in self._blocked_queue if n.node_id != node.node_id]
-
-                # 入 ReadyQueue（立即可被空闲 Worker 抢到）
-                node.status = NodeStatus.READY
-                priority_score = node.get_ready_score()
-                await self._ready_queue.put((priority_score, node))
-
-                self._ooo_execution_count += 1
-                self._ooo_lookahead_triggered += 1
-                self._ooo_promotion_events.append({
-                    "task_id": node.node_id,
-                    "reason": reason,
-                    "elapsed_since_submit_ms": (time.monotonic() - node.submit_time) * 1000,
-                    "timestamp": time.monotonic(),
-                })
-                promoted += 1
-
+            if promoted > 0:
                 logger.info(
-                    "[OoO-Scan] 越级推进成功: 节点 '%s' (skill=%s, reason=%s) "
-                    "→ ReadyQueue | OoO累计: %d",
-                    node.node_id, node.skill_name, reason,
-                    self._ooo_execution_count,
+                    "[OoO-Scan] Scanner 触发链式越级：推进 %d 个节点 | OoO累计: %d",
+                    promoted, self._ooo_execution_count,
                 )
-
-                # 每轮最多越级 1 个节点（防止一次推进太多导致资源碎片化）
-                break
 
             return promoted
 
