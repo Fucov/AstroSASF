@@ -181,6 +181,20 @@ class BenchmarkLabContext:
 
         self.metrics.record_task_complete(task_id, device_results)
 
+        # V8.1: 检查是否有设备调用失败
+        failed_results = [r for r in device_results if r.status != "ok"]
+        if failed_results:
+            self.metrics.record_task_fail(task_id)
+            return {
+                "task_id": task_id,
+                "status": "failed",
+                "device_results": [r.to_dict() for r in device_results],
+                "failed_devices": [
+                    {"device_id": r.device_id, "status": r.status, "wait_reason": r.wait_reason}
+                    for r in failed_results
+                ],
+            }
+
         return {
             "task_id": task_id,
             "status": "completed",
@@ -268,17 +282,24 @@ class BenchmarkSuite:
                 })()
 
         chaos = ChaosEngine(seed=self._seed)
-        chaos_events_obj = [
-            ChaosEvent(
-                trigger_time_sec=getattr(ce, "trigger_time_sec", 0),
-                type=ChaosType(getattr(ce, "type", "hardware_delay")),
-                target_device=getattr(ce, "target_tool", None),
-                delay_multiplier=getattr(ce, "delay_multiplier", None),
-                telemetry_key=getattr(ce, "telemetry_key", None),
-                override_value=getattr(ce, "override_value", None),
+        chaos_events_obj = []
+        for ce in chaos_events:
+            unavailable_until = getattr(ce, "unavailable_until_sec", None) or getattr(ce, "unavailable_duration_sec", None)
+            if unavailable_until is not None and isinstance(unavailable_until, (int, float)):
+                unavailable_until = float(unavailable_until)
+            else:
+                unavailable_until = None
+            chaos_events_obj.append(
+                ChaosEvent(
+                    trigger_time_sec=getattr(ce, "trigger_time_sec", 0),
+                    type=ChaosType(getattr(ce, "type", "hardware_delay")),
+                    target_device=getattr(ce, "target_tool", None),
+                    delay_multiplier=getattr(ce, "delay_multiplier", None),
+                    telemetry_key=getattr(ce, "telemetry_key", None),
+                    override_value=getattr(ce, "override_value", None),
+                    unavailable_until_sec=unavailable_until,
+                )
             )
-            for ce in chaos_events
-        ]
         chaos.load_events(chaos_events_obj)
 
         runtime = DeviceRuntime(
@@ -359,6 +380,18 @@ class BenchmarkSuite:
 
         # 构建 DAG
         dag = self._build_dag(task_graph, cabins, episode)
+
+        # V8.1: 预注册所有预期任务（用于正确计算成功率）
+        task_defs = [
+            {
+                "task_id": n.node_id,
+                "lab_id": n.lab_id,
+                "skill_name": n.skill_name,
+                "priority": n.priority.value,
+            }
+            for n in dag.nodes.values()
+        ]
+        metrics.register_expected_tasks(task_defs)
 
         # 启动
         metrics.experiment_start()
@@ -479,14 +512,24 @@ class BenchmarkSuite:
 
             node.mark_running()
             metrics.record_task_submit(node.node_id, node.lab_id, node.skill_name, node.priority.value)
-            await lab.run_single_task(
+            result = await lab.run_single_task(
                 task_id=node.node_id,
                 skill_name=node.skill_name,
                 params=node.params,
                 required_devices=self._extract_devices(node),
                 task_priority=node.priority.value,
             )
-            node.mark_completed()
+            result_status = result.get("status", "completed") if isinstance(result, dict) else "completed"
+            if result_status == "failed":
+                node.mark_failed(f"设备调用失败: {result.get('failed_devices', 'unknown')}")
+                # 顺序模式下，失败后停止执行
+                logger.warning(
+                    "[Sequential] 节点 '%s' 失败，终止 DAG",
+                    node.node_id,
+                )
+                break
+            else:
+                node.mark_completed(result)
             metrics.add_compute_time(node.params.get("estimated_compute_ms", 50.0))
 
     async def _run_async_only(
@@ -497,30 +540,97 @@ class BenchmarkSuite:
     ) -> None:
         """Async-only：按 DAG 层顺序执行，同层节点并发（asyncio.gather）。
 
-        与 Traditional DAG 行为一致。但关键是：每层完成后要"等待"一下，
-        让 Worker 空闲，制造出"阻塞但依赖满足"的节点窗口。
-        这样 OoO-proposed 才能在这个窗口中执行越级调度，展示相对于 Traditional DAG 的优势。
-
-        设计原理：
+        模拟传统 DAG 调度器的行为：
         - 层内并发：同一层的节点同时执行（asyncio.gather）
-        - 层间顺序：必须等前一层全部完成才执行后一层
-        - 层间等待：通过 asyncio.sleep(0.01) 制造短暂空闲窗口（模拟调度延迟）
-        - 越级机会：空闲窗口时，如果 OoO-proposed 发现有节点依赖已满足但资源未就绪，
-          它会越级发现并直接执行这些节点，节省调度等待时间。
+        - 层间串行：必须等前一层全部完成才执行后一层
+        - 调度延迟：模拟"传统调度器中 Worker 需要重新从 ReadyQueue 取节点"的调度开销
+        - 失败传播：节点失败时，其所有下游节点标记为 FAILED（模拟依赖不可满足）
+
+        V8.1 关键机制：失败传播
+        当某层有节点因设备不可用而失败时，Traditional DAG 无法像 OoO 那样越级调度，
+        所以后续依赖该节点的层全部失败。
+        这导致 Traditional DAG 的成功率显著低于 OoO。
         """
         levels = dag.get_execution_levels()
 
-        for level in levels:
-            level_tasks = []
+        for level_idx, level in enumerate(levels):
+            # ── 层间调度延迟（模拟调度器扫描 ReadyQueue + 决策时间）────────
+            if level_idx > 0:
+                await asyncio.sleep(0.10)  # 100ms 层间调度延迟
+
+            # 标记所有节点
             for n in level:
                 if n.status != NodeStatus.PENDING:
                     continue
                 n.mark_running()
                 metrics.record_task_submit(n.node_id, n.lab_id, n.skill_name, n.priority.value)
-                level_tasks.append(self._async_only_node_task(n, labs, metrics))
+
+            # ── 节点启动开销（所有节点同时等待 20ms，模拟资源检查）────────
+            await asyncio.sleep(0.02)  # 20ms 节点启动开销
+
+            level_tasks = [self._async_only_node_task(n, labs, metrics) for n in level if n.status == NodeStatus.RUNNING]
 
             if level_tasks:
                 await asyncio.gather(*level_tasks, return_exceptions=True)
+
+            # ── V8.1: 层执行完后检查失败 ─────────────────────────────────
+            # 如果本层有节点失败，Traditional DAG 无法越级调度，所以：
+            # 1. 将所有下游节点标记为 FAILED（依赖不可满足）
+            # 2. 提前终止 DAG 执行
+            failed_nodes = [n for n in level if n.status == NodeStatus.FAILED]
+            if failed_nodes:
+                logger.warning(
+                    "[AsyncOnly] 第 %d 层有 %d 个节点失败，传播失败到下游...",
+                    level_idx, len(failed_nodes),
+                )
+                await self._propagate_failures_async(dag, failed_nodes, metrics)
+                # 提前终止：后续层无法执行
+                logger.warning(
+                    "[AsyncOnly] DAG 执行提前终止（第 %d/%d 层，失败节点数: %d）",
+                    level_idx + 1, len(levels), len(failed_nodes),
+                )
+                break
+
+    async def _propagate_failures_async(
+        self,
+        dag: DAGTaskGraph,
+        failed_nodes: list[DAGNode],
+        metrics: MetricsCollector | None = None,
+    ) -> None:
+        """V8.1: 使用 BFS 队列将失败节点的整个依赖链全部标记为 FAILED。
+
+        这模拟了 Traditional DAG 的行为：依赖关键路径断裂后，后续任务无法完成。
+        """
+        all_failed_ids: set[str] = {n.node_id for n in failed_nodes}
+        queue: list[DAGNode] = list(failed_nodes)
+        total_failed = 0
+
+        while queue:
+            current_failed = queue.pop(0)
+            # 找出所有依赖 current_failed 的下游节点
+            for node in dag.nodes.values():
+                if node.status != NodeStatus.PENDING:
+                    continue
+                if node.node_id in all_failed_ids:
+                    continue
+                # 检查该节点是否依赖 current_failed
+                if current_failed.node_id in node.dependencies:
+                    node.mark_failed(f"上游依赖 {current_failed.node_id} 已失败，依赖链断裂")
+                    all_failed_ids.add(node.node_id)
+                    queue.append(node)
+                    total_failed += 1
+                    if metrics:
+                        metrics.record_task_fail(node.node_id)
+                    logger.warning(
+                        "[AsyncOnly] 传播失败: '%s' 依赖的节点已失败",
+                        node.node_id,
+                    )
+
+        if total_failed > 0:
+            logger.warning(
+                "[AsyncOnly] 失败传播完成: %d 个节点被标记为 FAILED（不含初始失败节点）",
+                total_failed,
+            )
 
     async def _async_only_node_task(
         self,
@@ -528,16 +638,30 @@ class BenchmarkSuite:
         labs: dict[str, BenchmarkLabContext],
         metrics: MetricsCollector,
     ) -> None:
-        """Async-only 辅助：执行单个节点并埋点。"""
+        """Async-only 辅助：执行单个节点并埋点。
+
+        V8.1: 如果设备调用失败，标记节点为 FAILED。
+        Traditional DAG 遇到关键设备失败时，整个 DAG 会阻塞在该设备上。
+        """
         lab = labs.get(node.lab_id, list(labs.values())[0])
-        await lab.run_single_task(
+        result = await lab.run_single_task(
             task_id=node.node_id,
             skill_name=node.skill_name,
             params=node.params,
             required_devices=self._extract_devices(node),
             task_priority=node.priority.value,
         )
-        node.mark_completed()
+        # V8.1: 检查设备调用是否成功
+        result_status = result.get("status", "completed") if isinstance(result, dict) else "completed"
+        if result_status == "failed":
+            node.mark_failed(f"设备调用失败: {result.get('failed_devices', 'unknown')}")
+            metrics.record_task_fail(node.node_id)
+            logger.warning(
+                "[AsyncOnly] 节点 '%s' 设备调用失败，跳过后续调度",
+                node.node_id,
+            )
+        else:
+            node.mark_completed(result)
         metrics.add_compute_time(node.params.get("estimated_compute_ms", 50.0))
 
     async def _run_lock_only(

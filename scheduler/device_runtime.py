@@ -45,6 +45,8 @@ class ChaosType(Enum):
     DEVICE_STEAL = "device_steal"
     TIMEOUT = "timeout"
     FAILURE = "failure"
+    # V8.1 新增：真正的设备不可用故障
+    DEVICE_UNAVAILABLE = "device_unavailable"  # 设备锁定/损坏，必须跳过或换路径
 
 
 # ────────────────────────────────────────────────────────────────────────────── #
@@ -61,6 +63,9 @@ class ChaosEvent:
     telemetry_key: str | None = None
     override_value: Any | None = None
     consumed: bool = field(default=False, init=False)
+    # V8.1 新增：故障参数
+    failure_count: int = 1  # 失败几次后恢复（0=永久故障，>1=间歇性故障）
+    unavailable_until_sec: float | None = None  # 设备不可用截止时间（None=永久不可用）
 
 
 class ChaosEngine:
@@ -69,37 +74,71 @@ class ChaosEngine:
     def __init__(self, seed: int | None = None) -> None:
         self._rng = random.Random(seed)
         self._events: list[ChaosEvent] = []
-        self._elapsed_sec: float = 0.0
+        self._start_time: float = time.monotonic()  # V8.1: 自动追踪时间
         self._injected: list[ChaosEvent] = []
+        # V8.1 新增：设备不可用状态（key=device_id, value=恢复时间戳）
+        self._device_unavailable_until: dict[str, float] = {}
 
     def load_events(self, events: list[ChaosEvent]) -> None:
         self._events = sorted(events, key=lambda e: e.trigger_time_sec)
         self._injected.clear()
-
-    def advance_time(self, delta_sec: float) -> None:
-        self._elapsed_sec += delta_sec
+        self._device_unavailable_until.clear()
+        self._start_time = time.monotonic()  # 重置起始时间
 
     @property
     def elapsed_sec(self) -> float:
-        return self._elapsed_sec
+        """V8.1: 自动计算流逝的时间（基于真实墙钟时间）。"""
+        return time.monotonic() - self._start_time
+
+    def is_device_unavailable(self, device_id: str) -> tuple[bool, float]:
+        """检查设备是否处于不可用状态（V8.1）。返回 (是否不可用, 恢复时间)。"""
+        if device_id not in self._device_unavailable_until:
+            return False, 0.0
+        if self.elapsed_sec >= self._device_unavailable_until[device_id]:
+            # 已恢复
+            del self._device_unavailable_until[device_id]
+            return False, 0.0
+        return True, self._device_unavailable_until[device_id]
 
     def check_and_inject(
         self,
         device_id: str,
         task_id: str,
     ) -> tuple[bool, ChaosEvent | None]:
-        """检查并注入 chaos。触发时标记 consumed=True。"""
+        """检查并注入 chaos。触发时标记 consumed=True。
+
+        V8.1 增强：DEVICE_UNAVAILABLE 触发后，将设备标记为不可用，
+        直到 unavailable_until_sec。后续所有调用该设备的任务也会失败。
+        """
+        # V8.1: 先检查设备是否已被标记为不可用
+        unavailable, recovery_time = self.is_device_unavailable(device_id)
+        if unavailable:
+            # 设备不可用，生成一个 pseudo-chaos-event 用于触发失败
+            return True, ChaosEvent(
+                trigger_time_sec=self.elapsed_sec,
+                type=ChaosType.DEVICE_UNAVAILABLE,
+                target_device=device_id,
+            )
+
         for ev in self._events:
             if ev.consumed:
                 continue
-            if ev.trigger_time_sec <= self._elapsed_sec:
+            if ev.trigger_time_sec <= self.elapsed_sec:
                 if ev.target_device is None or ev.target_device == device_id:
                     ev.consumed = True
                     self._injected.append(ev)
                     logger.warning(
                         "[Chaos] 注入: device=%s type=%s task=%s at %.3fs",
-                        device_id, ev.type.value, task_id, self._elapsed_sec,
+                        device_id, ev.type.value, task_id, self.elapsed_sec,
                     )
+                    # V8.1: DEVICE_UNAVAILABLE 触发后，设置设备不可用状态
+                    if ev.type == ChaosType.DEVICE_UNAVAILABLE:
+                        unavailable_until = ev.unavailable_until_sec or float('inf')
+                        self._device_unavailable_until[device_id] = unavailable_until
+                        logger.warning(
+                            "[Chaos] 设备 '%s' 标记为不可用 until %.3fs",
+                            device_id, unavailable_until,
+                        )
                     return True, ev
         return False, None
 
@@ -107,8 +146,12 @@ class ChaosEngine:
         self,
         base_ms: float,
         multiplier: float | None,
+        chaos_type: ChaosType | None = None,
     ) -> float:
         if multiplier is None or multiplier <= 0:
+            return base_ms
+        # V8.1: FAILURE 和 DEVICE_UNAVAILABLE 类型不应用延迟乘数（直接失败）
+        if chaos_type in (ChaosType.FAILURE, ChaosType.DEVICE_UNAVAILABLE):
             return base_ms
         return base_ms * multiplier
 
@@ -117,8 +160,9 @@ class ChaosEngine:
         return list(self._injected)
 
     def reset(self) -> None:
-        self._elapsed_sec = 0.0
         self._injected.clear()
+        self._device_unavailable_until.clear()
+        self._start_time = time.monotonic()
         for ev in self._events:
             ev.consumed = False
 
@@ -231,12 +275,17 @@ class DeviceLockManager:
         task_id: str,
         timeout: float = 30.0,
     ) -> tuple[bool, float]:
-        """轮询等待设备锁释放（被 asyncio.sleep 打断时立即返回 False）。
+        """轮询等待设备锁释放（V8.1: 增加 timeout 防止永久等待）。
+
+        V8.1: timeout 参数控制最大等待时间。
+        - 等待超时后返回 (False, waited_ms)，让调用者决定如何处理（失败/跳过）
+        - 这让 Traditional DAG 有合理的失败机制（而不是永远死锁）
 
         Returns
         -------
         tuple[bool, float]
             (success, waited_ms) — 成功获取锁时返回等待时长（毫秒）
+            超时时返回 (False, waited_ms)
         """
         wait_start = time.monotonic()
         total_wait = 0.0
@@ -249,6 +298,11 @@ class DeviceLockManager:
             elapsed = time.monotonic() - wait_start
             if elapsed >= timeout:
                 waited_ms = total_wait * 1000.0
+                self._total_contention_wait_ms += waited_ms
+                logger.warning(
+                    "[Lock] 等待设备 '%s' 超时 (waited=%.1fs, timeout=%.1fs)",
+                    device_id, waited_ms / 1000.0, timeout,
+                )
                 return False, waited_ms
             sleep_t = min(0.05, timeout - elapsed)
             await asyncio.sleep(sleep_t)
@@ -421,6 +475,27 @@ class DeviceRuntime:
             )
 
         # ── Step 2: 获取资源锁 ─────────────────────────────────────────────────
+        # V8.1: 先检查 chaos 是否让设备不可用（必须在获取锁之前检查）
+        unavailable, recovery_time = self._chaos.is_device_unavailable(device_id)
+        if unavailable:
+            logger.warning(
+                "[DeviceRuntime] 设备 '%s' 不可用（chaos），跳过执行",
+                device_id,
+            )
+            return DeviceResult(
+                device_id=device_id,
+                action=action,
+                params=params,
+                task_id=task_id,
+                lab_id=lab_id,
+                start_ts=start_ts,
+                end_ts=time.monotonic(),
+                wait_reason="device_unavailable",
+                chaos_injected=True,
+                chaos_type=ChaosType.DEVICE_UNAVAILABLE,
+                status="failure",
+            )
+
         acquired, _ = await self._lock_mgr.acquire(
             device_id=device_id,
             task_id=task_id,
@@ -471,7 +546,8 @@ class DeviceRuntime:
                 chaos_injected = True
                 chaos_type = chaos_ev.type
 
-                if chaos_ev.type == ChaosType.FAILURE:
+                # V8.1: FAILURE 和 DEVICE_UNAVAILABLE 直接返回失败状态
+                if chaos_ev.type in (ChaosType.FAILURE, ChaosType.DEVICE_UNAVAILABLE):
                     return DeviceResult(
                         device_id=device_id,
                         action=action,
@@ -513,18 +589,18 @@ class DeviceRuntime:
                 chaos_mult = chaos_ev.delay_multiplier or 1.0
 
             actual_ms = schema.apply_jitter(base_ms)
-            actual_ms = self._chaos.apply_delay_multiplier(actual_ms, chaos_mult)
+            actual_ms = self._chaos.apply_delay_multiplier(actual_ms, chaos_mult, chaos_type)
             latency_components["jitter_ms"] = max(0.0, actual_ms - base_ms)
             latency_components["chaos_delay_ms"] = (
                 (chaos_mult - 1.0) * base_ms if chaos_injected else 0.0
             )
-            latency_components["contention_wait_ms"] = contention_wait_ms  # 锁竞争等待时间
+            latency_components["contention_wait_ms"] = contention_wait_ms
             scaled_ms = actual_ms * self._physical_delay_scale
-            latency_components["total_physical_ms"] = actual_ms  # 原始物理时间（metrics 用）
-            latency_components["scaled_physical_ms"] = scaled_ms  # 实际等待时间
+            latency_components["total_physical_ms"] = actual_ms
+            latency_components["scaled_physical_ms"] = scaled_ms
 
             # ── Step 5: 执行物理动作（真实 sleep，让出控制权）────────────────
-            # physical_delay_scale ∈ [0,1]，用于实验变量控制（paper 实验设为 1.0）
+            # V8.1: FAILURE/DEVICE_UNAVAILABLE 状态在前面已 return，不会执行到这里
             await asyncio.sleep(scaled_ms / 1000.0)
 
             self._invocation_count += 1

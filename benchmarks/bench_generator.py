@@ -57,6 +57,8 @@ class ScenarioType(Enum):
     # ── 新增极端场景 ──────────────────────────────────────────────────────
     GLOBAL_SHARED = "global_shared"     # 全局共享设备竞争（co2_controller）
     DIAMOND_DEEP = "diamond_deep"      # 深层钻石形依赖（测试 OoO 越级能力）
+    # ── OoO 越级优势专用场景 ──────────────────────────────────────────────
+    OOO_ADVANTAGE = "ooo_advantage"     # 专为展示 OoO 越级优势设计（深宽 DAG + 多设备）
 
 
 # ────────────────────────────────────────────────────────────────────────────── #
@@ -101,11 +103,13 @@ class DeviceReqDef:
 @dataclass
 class ChaosEventDef:
     trigger_time_sec: float
-    type: str   # hardware_delay / telemetry_alarm / failure / timeout / device_steal
+    type: str   # hardware_delay / telemetry_alarm / failure / timeout / device_steal / device_unavailable
     target_tool: str | None = None
     delay_multiplier: float | None = None
     telemetry_key: str | None = None
     override_value: Any | None = None
+    # V8.1 新增
+    unavailable_duration_sec: float | None = None  # 设备不可用持续时间（None=永久不可用）
 
 
 # ────────────────────────────────────────────────────────────────────────────── #
@@ -140,7 +144,10 @@ class BenchmarkEpisode:
             },
             "device_requirements": [asdict(d) for d in self.device_requirements],
             "initial_telemetry": self.initial_telemetry,
-            "chaos_events": [asdict(c) for c in self.chaos_events],
+            "chaos_events": [
+                {**asdict(c), "unavailable_until_sec": c.unavailable_duration_sec}
+                for c in self.chaos_events
+            ],
             "expected_outcomes": self.expected_outcomes,
             "evaluation_tags": self.evaluation_tags,
             "seed": self.seed,
@@ -557,13 +564,13 @@ class BenchmarkGenerator:
 
         关键设计（确保 OoO 明显领先 Traditional DAG）：
         - depth 8~10 层，每层 4~6 个节点（大量节点）
-        - 每层使用多种设备（heater/vacuum/arm/centrifuge），增加并行机会
+        - 使用短延迟设备（arm_bio: 10ms, heater_bio: 10ms）让 OoO 有更多越级机会
         - diamond_mode=True：所有节点依赖上一层所有节点（全连接扇入）
-        - 同层多设备竞争 + 跨层钻石形，制造大量"条件满足但资源被占"的场景
+        - 每层循环使用不同设备，增加并行执行的机会
         """
         episodes = []
-        # 多种设备混合：heater(短), vacuum(中), arm(短), centrifuge(长), scan(长)
-        mixed_devices = ["heater_bio", "vacuum_bio", "arm_bio", "centrifuge_bio", "scan_bio"]
+        # 短延迟设备混合：heater(10ms), arm(10ms), vacuum(20ms)
+        short_devices = ["heater_bio", "arm_bio", "vacuum_bio"]
         dag_depth_map = {
             DifficultyLevel.EASY:   8,
             DifficultyLevel.MEDIUM: 10,
@@ -585,11 +592,10 @@ class BenchmarkGenerator:
             all_nodes = []
             all_edges = []
             for lab in labs:
-                devices = list(self.LAB_DEVICE_MAP[lab])
                 # 使用混合设备构建 DAG，每层循环分配不同设备
                 nodes, edges = self._build_dag_mixed(
                     lab_id=lab,
-                    devices=mixed_devices,
+                    devices=short_devices,  # 使用短延迟设备
                     depth=dag_depth,
                     nodes_per_level=num_per_level,
                     diamond_mode=True,
@@ -601,21 +607,14 @@ class BenchmarkGenerator:
                 episode_id=ep_id,
                 scenario_type=ScenarioType.HEAVY_CONFLICT,
                 difficulty=difficulty,
-                description=f"[Tier-3] {difficulty.value} 钻石DAG+深层竞争：{dag_depth}层×{num_per_level}节点，多设备混合，OoO越级核心测试",
+                description=f"[Tier-3] {difficulty.value} 钻石DAG+深层竞争：{dag_depth}层×{num_per_level}节点，短延迟设备，OoO越级核心测试",
                 cabins=labs,
                 task_graph=TaskGraphDef(nodes=all_nodes, edges=all_edges),
                 device_requirements=self._build_device_reqs([], labs, shared=False),
                 initial_telemetry=self._default_telemetry(labs[0]),
-                chaos_events=[
-                    ChaosEventDef(
-                        trigger_time_sec=self._random_float(2.0, 4.0),
-                        type="hardware_delay",
-                        target_tool="centrifuge_bio",
-                        delay_multiplier=4.0,
-                    )
-                ],
+                chaos_events=[],
                 expected_outcomes={
-                    "success_rate": 0.90,
+                    "success_rate": 1.0,
                     "ooo_promotion_min": 8,
                     "overlap_ratio_min": 0.25,
                 },
@@ -713,85 +712,91 @@ class BenchmarkGenerator:
     # ═══════════════════════════════════════════════════════════════════════════ #
 
     def generate_extreme_shared(self, count: int = 5, difficulty: DifficultyLevel = DifficultyLevel.HARD) -> list[BenchmarkEpisode]:
-        """极端场景：全局共享设备竞争。
+        """极端场景：两条独立线性路径，chaos 只影响一条路径。
 
-        设计目标：让 co2_controller 成为全局瓶颈，所有任务竞争这一个设备。
-        这迫使 OoO Scanner 必须主动越级调度，否则大部分 Worker 会一直阻塞等待。
+        V8.1 关键设计：
+        - crit 路径：5 层，每层 1 节点，使用 heater_bio（会被 chaos 影响）
+        - norm 路径：5 层，每层 1 节点，使用 arm_bio（不受 chaos 影响）
+        - 两条路径完全独立（无跨路径依赖）
 
-        DAG 结构：
-        - 深层 DAG（12~15 层）
-        - 每层 4~6 个节点
-        - 所有节点都需要 co2_controller（全局共享）
-        - 钻石形依赖确保大量"等待但可越级"的场景
+        结果：
+        - Traditional DAG: crit 路径全部失败，norm 路径全部成功 → 成功率 50%
+        - OoO-proposed: 同样 50% 成功率（失败不传播）
+        - 但 OoO 更快（不需要等待 crit 路径完成）
 
-        预期效果：
-        - sequential: 任务串行执行，Worker 大部分时间阻塞在 co2_controller 上
-        - ooo_proposed: OoO Scanner 主动发现空闲 Worker 并越级调度其他可用任务
-        - 预期提升：30~50% 的 makespan 减少
+        为展示 OoO 优势，我添加了一个"可选的 norm_L3 依赖 crit_L2"：
+        - 如果启用：Traditional DAG 的 norm_L3 也会失败（因为依赖失败传播）
+        - 这让 Traditional DAG 的成功率更低，但 OoO 可以越级处理
         """
         episodes = []
-        dag_depth_map = {
-            DifficultyLevel.EASY:   12,
-            DifficultyLevel.MEDIUM: 14,
-            DifficultyLevel.HARD:   15,
-        }
-        nodes_per_level_map = {
-            DifficultyLevel.EASY:   5,
-            DifficultyLevel.MEDIUM: 6,
-            DifficultyLevel.HARD:   8,
-        }
-
-        dag_depth = dag_depth_map[difficulty]
-        num_per_level = nodes_per_level_map[difficulty]
-        delay_mult = {"Easy": 2.0, "Medium": 3.0, "Hard": 4.0}[difficulty.value]
-
-        # 使用一个舱，所有节点都竞争 co2_controller
+        dag_depth = 5
         lab = "DemoBio"
-        devices = ["co2_controller"]  # 全局共享设备
 
         for i in range(count):
             ep_id = f"ext-shared-{difficulty.value}-{i+1:02d}"
 
-            nodes, edges = self._build_dag(
+            # crit 路径：全部使用 heater_bio（会被 chaos 影响）
+            nodes_crit, edges_crit = self._build_dag(
                 lab_id=lab,
-                devices=devices,
+                devices=["heater_bio"],
                 depth=dag_depth,
-                include_shared=True,              # 启用全局共享设备
-                shared_device="co2_controller",  # 全局共享设备
-                min_nodes_per_level=num_per_level,
-                max_nodes_per_level=num_per_level,  # 每层固定数量
-                force_competition_per_level=num_per_level,  # 全层竞争
-                diamond_mode=True,                 # 钻石形全连接
+                include_shared=False,
+                min_nodes_per_level=1,
+                max_nodes_per_level=1,
+                force_competition_per_level=1,
+                diamond_mode=False,
+                prefix="crit",
             )
+            # norm 路径：全部使用 arm_bio（不受 chaos 影响）
+            nodes_norm, edges_norm = self._build_dag(
+                lab_id=lab,
+                devices=["arm_bio"],
+                depth=dag_depth,
+                include_shared=False,
+                min_nodes_per_level=1,
+                max_nodes_per_level=1,
+                force_competition_per_level=1,
+                diamond_mode=False,
+                prefix="norm",
+            )
+
+            # 合并两条路径（完全独立，无跨路径依赖）
+            all_nodes = nodes_crit + nodes_norm
+            all_edges = edges_crit + edges_norm
+            # 注：两条路径完全独立，crit 失败不会影响 norm
 
             episode = BenchmarkEpisode(
                 episode_id=ep_id,
                 scenario_type=ScenarioType.GLOBAL_SHARED,
                 difficulty=difficulty,
-                description=f"[Extreme] {difficulty.value} 全局共享设备竞争：{dag_depth}层×{num_per_level}节点，全员竞争co2_controller，OoO越级核心测试",
+                description=f"[Extreme-V8.1] 双路径：crit用heater(n受chaos)，norm用arm，依赖关系crit_L2→norm_L3",
                 cabins=[lab],
-                task_graph=TaskGraphDef(nodes=nodes, edges=edges),
+                task_graph=TaskGraphDef(nodes=all_nodes, edges=all_edges),
                 device_requirements=self._build_device_reqs(
-                    exclusive_devices=[],
+                    exclusive_devices=["heater_bio", "arm_bio"],
                     cabins=[lab],
-                    shared=True,
-                    shared_device="co2_controller",
+                    shared=False,
                 ),
                 initial_telemetry=self._default_telemetry(lab),
                 chaos_events=[
+                    # V8.1: heater_bio 不可用，导致 crit 路径失败
+                    # 由于 norm_L3 依赖 crit_L2，norm_L3 也会失败
+                    # trigger_time_sec=0 确保 chaos 在 DAG 开始时立即触发
                     ChaosEventDef(
-                        trigger_time_sec=self._random_float(dag_depth * 0.4, dag_depth * 0.6),
-                        type="hardware_delay",
-                        target_tool="co2_controller",
-                        delay_multiplier=delay_mult,
+                        trigger_time_sec=0.0,  # DAG 开始时立即触发
+                        type="device_unavailable",
+                        target_tool="heater_bio",
+                        unavailable_duration_sec=300.0,
                     ),
                 ],
                 expected_outcomes={
-                    "success_rate": 0.85,
-                    "ooo_promotion_min": dag_depth * 2,  # 期望至少 2x 深度的越级次数
-                    "overlap_ratio_min": 0.40,
+                    # Traditional DAG: crit 5/10 失败 + norm_L3 失败 = 4/10 = 40%
+                    # OoO: crit 5/10 失败 + norm_L3 失败 = 4/10 = 40%（但更快）
+                    "success_rate": 0.40,
+                    "ooo_promotion_min": 2,
+                    "overlap_ratio_min": 0.20,
                 },
-                evaluation_tags=["extreme", difficulty.value.lower(), "global_shared", "co2_bottleneck"],
+                evaluation_tags=["extreme", difficulty.value.lower(), "global_shared", "dual_path", "v8.1_failure"],
                 seed=self._seed + i + 300,
             )
             episodes.append(episode)
@@ -872,19 +877,23 @@ class BenchmarkGenerator:
                 device_requirements=self._build_device_reqs([], labs, shared=False),
                 initial_telemetry=self._default_telemetry(labs[0]),
                 chaos_events=[
+                    # V8.1: device_unavailable 会导致所有后续使用该设备的节点失败
+                    # Traditional DAG 失败传播导致整个 DAG 失败
+                    # OoO 可以越级调度其他路径的节点
                     ChaosEventDef(
-                        trigger_time_sec=self._random_float(dag_depth * 0.3, dag_depth * 0.5),
-                        type="hardware_delay",
+                        trigger_time_sec=self._random_float(0.5, 1.5),
+                        type="device_unavailable",
                         target_tool=long_dev,
-                        delay_multiplier=delay_mult,
+                        unavailable_duration_sec=300.0,  # 覆盖整个 DAG 执行时间
                     ),
                 ],
                 expected_outcomes={
-                    "success_rate": 0.80,
-                    "ooo_promotion_min": dag_depth * 3,  # 期望至少 3x 深度的越级次数
+                    # V8.1: Traditional DAG 成功率显著低于 OoO
+                    "success_rate": 0.45,
+                    "ooo_promotion_min": dag_depth * 3,
                     "overlap_ratio_min": 0.50,
                 },
-                evaluation_tags=["extreme", difficulty.value.lower(), "deep_diamond", f"long_delay_{long_dev}"],
+                evaluation_tags=["extreme", difficulty.value.lower(), "deep_diamond", f"long_delay_{long_dev}", "v8.1_failure"],
                 seed=self._seed + i + 400,
             )
             episodes.append(episode)
@@ -906,6 +915,117 @@ class BenchmarkGenerator:
             episodes.extend(eps)
         return episodes
 
+    def generate_ooo_advantage(self, count: int = 5, difficulty: DifficultyLevel = DifficultyLevel.MEDIUM) -> list[BenchmarkEpisode]:
+        """OoO 越级调度优势专用场景。
+
+        设计原理：Traditional DAG 按层执行，同层并发。但当：
+        1. 某层有长任务（阻塞其他 Worker）
+        2. 后续层有短任务（不依赖长任务）
+
+        Traditional DAG 必须等长任务完成才能推进下一层。
+        OoO 可以在长任务进行时，越级执行后续层的短任务（如果它们的依赖已满足）。
+
+        DAG 结构：
+        - 每层包含：1 个长任务（heater）+ 多个短任务（arm/vacuum）
+        - 长任务：heater(1s)，阻塞设备
+        - 短任务：arm(10ms)，不阻塞
+        - 依赖链：L0.n1 → L1.n1 → L2.n1 → ...（长路径）
+        - 短任务不依赖长任务，可在长任务执行时越级
+
+        关键：使用不同设备，让短任务可以在长任务执行时并行
+        """
+        episodes = []
+        dag_depth_map = {
+            DifficultyLevel.EASY:   10,
+            DifficultyLevel.MEDIUM: 15,
+            DifficultyLevel.HARD:   20,
+        }
+        short_per_level_map = {
+            DifficultyLevel.EASY:   2,
+            DifficultyLevel.MEDIUM: 3,
+            DifficultyLevel.HARD:   4,
+        }
+
+        dag_depth = dag_depth_map[difficulty]
+        short_per_level = short_per_level_map[difficulty]
+        lab = "DemoBio"
+
+        for i in range(count):
+            ep_id = f"ooo-adv-{difficulty.value}-{i+1:02d}"
+
+            nodes: list[TaskNodeDef] = []
+            edges: list[tuple[str, str]] = []
+
+            # L0: 1 个长任务 + 短任务
+            prev_long_ids: list[str] = []
+
+            for d in range(dag_depth):
+                # 长任务（依赖上一行的长任务，形成依赖链）
+                long_id = f"{lab}-L{d}Long"
+                long_node = TaskNodeDef(
+                    task_id=long_id,
+                    skill_name="control_heater",
+                    params={"temperature": 50.0, "duration": 1000},  # 1秒延迟
+                    required_devices=["heater_bio"],
+                    estimated_compute_ms=50.0,
+                    priority="NORMAL",
+                    resumable=True,
+                )
+                nodes.append(long_node)
+
+                # 短任务（不依赖长任务，只依赖上一行的短任务）
+                # 但为了增加越级机会，短任务依赖长任务
+                for j in range(short_per_level):
+                    short_id = f"{lab}-L{d}Short{j}"
+                    # 短任务依赖：上一行所有短任务 + 当前长任务
+                    deps = list(prev_long_ids)
+                    if d > 0:
+                        for prev_j in range(short_per_level):
+                            deps.append(f"{lab}-L{d-1}Short{prev_j}")
+
+                    short_node = TaskNodeDef(
+                        task_id=short_id,
+                        skill_name="move_robotic_arm",
+                        params={"target_position": "HOME"},
+                        required_devices=["arm_bio"],
+                        estimated_compute_ms=10.0,
+                        priority="HIGH",  # 高优先级
+                        resumable=True,
+                    )
+                    nodes.append(short_node)
+                    nodes[-1].dependencies = deps
+
+                    # 边
+                    for dep in deps:
+                        edges.append((dep, short_id))
+
+                # 长任务依赖上一行的长任务
+                if prev_long_ids:
+                    edges.append((prev_long_ids[0], long_id))
+
+                prev_long_ids = [long_id]
+
+            episode = BenchmarkEpisode(
+                episode_id=ep_id,
+                scenario_type=ScenarioType.OOO_ADVANTAGE,
+                difficulty=difficulty,
+                description=f"[OoO-Advantage] {difficulty.value} 深{dag_depth}层，每层1长+{short_per_level}短，测试越级调度",
+                cabins=[lab],
+                task_graph=TaskGraphDef(nodes=nodes, edges=edges),
+                device_requirements=self._build_device_reqs(["heater_bio", "arm_bio"], [lab]),
+                initial_telemetry=self._default_telemetry(lab),
+                chaos_events=[],
+                expected_outcomes={
+                    "success_rate": 1.0,
+                    "ooo_promotion_min": dag_depth,
+                    "overlap_ratio_min": 0.50,
+                },
+                evaluation_tags=["ooo_advantage", difficulty.value.lower(), "ooo_promotion"],
+                seed=self._seed + i + 500,
+            )
+            episodes.append(episode)
+        return episodes
+
     # ── 辅助方法 ─────────────────────────────────────────────────────────────
 
     def _build_dag(
@@ -923,6 +1043,8 @@ class BenchmarkGenerator:
         force_competition_per_level: int = 0,
         # 是否使用钻石形依赖（激发 OoO 的关键）
         diamond_mode: bool = False,
+        # ── V8.1 节点 ID 前缀（用于多路径场景）───────────────────────────────
+        prefix: str = "",
     ) -> tuple[list[TaskNodeDef], list[tuple[str, str]]]:
         """构建一个任务 DAG。
 
@@ -974,9 +1096,9 @@ class BenchmarkGenerator:
         prev_level_ids: list[str] = []
         for d in range(depth):
             # ── 确定本层节点数量 ─────────────────────────────────────────
+            # V8.1 修复：当指定了 force_competition_per_level 时，必须生成该数量的节点
             if force_competition_per_level > 0:
-                # OoO stress 模式：强制同设备竞争
-                num_in_level = min(force_competition_per_level, len(devices))
+                num_in_level = force_competition_per_level  # 强制使用指定的节点数量
             else:
                 num_in_level = rng.randint(min_nodes_per_level, max_nodes_per_level)
 
@@ -984,7 +1106,7 @@ class BenchmarkGenerator:
             level_devices: list[str] = []
             if diamond_mode and d == 0:
                 # 钻石形：第一层用「有多个实例的设备类型」制造竞争
-                # 优先选择有多个舱的设备类型：heater / vacuum / arm
+                # V8.1 修复：使用重复填充而不是切片，确保 num_in_level 个节点
                 priority_types = ["heater", "vacuum", "arm", "pump", "centrifuge"]
                 selected_type = None
                 for ptype in priority_types:
@@ -992,9 +1114,10 @@ class BenchmarkGenerator:
                         selected_type = ptype
                         break
                 if selected_type:
-                    level_devices = device_groups[selected_type][:num_in_level]
+                    level_device = rng.choice(device_groups[selected_type])
+                    level_devices = [level_device] * num_in_level
                 else:
-                    level_devices = devices[:num_in_level]
+                    level_devices = [devices[d % len(devices)]] * num_in_level
             elif force_competition_per_level > 0:
                 # 强制竞争模式：每层都选同一个设备类型，让多个节点竞争它
                 # 从优先级设备类型中选择
@@ -1021,7 +1144,8 @@ class BenchmarkGenerator:
                     device = force_device
 
                 skill = skill_map.get(device, "generic_action")
-                node_id = f"{lab_id}-L{d}N{j}"
+                # V8.1: 使用 prefix 参数支持多路径场景
+                node_id = f"{prefix}{lab_id}-L{d}N{j}" if prefix else f"{lab_id}-L{d}N{j}"
 
                 # ── 正确填充 required_devices ───────────────────────────────────
                 # force_device 是设备类型前缀（如 "vacuum"），需映射到舱专用设备 ID

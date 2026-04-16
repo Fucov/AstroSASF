@@ -88,6 +88,25 @@ class MetricsCollector:
         self._prefix_misses: int = 0
         self._alarm_triggers: dict[str, float] = {}  # alarm_id → triggered_at
         self._checkpoint_snapshots: dict[str, dict] = {}
+        # V8.1: 预期任务数（在实验开始前注册，用于计算失败率）
+        self._expected_task_count: int = 0
+
+    def register_expected_tasks(self, task_defs: list[dict[str, Any]]) -> None:
+        """V8.1: 在实验开始前预注册所有预期的任务。
+
+        这确保即使任务失败，total_tasks 仍然正确计算。
+        用于 benchmark 中知道所有任务节点的情况。
+        """
+        for td in task_defs:
+            task_id = td.get("task_id", f"task_{len(self._task_lifecycles)}")
+            lc = TaskLifecycle(
+                task_id=task_id,
+                lab_id=td.get("lab_id", "default"),
+                skill_name=td.get("skill_name", "unknown"),
+                priority=td.get("priority", 2),
+            )
+            self._task_lifecycles[task_id] = lc
+        self._expected_task_count = len(task_defs)
 
     # ── 埋点 API ─────────────────────────────────────────────────────────────
 
@@ -126,10 +145,16 @@ class MetricsCollector:
         self,
         task_id: str,
         device_results: list[DeviceResult],
+        result_dict: dict[str, Any] | None = None,
     ) -> None:
+        """V8.1: 增加 result_dict 参数以检查任务整体状态。"""
         lc = self._task_lifecycles.get(task_id)
         if lc:
-            lc.completed_at = time.monotonic()
+            # V8.1: 如果 result_dict 显示失败，标记为 failed
+            if result_dict and result_dict.get("status") == "failed":
+                lc.failed_at = time.monotonic()
+            else:
+                lc.completed_at = time.monotonic()
             lc.device_results = list(device_results)
 
     def record_task_fail(self, task_id: str) -> None:
@@ -257,6 +282,8 @@ class MetricsCollector:
         makespan_s = makespan
 
         # ── Metric 2: Success Rate ────────────────────────────────────────────
+        # V8.1: 如果预注册了预期任务，使用预期任务数；否则使用已提交的任务数
+        total_tasks = max(self._expected_task_count, total_tasks)
         success_rate = completed_tasks / max(1, total_tasks)
 
         # ── Metric 3: Scheduling Overhead ─────────────────────────────────────

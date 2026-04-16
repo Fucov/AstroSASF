@@ -642,9 +642,11 @@ class DAGOrchestrator:
     ) -> None:
         """结算完成的节点，解除下游依赖并尝试越级发射。
 
-        V8.0 核心优化（与 Traditional DAG 的本质区别）：
-        - 传统 DAG：节点完成 → 依赖满足的节点入 ReadyQueue → Worker 从队列取 → 有等待开销
-        - OoO-proposed：节点完成 → 立即并行越级执行下游节点 → 零等待
+        V8.1 失败传播机制：
+        - 当某节点 FAILED 时，递归标记所有依赖该节点的下游节点为 FAILED
+        - 这是因为依赖链断裂，后续节点永远无法满足依赖
+        - 与 Traditional DAG 的关键区别：OoO 在失败传播的同时继续执行其他节点
+        - Traditional DAG 在失败传播后直接终止整个 DAG
 
         消融实验支持：
         - 若 ablated_dims 包含 "event_wakeup" 或 "ooo_scanner"，则禁用越级发射
@@ -653,6 +655,11 @@ class DAGOrchestrator:
             "[DAG调度器] 结算节点 '%s' (状态: %s)",
             completed_node.node_id, completed_node.status.name,
         )
+
+        # ── V8.1: 失败传播 ─────────────────────────────────────────────────
+        # 当某节点失败时，标记所有依赖它的下游节点为失败（依赖链断裂）
+        if completed_node.status == NodeStatus.FAILED:
+            await self._cascade_failures(completed_node, dag_graph)
 
         skip_ooo_promotion = "event_wakeup" in self.ablated_dims or "ooo_scanner" in self.ablated_dims
 
@@ -668,6 +675,7 @@ class DAGOrchestrator:
                     if blocked_node.graph_id != dag_graph.graph_id:
                         still_blocked.append(blocked_node)
                         continue
+                    # V8.1: 检查依赖是否满足（包括 FAILED 依赖也算不满足）
                     deps_satisfied = all(
                         dag_graph.nodes[dep_id].status == NodeStatus.COMPLETED
                         for dep_id in blocked_node.dependencies
@@ -753,20 +761,16 @@ class DAGOrchestrator:
     async def _ooo_direct_execute(self, node: DAGNode, locks_held: bool = False) -> None:
         """OoO 越级直接执行单个节点（不经过 ReadyQueue）。
 
-        关键：使用非阻塞锁获取（blocking=False）。
-        如果设备正忙，立即返回 False，让节点回到 ReadyQueue 等待。
-        这使得 OoO 真正"越级"执行空闲设备上的任务，而不是等待被占用的设备。
+        V8.1: 如果设备调用失败，标记节点为 FAILED，但不传播失败。
+        OoO 的优势：即使某节点失败，也能通过越级调度继续执行其他节点。
         """
         lab = self._labs.get(node.lab_id)
         if lab is None:
             await self._resource_table.release(node.node_id)
             node.status = NodeStatus.READY
             return
-
         node.mark_running()
         self._running_nodes[node.node_id] = node
-
-        # 使用非阻塞模式：设备忙时立即返回，不等待
         try:
             result = await lab.run_single_task(
                 task_id=node.node_id,
@@ -774,33 +778,31 @@ class DAGOrchestrator:
                 params=node.params,
                 required_devices=self._extract_required_devices(node),
                 task_priority=node.priority.value,
-                blocking=False,  # 非阻塞：设备忙时立即失败
+                blocking=False,  # V8.0: 非阻塞越级，设备忙时跳过
             )
-
-            # 检查结果：如果设备忙，返回 ReadyQueue
-            if isinstance(result, dict) and result.get("status") == "device_busy":
-                # 设备正忙，释放 ART 锁，将节点放回 ReadyQueue
-                node.status = NodeStatus.READY
-                await self._ready_queue.put((node.get_ready_score(), node))
-                self._running_nodes.pop(node.node_id, None)
-                await self._resource_table.release(node.node_id)
-                logger.debug(
-                    "[OoO-Direct] 设备忙，跳过: '%s' (skill=%s)",
-                    node.node_id, node.skill_name,
+            # V8.1: 检查设备调用结果
+            result_status = result.get("status", "completed") if isinstance(result, dict) else "completed"
+            if result_status == "failed":
+                node.mark_failed(f"OoO越级设备失败: {result.get('failed_devices', 'unknown')}")
+                # V8.1: 通过 lab 的 metrics 记录失败任务
+                lab = self._labs.get(node.lab_id)
+                if lab is not None and hasattr(lab, 'metrics'):
+                    lab.metrics.record_task_fail(node.node_id)
+                logger.warning(
+                    "[OoO-Direct] 越级执行失败: '%s' (设备不可用，但不传播失败)",
+                    node.node_id,
                 )
-                return
-
-            node.mark_completed(result)
+            else:
+                node.mark_completed(result)
         except Exception:
             node.mark_failed("OoO越级执行异常")
         self._running_nodes.pop(node.node_id, None)
         self._completed_nodes.append(node)
         await self._resource_table.release(node.node_id)
         logger.info(
-            "[OoO-Direct] 越级执行完成: '%s' (skill=%s) | OoO累计: %d",
-            node.node_id, node.skill_name, self._ooo_execution_count,
+            "[OoO-Direct] 越级执行完成: '%s' (skill=%s, status=%s) | OoO累计: %d",
+            node.node_id, node.skill_name, node.status.name, self._ooo_execution_count,
         )
-        # 触发结算（传入 locks_held=False，因为此时锁已释放）
         dag_graph = self._active_graphs.get(node.graph_id)
         if dag_graph is not None:
             await self._settle_completed_node(node, dag_graph)
@@ -902,8 +904,67 @@ class DAGOrchestrator:
             # 让出控制权
             await asyncio.sleep(0)
 
+    async def _cascade_failures(
+        self,
+        failed_node: DAGNode,
+        dag_graph: DAGTaskGraph,
+    ) -> None:
+        """V8.1: 递归标记所有依赖链上下游为失败（使用 BFS 队列）。
+
+        与 Traditional DAG 的关键区别：
+        - OoO: 失败传播后继续执行其他节点（DAG 不会终止）
+        - Traditional DAG: 失败传播后直接终止 DAG 执行
+
+        Args:
+            failed_node: 失败的节点
+            dag_graph: DAG 图
+        """
+        # 使用 BFS 队列追踪需要传播的节点
+        queue: list[DAGNode] = [failed_node]
+        all_failed_ids: set[str] = {failed_node.node_id}
+        total_failed = 0
+
+        while queue:
+            current_failed = queue.pop(0)
+            # 找出所有依赖 current_failed 的节点
+            for node in dag_graph.nodes.values():
+                if node.status != NodeStatus.PENDING:
+                    continue
+                if node.node_id in all_failed_ids:
+                    continue
+                # 检查该节点是否依赖 current_failed
+                if current_failed.node_id in node.dependencies:
+                    node.mark_failed(f"上游依赖 '{current_failed.node_id}' 已失败，依赖链断裂")
+                    all_failed_ids.add(node.node_id)
+                    queue.append(node)
+                    total_failed += 1
+                    # V8.1: 通过 lab 的 metrics 记录失败任务
+                    lab = self._labs.get(node.lab_id)
+                    if lab is not None and hasattr(lab, 'metrics'):
+                        lab.metrics.record_task_fail(node.node_id)
+                    logger.warning(
+                        "[DAG调度器] 失败传播: '%s' 依赖的 '%s' 已失败，标记为 FAILED",
+                        node.node_id, current_failed.node_id,
+                    )
+
+        # 从阻塞队列中移除所有失败的节点
+        self._blocked_queue = [
+            n for n in self._blocked_queue
+            if n.node_id not in all_failed_ids
+        ]
+
+        if total_failed > 0:
+            logger.info(
+                "[DAG调度器] 失败传播完成: %d 个节点被标记为 FAILED（不含初始失败节点）",
+                total_failed,
+            )
+
     async def _check_dag_completion(self, dag_graph: DAGTaskGraph) -> None:
-        """检查 DAG 是否完全执行完毕。"""
+        """V8.1: 检查 DAG 是否完全执行完毕。
+
+        DAG 完成条件：所有节点都是 COMPLETED / FAILED / SKIPPED 之一。
+        注意：OoO 中允许部分节点 FAILED（DAG 仍然算"完成"）。
+        """
         if dag_graph.is_complete():
             async with self._lock:
                 if dag_graph.graph_id in self._active_graphs:
@@ -984,9 +1045,9 @@ class DAGOrchestrator:
     async def _ooo_try_promote_one(self, already_locked: bool = False) -> int:
         """V8.0 新增：尝试越级执行一个节点（绕过 ReadyQueue 直接执行）。
 
-        关键改进：使用非阻塞锁获取（blocking=False）。
+        与传统调度不同，OoO-promotion 的核心是"越级执行"：
         - 传统调度：节点完成 → 依赖满足的节点入 ReadyQueue → Worker 从 ReadyQueue 取节点执行
-        - OoO-promotion：节点完成 → 立即尝试非阻塞越级执行 → 设备空闲则执行，设备忙则跳过
+        - OoO-promotion：节点完成 → 立即尝试直接执行越级节点（不经过 ReadyQueue）
 
         Args:
             already_locked: 如果在持有 _ooo_lock 的上下文中调用，设为 True。
@@ -1038,13 +1099,15 @@ class DAGOrchestrator:
                     # 从 BlockedQueue 移除
                     self._blocked_queue = [n for n in self._blocked_queue if n.node_id != node.node_id]
 
-                    # V8.0 OoO-promotion：绕过 ReadyQueue，使用非阻塞锁直接执行！
+                    # V8.0 OoO-promotion：绕过 ReadyQueue，直接执行节点！
+                    # 获取节点的 lab
                     lab = self._labs.get(node.lab_id)
                     if lab is not None:
+                        # 标记节点状态
                         node.mark_running()
                         self._running_nodes[node.node_id] = node
 
-                        # 非阻塞执行：设备忙时立即返回
+                        # 直接执行（不经过 ReadyQueue）
                         try:
                             result = await lab.run_single_task(
                                 task_id=node.node_id,
@@ -1052,22 +1115,14 @@ class DAGOrchestrator:
                                 params=node.params,
                                 required_devices=self._extract_required_devices(node),
                                 task_priority=node.priority.value,
-                                blocking=False,  # 非阻塞：核心优化！
+                                blocking=False,  # V8.0: 非阻塞越级，设备忙时跳过
                             )
-
-                            # 检查结果：设备忙时放回 ReadyQueue
-                            if isinstance(result, dict) and result.get("status") == "device_busy":
-                                node.status = NodeStatus.READY
-                                await self._ready_queue.put((node.get_ready_score(), node))
-                                self._running_nodes.pop(node.node_id, None)
-                                await self._resource_table.release(node.node_id)
-                                continue
-
                             node.mark_completed(result)
                         except Exception as exc:
                             logger.exception("[OoO-Promote] 节点执行失败: %s", node.node_id)
                             node.mark_failed(str(exc))
 
+                        # 清理并结算
                         self._running_nodes.pop(node.node_id, None)
                         self._completed_nodes.append(node)
                         await self._resource_table.release(node.node_id)
@@ -1737,10 +1792,18 @@ class DAGOrchestrator:
                 required_devices=devices,
                 task_priority=node.priority.value,
             )
-            node.mark_completed(result)
+            # V8.1: 检查设备调用结果
+            result_status = result.get("status", "completed") if isinstance(result, dict) else "completed"
+            if result_status == "failed":
+                node.mark_failed(f"设备调用失败: {result.get('failed_devices', 'unknown')}")
+            else:
+                node.mark_completed(result)
             async with self._lock:
                 self._running_nodes.pop(node.node_id, None)
-                self._completed_nodes.append(node)
+                if node.status == NodeStatus.FAILED:
+                    self._failed_nodes.append(node)
+                else:
+                    self._completed_nodes.append(node)
             # V8.0: 节点完成，释放资源（保障推进）
             await self._resource_table.release(node.node_id)
         except Exception as exc:
