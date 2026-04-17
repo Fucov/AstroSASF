@@ -1,0 +1,1226 @@
+{
+  "metadata": {
+    "generated_at": "2026-03-31T03:07:05.664960+00:00",
+    "dataset_path": "datasets/astro_bench.jsonl",
+    "total_episodes": 50,
+    "baseline_workers": 1,
+    "dag_workers": 4,
+    "physics_delays": {
+      "set_temperature": 3.0,
+      "toggle_vacuum_pump": 4.0,
+      "move_robotic_arm": 5.0,
+      "inject_nutrient": 3.0,
+      "turn_on_laser": 2.5,
+      "toggle_ventilation": 3.0,
+      "set_greenhouse_lighting": 1.0,
+      "_default": 2.0
+    }
+  },
+  "summary": {
+    "baseline_avg_makespan_sec": 18.41850239469366,
+    "dag_avg_makespan_sec": 7.309685014648523,
+    "baseline_total_llm_calls": 174,
+    "dag_total_llm_calls": 50,
+    "llm_call_reduction_pct": 71.26436781609196,
+    "hard_survival_rate_baseline": 0.0,
+    "hard_survival_rate_dag": 1.0,
+    "avg_preemption_latency_ms": 0
+  },
+  "difficulty_breakdown": {
+    "baseline": {
+      "Hard": {
+        "count": 15,
+        "avg_makespan": 23.621596400661062,
+        "success_rate": 0.0,
+        "guardrail_triggered_count": 15
+      },
+      "Medium": {
+        "count": 20,
+        "avg_makespan": 22.180058686238358,
+        "success_rate": 1.0,
+        "guardrail_triggered_count": 0
+      },
+      "Easy": {
+        "count": 15,
+        "avg_makespan": 8.2,
+        "success_rate": 1.0,
+        "guardrail_triggered_count": 0
+      }
+    },
+    "dag": {
+      "Hard": {
+        "count": 15,
+        "avg_makespan": 9.889942047654104,
+        "success_rate": 1.0,
+        "preemption_count": 0,
+        "avg_preemption_latency_ms": 0
+      },
+      "Medium": {
+        "count": 20,
+        "avg_makespan": 7.906756000880731,
+        "success_rate": 1.0,
+        "preemption_count": 0,
+        "avg_preemption_latency_ms": 0
+      },
+      "Easy": {
+        "count": 15,
+        "avg_makespan": 3.933333333333333,
+        "success_rate": 1.0,
+        "preemption_count": 0,
+        "avg_preemption_latency_ms": 0
+      }
+    }
+  },
+  "episode_results": [
+    {
+      "episode_id": "bench-20260330-9508A8",
+      "difficulty": "Hard",
+      "description": "[#01] Hard 极限并发：5 个 Prompt 竞争 vacuum_pump，在 5.1s 触发 CO2 浓度过高（co2_level=2000.0），测试硬件抢占和灾难逃生",
+      "baseline": {
+        "makespan_sec": 30.111184005118204,
+        "llm_calls": 5,
+        "completed_nodes": 0,
+        "failed_nodes": 5,
+        "success": false,
+        "guardrail_triggered": true
+      },
+      "dag": {
+        "makespan_sec": 13.382748446719201,
+        "llm_calls": 1,
+        "completed_nodes": 5,
+        "failed_nodes": 0,
+        "success": true,
+        "preemption_triggered": false,
+        "preemption_latency_ms": 0.0
+      },
+      "chaos_injected": []
+    },
+    {
+      "episode_id": "bench-20260330-5B9BB6",
+      "difficulty": "Medium",
+      "description": "[#02] Medium 资源冲突：3 个 Prompt 竞争 water_pump，注入 hardware_delay（延迟 3 倍）",
+      "baseline": {
+        "makespan_sec": 14.133736489949897,
+        "llm_calls": 3,
+        "completed_nodes": 3,
+        "failed_nodes": 0,
+        "success": true,
+        "guardrail_triggered": false
+      },
+      "dag": {
+        "makespan_sec": 4.7112454966499655,
+        "llm_calls": 1,
+        "completed_nodes": 3,
+        "failed_nodes": 0,
+        "success": true,
+        "preemption_triggered": false,
+        "preemption_latency_ms": 0.0
+      },
+      "chaos_injected": []
+    },
+    {
+      "episode_id": "bench-20260330-33917E",
+      "difficulty": "Hard",
+      "description": "[#03] Hard 极限并发：4 个 Prompt 竞争 heater，在 7.0s 触发 温度骤升（temperature=85.0），测试硬件抢占和灾难逃生",
+      "baseline": {
+        "makespan_sec": 15.091553855765781,
+        "llm_calls": 4,
+        "completed_nodes": 0,
+        "failed_nodes": 4,
+        "success": false,
+        "guardrail_triggered": true
+      },
+      "dag": {
+        "makespan_sec": 5.030517951921928,
+        "llm_calls": 1,
+        "completed_nodes": 4,
+        "failed_nodes": 0,
+        "success": true,
+        "preemption_triggered": false,
+        "preemption_latency_ms": 0.0
+      },
+      "chaos_injected": []
+    },
+    {
+      "episode_id": "bench-20260330-936E22",
+      "difficulty": "Easy",
+      "description": "[#04] Easy 并发实验：bio + generic，无资源冲突",
+      "baseline": {
+        "makespan_sec": 11.0,
+        "llm_calls": 3,
+        "completed_nodes": 3,
+        "failed_nodes": 0,
+        "success": true,
+        "guardrail_triggered": false
+      },
+      "dag": {
+        "makespan_sec": 5.0,
+        "llm_calls": 1,
+        "completed_nodes": 3,
+        "failed_nodes": 0,
+        "success": true,
+        "preemption_triggered": false,
+        "preemption_latency_ms": 0.0
+      },
+      "chaos_injected": []
+    },
+    {
+      "episode_id": "bench-20260330-1E8B8F",
+      "difficulty": "Medium",
+      "description": "[#05] Medium 资源冲突：3 个 Prompt 竞争 robotic_arm，注入 hardware_delay（延迟 3 倍）",
+      "baseline": {
+        "makespan_sec": 26.376653174049224,
+        "llm_calls": 3,
+        "completed_nodes": 3,
+        "failed_nodes": 0,
+        "success": true,
+        "guardrail_triggered": false
+      },
+      "dag": {
+        "makespan_sec": 11.989387806386011,
+        "llm_calls": 1,
+        "completed_nodes": 3,
+        "failed_nodes": 0,
+        "success": true,
+        "preemption_triggered": false,
+        "preemption_latency_ms": 0.0
+      },
+      "chaos_injected": []
+    },
+    {
+      "episode_id": "bench-20260330-D2E20C",
+      "difficulty": "Hard",
+      "description": "[#06] Hard 极限并发：4 个 Prompt 竞争 vacuum_pump，在 7.7s 触发 温度骤升（temperature=85.0），测试硬件抢占和灾难逃生",
+      "baseline": {
+        "makespan_sec": 21.646089273989134,
+        "llm_calls": 4,
+        "completed_nodes": 0,
+        "failed_nodes": 4,
+        "success": false,
+        "guardrail_triggered": true
+      },
+      "dag": {
+        "makespan_sec": 6.184596935425467,
+        "llm_calls": 1,
+        "completed_nodes": 4,
+        "failed_nodes": 0,
+        "success": true,
+        "preemption_triggered": false,
+        "preemption_latency_ms": 0.0
+      },
+      "chaos_injected": []
+    },
+    {
+      "episode_id": "bench-20260330-109D94",
+      "difficulty": "Hard",
+      "description": "[#07] Hard 极限并发：5 个 Prompt 竞争 heater，在 6.1s 触发 温度骤升（temperature=85.0），测试硬件抢占和灾难逃生",
+      "baseline": {
+        "makespan_sec": 25.667684158813543,
+        "llm_calls": 5,
+        "completed_nodes": 0,
+        "failed_nodes": 5,
+        "success": false,
+        "guardrail_triggered": true
+      },
+      "dag": {
+        "makespan_sec": 11.846623457913942,
+        "llm_calls": 1,
+        "completed_nodes": 5,
+        "failed_nodes": 0,
+        "success": true,
+        "preemption_triggered": false,
+        "preemption_latency_ms": 0.0
+      },
+      "chaos_injected": []
+    },
+    {
+      "episode_id": "bench-20260330-3EEE6A",
+      "difficulty": "Easy",
+      "description": "[#08] Easy 并发实验：fluid + material，无资源冲突",
+      "baseline": {
+        "makespan_sec": 6.0,
+        "llm_calls": 2,
+        "completed_nodes": 2,
+        "failed_nodes": 0,
+        "success": true,
+        "guardrail_triggered": false
+      },
+      "dag": {
+        "makespan_sec": 4.0,
+        "llm_calls": 1,
+        "completed_nodes": 2,
+        "failed_nodes": 0,
+        "success": true,
+        "preemption_triggered": false,
+        "preemption_latency_ms": 0.0
+      },
+      "chaos_injected": []
+    },
+    {
+      "episode_id": "bench-20260330-940D25",
+      "difficulty": "Medium",
+      "description": "[#09] Medium 资源冲突：4 个 Prompt 竞争 water_pump，注入 hardware_delay（延迟 3 倍）",
+      "baseline": {
+        "makespan_sec": 16.81756484182652,
+        "llm_calls": 4,
+        "completed_nodes": 4,
+        "failed_nodes": 0,
+        "success": true,
+        "guardrail_triggered": false
+      },
+      "dag": {
+        "makespan_sec": 5.605854947275507,
+        "llm_calls": 1,
+        "completed_nodes": 4,
+        "failed_nodes": 0,
+        "success": true,
+        "preemption_triggered": false,
+        "preemption_latency_ms": 0.0
+      },
+      "chaos_injected": []
+    },
+    {
+      "episode_id": "bench-20260330-F94982",
+      "difficulty": "Hard",
+      "description": "[#10] Hard 极限并发：4 个 Prompt 竞争 heater，在 7.1s 触发 烟雾浓度超限（smoke_level=0.9），测试硬件抢占和灾难逃生",
+      "baseline": {
+        "makespan_sec": 13.78902982821245,
+        "llm_calls": 4,
+        "completed_nodes": 0,
+        "failed_nodes": 4,
+        "success": false,
+        "guardrail_triggered": true
+      },
+      "dag": {
+        "makespan_sec": 4.596343276070817,
+        "llm_calls": 1,
+        "completed_nodes": 4,
+        "failed_nodes": 0,
+        "success": true,
+        "preemption_triggered": false,
+        "preemption_latency_ms": 0.0
+      },
+      "chaos_injected": []
+    },
+    {
+      "episode_id": "bench-20260330-4E33E8",
+      "difficulty": "Easy",
+      "description": "[#11] Easy 并发实验：fluid + bio，无资源冲突",
+      "baseline": {
+        "makespan_sec": 10.0,
+        "llm_calls": 3,
+        "completed_nodes": 3,
+        "failed_nodes": 0,
+        "success": true,
+        "guardrail_triggered": false
+      },
+      "dag": {
+        "makespan_sec": 4.0,
+        "llm_calls": 1,
+        "completed_nodes": 3,
+        "failed_nodes": 0,
+        "success": true,
+        "preemption_triggered": false,
+        "preemption_latency_ms": 0.0
+      },
+      "chaos_injected": []
+    },
+    {
+      "episode_id": "bench-20260330-C349F1",
+      "difficulty": "Medium",
+      "description": "[#12] Medium 资源冲突：4 个 Prompt 竞争 vacuum_pump，注入 hardware_delay（延迟 3 倍）",
+      "baseline": {
+        "makespan_sec": 30.788918136832404,
+        "llm_calls": 4,
+        "completed_nodes": 4,
+        "failed_nodes": 0,
+        "success": true,
+        "guardrail_triggered": false
+      },
+      "dag": {
+        "makespan_sec": 8.796833753380687,
+        "llm_calls": 1,
+        "completed_nodes": 4,
+        "failed_nodes": 0,
+        "success": true,
+        "preemption_triggered": false,
+        "preemption_latency_ms": 0.0
+      },
+      "chaos_injected": []
+    },
+    {
+      "episode_id": "bench-20260330-1F9D1C",
+      "difficulty": "Medium",
+      "description": "[#13] Medium 资源冲突：4 个 Prompt 竞争 robotic_arm，注入 hardware_delay（延迟 3 倍）",
+      "baseline": {
+        "makespan_sec": 25.77054405661679,
+        "llm_calls": 4,
+        "completed_nodes": 4,
+        "failed_nodes": 0,
+        "success": true,
+        "guardrail_triggered": false
+      },
+      "dag": {
+        "makespan_sec": 9.203765734505996,
+        "llm_calls": 1,
+        "completed_nodes": 4,
+        "failed_nodes": 0,
+        "success": true,
+        "preemption_triggered": false,
+        "preemption_latency_ms": 0.0
+      },
+      "chaos_injected": []
+    },
+    {
+      "episode_id": "bench-20260330-35651A",
+      "difficulty": "Easy",
+      "description": "[#14] Easy 并发实验：fluid + bio，无资源冲突",
+      "baseline": {
+        "makespan_sec": 7.0,
+        "llm_calls": 2,
+        "completed_nodes": 2,
+        "failed_nodes": 0,
+        "success": true,
+        "guardrail_triggered": false
+      },
+      "dag": {
+        "makespan_sec": 4.0,
+        "llm_calls": 1,
+        "completed_nodes": 2,
+        "failed_nodes": 0,
+        "success": true,
+        "preemption_triggered": false,
+        "preemption_latency_ms": 0.0
+      },
+      "chaos_injected": []
+    },
+    {
+      "episode_id": "bench-20260330-930B2C",
+      "difficulty": "Easy",
+      "description": "[#15] Easy 并发实验：fluid + bio，无资源冲突",
+      "baseline": {
+        "makespan_sec": 11.0,
+        "llm_calls": 3,
+        "completed_nodes": 3,
+        "failed_nodes": 0,
+        "success": true,
+        "guardrail_triggered": false
+      },
+      "dag": {
+        "makespan_sec": 5.0,
+        "llm_calls": 1,
+        "completed_nodes": 3,
+        "failed_nodes": 0,
+        "success": true,
+        "preemption_triggered": false,
+        "preemption_latency_ms": 0.0
+      },
+      "chaos_injected": []
+    },
+    {
+      "episode_id": "bench-20260330-53CFBD",
+      "difficulty": "Hard",
+      "description": "[#16] Hard 极限并发：5 个 Prompt 竞争 vacuum_pump，在 7.0s 触发 压力超限（pressure=150.0），测试硬件抢占和灾难逃生",
+      "baseline": {
+        "makespan_sec": 35.5503564759884,
+        "llm_calls": 5,
+        "completed_nodes": 0,
+        "failed_nodes": 5,
+        "success": false,
+        "guardrail_triggered": true
+      },
+      "dag": {
+        "makespan_sec": 15.800158433772623,
+        "llm_calls": 1,
+        "completed_nodes": 5,
+        "failed_nodes": 0,
+        "success": true,
+        "preemption_triggered": false,
+        "preemption_latency_ms": 0.0
+      },
+      "chaos_injected": []
+    },
+    {
+      "episode_id": "bench-20260330-22DA7C",
+      "difficulty": "Medium",
+      "description": "[#17] Medium 资源冲突：4 个 Prompt 竞争 robotic_arm，注入 hardware_delay（延迟 3 倍）",
+      "baseline": {
+        "makespan_sec": 31.532122735083206,
+        "llm_calls": 4,
+        "completed_nodes": 4,
+        "failed_nodes": 0,
+        "success": true,
+        "guardrail_triggered": false
+      },
+      "dag": {
+        "makespan_sec": 11.261472405386858,
+        "llm_calls": 1,
+        "completed_nodes": 4,
+        "failed_nodes": 0,
+        "success": true,
+        "preemption_triggered": false,
+        "preemption_latency_ms": 0.0
+      },
+      "chaos_injected": []
+    },
+    {
+      "episode_id": "bench-20260330-EC8260",
+      "difficulty": "Medium",
+      "description": "[#18] Medium 资源冲突：3 个 Prompt 竞争 vacuum_pump，注入 hardware_delay（延迟 3 倍）",
+      "baseline": {
+        "makespan_sec": 20.342766705523356,
+        "llm_calls": 3,
+        "completed_nodes": 3,
+        "failed_nodes": 0,
+        "success": true,
+        "guardrail_triggered": false
+      },
+      "dag": {
+        "makespan_sec": 7.397369711099402,
+        "llm_calls": 1,
+        "completed_nodes": 3,
+        "failed_nodes": 0,
+        "success": true,
+        "preemption_triggered": false,
+        "preemption_latency_ms": 0.0
+      },
+      "chaos_injected": []
+    },
+    {
+      "episode_id": "bench-20260330-1C670D",
+      "difficulty": "Hard",
+      "description": "[#19] Hard 极限并发：5 个 Prompt 竞争 vacuum_pump，在 7.0s 触发 CO2 浓度过高（co2_level=2000.0），测试硬件抢占和灾难逃生",
+      "baseline": {
+        "makespan_sec": 29.95435756077936,
+        "llm_calls": 5,
+        "completed_nodes": 0,
+        "failed_nodes": 5,
+        "success": false,
+        "guardrail_triggered": true
+      },
+      "dag": {
+        "makespan_sec": 13.313047804790827,
+        "llm_calls": 1,
+        "completed_nodes": 5,
+        "failed_nodes": 0,
+        "success": true,
+        "preemption_triggered": false,
+        "preemption_latency_ms": 0.0
+      },
+      "chaos_injected": []
+    },
+    {
+      "episode_id": "bench-20260330-5C7D76",
+      "difficulty": "Easy",
+      "description": "[#20] Easy 并发实验：fluid + bio，无资源冲突",
+      "baseline": {
+        "makespan_sec": 10.0,
+        "llm_calls": 3,
+        "completed_nodes": 3,
+        "failed_nodes": 0,
+        "success": true,
+        "guardrail_triggered": false
+      },
+      "dag": {
+        "makespan_sec": 4.0,
+        "llm_calls": 1,
+        "completed_nodes": 3,
+        "failed_nodes": 0,
+        "success": true,
+        "preemption_triggered": false,
+        "preemption_latency_ms": 0.0
+      },
+      "chaos_injected": []
+    },
+    {
+      "episode_id": "bench-20260330-63C070",
+      "difficulty": "Hard",
+      "description": "[#21] Hard 极限并发：5 个 Prompt 竞争 heater，在 5.6s 触发 CO2 浓度过高（co2_level=2000.0），测试硬件抢占和灾难逃生",
+      "baseline": {
+        "makespan_sec": 22.063907671636397,
+        "llm_calls": 5,
+        "completed_nodes": 0,
+        "failed_nodes": 5,
+        "success": false,
+        "guardrail_triggered": true
+      },
+      "dag": {
+        "makespan_sec": 11.031953835818198,
+        "llm_calls": 1,
+        "completed_nodes": 5,
+        "failed_nodes": 0,
+        "success": true,
+        "preemption_triggered": false,
+        "preemption_latency_ms": 0.0
+      },
+      "chaos_injected": []
+    },
+    {
+      "episode_id": "bench-20260330-9691C9",
+      "difficulty": "Easy",
+      "description": "[#22] Easy 并发实验：fluid + bio，无资源冲突",
+      "baseline": {
+        "makespan_sec": 6.0,
+        "llm_calls": 2,
+        "completed_nodes": 2,
+        "failed_nodes": 0,
+        "success": true,
+        "guardrail_triggered": false
+      },
+      "dag": {
+        "makespan_sec": 3.0,
+        "llm_calls": 1,
+        "completed_nodes": 2,
+        "failed_nodes": 0,
+        "success": true,
+        "preemption_triggered": false,
+        "preemption_latency_ms": 0.0
+      },
+      "chaos_injected": []
+    },
+    {
+      "episode_id": "bench-20260330-5A5E0F",
+      "difficulty": "Easy",
+      "description": "[#23] Easy 并发实验：fluid + material，无资源冲突",
+      "baseline": {
+        "makespan_sec": 10.0,
+        "llm_calls": 3,
+        "completed_nodes": 3,
+        "failed_nodes": 0,
+        "success": true,
+        "guardrail_triggered": false
+      },
+      "dag": {
+        "makespan_sec": 4.0,
+        "llm_calls": 1,
+        "completed_nodes": 3,
+        "failed_nodes": 0,
+        "success": true,
+        "preemption_triggered": false,
+        "preemption_latency_ms": 0.0
+      },
+      "chaos_injected": []
+    },
+    {
+      "episode_id": "bench-20260330-33D306",
+      "difficulty": "Medium",
+      "description": "[#24] Medium 资源冲突：3 个 Prompt 竞争 robotic_arm，注入 hardware_delay（延迟 3 倍）",
+      "baseline": {
+        "makespan_sec": 19.30932442162702,
+        "llm_calls": 3,
+        "completed_nodes": 3,
+        "failed_nodes": 0,
+        "success": true,
+        "guardrail_triggered": false
+      },
+      "dag": {
+        "makespan_sec": 8.7769656461941,
+        "llm_calls": 1,
+        "completed_nodes": 3,
+        "failed_nodes": 0,
+        "success": true,
+        "preemption_triggered": false,
+        "preemption_latency_ms": 0.0
+      },
+      "chaos_injected": []
+    },
+    {
+      "episode_id": "bench-20260330-1A303E",
+      "difficulty": "Easy",
+      "description": "[#25] Easy 并发实验：fluid + bio，无资源冲突",
+      "baseline": {
+        "makespan_sec": 7.0,
+        "llm_calls": 2,
+        "completed_nodes": 2,
+        "failed_nodes": 0,
+        "success": true,
+        "guardrail_triggered": false
+      },
+      "dag": {
+        "makespan_sec": 4.0,
+        "llm_calls": 1,
+        "completed_nodes": 2,
+        "failed_nodes": 0,
+        "success": true,
+        "preemption_triggered": false,
+        "preemption_latency_ms": 0.0
+      },
+      "chaos_injected": []
+    },
+    {
+      "episode_id": "bench-20260330-EE4838",
+      "difficulty": "Easy",
+      "description": "[#26] Easy 并发实验：fluid + material，无资源冲突",
+      "baseline": {
+        "makespan_sec": 7.0,
+        "llm_calls": 2,
+        "completed_nodes": 2,
+        "failed_nodes": 0,
+        "success": true,
+        "guardrail_triggered": false
+      },
+      "dag": {
+        "makespan_sec": 4.0,
+        "llm_calls": 1,
+        "completed_nodes": 2,
+        "failed_nodes": 0,
+        "success": true,
+        "preemption_triggered": false,
+        "preemption_latency_ms": 0.0
+      },
+      "chaos_injected": []
+    },
+    {
+      "episode_id": "bench-20260330-1BB161",
+      "difficulty": "Hard",
+      "description": "[#27] Hard 极限并发：5 个 Prompt 竞争 water_pump，在 5.3s 触发 烟雾浓度超限（smoke_level=0.9），测试硬件抢占和灾难逃生",
+      "baseline": {
+        "makespan_sec": 17.72795144602761,
+        "llm_calls": 5,
+        "completed_nodes": 0,
+        "failed_nodes": 5,
+        "success": false,
+        "guardrail_triggered": true
+      },
+      "dag": {
+        "makespan_sec": 7.091180578411045,
+        "llm_calls": 1,
+        "completed_nodes": 5,
+        "failed_nodes": 0,
+        "success": true,
+        "preemption_triggered": false,
+        "preemption_latency_ms": 0.0
+      },
+      "chaos_injected": []
+    },
+    {
+      "episode_id": "bench-20260330-BACF0F",
+      "difficulty": "Medium",
+      "description": "[#28] Medium 资源冲突：4 个 Prompt 竞争 co2_controller，注入 hardware_delay（延迟 3 倍）",
+      "baseline": {
+        "makespan_sec": 21.45128103537558,
+        "llm_calls": 4,
+        "completed_nodes": 4,
+        "failed_nodes": 0,
+        "success": true,
+        "guardrail_triggered": false
+      },
+      "dag": {
+        "makespan_sec": 5.362820258843895,
+        "llm_calls": 1,
+        "completed_nodes": 4,
+        "failed_nodes": 0,
+        "success": true,
+        "preemption_triggered": false,
+        "preemption_latency_ms": 0.0
+      },
+      "chaos_injected": []
+    },
+    {
+      "episode_id": "bench-20260330-D33697",
+      "difficulty": "Medium",
+      "description": "[#29] Medium 资源冲突：3 个 Prompt 竞争 vacuum_pump，注入 hardware_delay（延迟 3 倍）",
+      "baseline": {
+        "makespan_sec": 27.061501607566175,
+        "llm_calls": 3,
+        "completed_nodes": 3,
+        "failed_nodes": 0,
+        "success": true,
+        "guardrail_triggered": false
+      },
+      "dag": {
+        "makespan_sec": 9.840546039114972,
+        "llm_calls": 1,
+        "completed_nodes": 3,
+        "failed_nodes": 0,
+        "success": true,
+        "preemption_triggered": false,
+        "preemption_latency_ms": 0.0
+      },
+      "chaos_injected": []
+    },
+    {
+      "episode_id": "bench-20260330-14BDE7",
+      "difficulty": "Easy",
+      "description": "[#30] Easy 并发实验：bio + generic，无资源冲突",
+      "baseline": {
+        "makespan_sec": 9.0,
+        "llm_calls": 3,
+        "completed_nodes": 3,
+        "failed_nodes": 0,
+        "success": true,
+        "guardrail_triggered": false
+      },
+      "dag": {
+        "makespan_sec": 3.0,
+        "llm_calls": 1,
+        "completed_nodes": 3,
+        "failed_nodes": 0,
+        "success": true,
+        "preemption_triggered": false,
+        "preemption_latency_ms": 0.0
+      },
+      "chaos_injected": []
+    },
+    {
+      "episode_id": "bench-20260330-7B0BFC",
+      "difficulty": "Medium",
+      "description": "[#31] Medium 资源冲突：3 个 Prompt 竞争 heater，注入 hardware_delay（延迟 3 倍）",
+      "baseline": {
+        "makespan_sec": 17.670066594355703,
+        "llm_calls": 3,
+        "completed_nodes": 3,
+        "failed_nodes": 0,
+        "success": true,
+        "guardrail_triggered": false
+      },
+      "dag": {
+        "makespan_sec": 6.6262749728833885,
+        "llm_calls": 1,
+        "completed_nodes": 3,
+        "failed_nodes": 0,
+        "success": true,
+        "preemption_triggered": false,
+        "preemption_latency_ms": 0.0
+      },
+      "chaos_injected": []
+    },
+    {
+      "episode_id": "bench-20260330-54F626",
+      "difficulty": "Hard",
+      "description": "[#32] Hard 极限并发：4 个 Prompt 竞争 co2_controller，在 7.0s 触发 温度骤升（temperature=85.0），测试硬件抢占和灾难逃生",
+      "baseline": {
+        "makespan_sec": 23.3559589572682,
+        "llm_calls": 4,
+        "completed_nodes": 0,
+        "failed_nodes": 4,
+        "success": false,
+        "guardrail_triggered": true
+      },
+      "dag": {
+        "makespan_sec": 5.83898973931705,
+        "llm_calls": 1,
+        "completed_nodes": 4,
+        "failed_nodes": 0,
+        "success": true,
+        "preemption_triggered": false,
+        "preemption_latency_ms": 0.0
+      },
+      "chaos_injected": []
+    },
+    {
+      "episode_id": "bench-20260330-D61112",
+      "difficulty": "Easy",
+      "description": "[#33] Easy 并发实验：fluid + material，无资源冲突",
+      "baseline": {
+        "makespan_sec": 9.0,
+        "llm_calls": 3,
+        "completed_nodes": 3,
+        "failed_nodes": 0,
+        "success": true,
+        "guardrail_triggered": false
+      },
+      "dag": {
+        "makespan_sec": 4.0,
+        "llm_calls": 1,
+        "completed_nodes": 3,
+        "failed_nodes": 0,
+        "success": true,
+        "preemption_triggered": false,
+        "preemption_latency_ms": 0.0
+      },
+      "chaos_injected": []
+    },
+    {
+      "episode_id": "bench-20260330-DA0736",
+      "difficulty": "Medium",
+      "description": "[#34] Medium 资源冲突：3 个 Prompt 竞争 water_pump，注入 hardware_delay（延迟 3 倍）",
+      "baseline": {
+        "makespan_sec": 13.538456491218405,
+        "llm_calls": 3,
+        "completed_nodes": 3,
+        "failed_nodes": 0,
+        "success": true,
+        "guardrail_triggered": false
+      },
+      "dag": {
+        "makespan_sec": 4.512818830406135,
+        "llm_calls": 1,
+        "completed_nodes": 3,
+        "failed_nodes": 0,
+        "success": true,
+        "preemption_triggered": false,
+        "preemption_latency_ms": 0.0
+      },
+      "chaos_injected": []
+    },
+    {
+      "episode_id": "bench-20260330-B305C4",
+      "difficulty": "Easy",
+      "description": "[#35] Easy 并发实验：bio + generic，无资源冲突",
+      "baseline": {
+        "makespan_sec": 6.0,
+        "llm_calls": 2,
+        "completed_nodes": 2,
+        "failed_nodes": 0,
+        "success": true,
+        "guardrail_triggered": false
+      },
+      "dag": {
+        "makespan_sec": 3.0,
+        "llm_calls": 1,
+        "completed_nodes": 2,
+        "failed_nodes": 0,
+        "success": true,
+        "preemption_triggered": false,
+        "preemption_latency_ms": 0.0
+      },
+      "chaos_injected": []
+    },
+    {
+      "episode_id": "bench-20260330-A67509",
+      "difficulty": "Medium",
+      "description": "[#36] Medium 资源冲突：4 个 Prompt 竞争 co2_controller，注入 hardware_delay（延迟 3 倍）",
+      "baseline": {
+        "makespan_sec": 28.272200202585324,
+        "llm_calls": 4,
+        "completed_nodes": 4,
+        "failed_nodes": 0,
+        "success": true,
+        "guardrail_triggered": false
+      },
+      "dag": {
+        "makespan_sec": 7.068050050646331,
+        "llm_calls": 1,
+        "completed_nodes": 4,
+        "failed_nodes": 0,
+        "success": true,
+        "preemption_triggered": false,
+        "preemption_latency_ms": 0.0
+      },
+      "chaos_injected": []
+    },
+    {
+      "episode_id": "bench-20260330-C7A651",
+      "difficulty": "Medium",
+      "description": "[#37] Medium 资源冲突：3 个 Prompt 竞争 vacuum_pump，注入 hardware_delay（延迟 3 倍）",
+      "baseline": {
+        "makespan_sec": 21.547437427707514,
+        "llm_calls": 3,
+        "completed_nodes": 3,
+        "failed_nodes": 0,
+        "success": true,
+        "guardrail_triggered": false
+      },
+      "dag": {
+        "makespan_sec": 7.835431791893641,
+        "llm_calls": 1,
+        "completed_nodes": 3,
+        "failed_nodes": 0,
+        "success": true,
+        "preemption_triggered": false,
+        "preemption_latency_ms": 0.0
+      },
+      "chaos_injected": []
+    },
+    {
+      "episode_id": "bench-20260330-3B2C24",
+      "difficulty": "Hard",
+      "description": "[#38] Hard 极限并发：5 个 Prompt 竞争 water_pump，在 6.4s 触发 压力超限（pressure=150.0），测试硬件抢占和灾难逃生",
+      "baseline": {
+        "makespan_sec": 16.493063261861916,
+        "llm_calls": 5,
+        "completed_nodes": 0,
+        "failed_nodes": 5,
+        "success": false,
+        "guardrail_triggered": true
+      },
+      "dag": {
+        "makespan_sec": 6.597225304744767,
+        "llm_calls": 1,
+        "completed_nodes": 5,
+        "failed_nodes": 0,
+        "success": true,
+        "preemption_triggered": false,
+        "preemption_latency_ms": 0.0
+      },
+      "chaos_injected": []
+    },
+    {
+      "episode_id": "bench-20260330-57A2FB",
+      "difficulty": "Easy",
+      "description": "[#39] Easy 并发实验：fluid + bio，无资源冲突",
+      "baseline": {
+        "makespan_sec": 7.0,
+        "llm_calls": 2,
+        "completed_nodes": 2,
+        "failed_nodes": 0,
+        "success": true,
+        "guardrail_triggered": false
+      },
+      "dag": {
+        "makespan_sec": 4.0,
+        "llm_calls": 1,
+        "completed_nodes": 2,
+        "failed_nodes": 0,
+        "success": true,
+        "preemption_triggered": false,
+        "preemption_latency_ms": 0.0
+      },
+      "chaos_injected": []
+    },
+    {
+      "episode_id": "bench-20260330-870A29",
+      "difficulty": "Hard",
+      "description": "[#40] Hard 极限并发：5 个 Prompt 竞争 robotic_arm，在 6.3s 触发 烟雾浓度超限（smoke_level=0.9），测试硬件抢占和灾难逃生",
+      "baseline": {
+        "makespan_sec": 29.844978973433992,
+        "llm_calls": 5,
+        "completed_nodes": 0,
+        "failed_nodes": 5,
+        "success": false,
+        "guardrail_triggered": true
+      },
+      "dag": {
+        "makespan_sec": 17.555869984372936,
+        "llm_calls": 1,
+        "completed_nodes": 5,
+        "failed_nodes": 0,
+        "success": true,
+        "preemption_triggered": false,
+        "preemption_latency_ms": 0.0
+      },
+      "chaos_injected": []
+    },
+    {
+      "episode_id": "bench-20260330-2E313C",
+      "difficulty": "Medium",
+      "description": "[#41] Medium 资源冲突：4 个 Prompt 竞争 robotic_arm，注入 hardware_delay（延迟 3 倍）",
+      "baseline": {
+        "makespan_sec": 28.941578602896712,
+        "llm_calls": 4,
+        "completed_nodes": 4,
+        "failed_nodes": 0,
+        "success": true,
+        "guardrail_triggered": false
+      },
+      "dag": {
+        "makespan_sec": 10.336278072463113,
+        "llm_calls": 1,
+        "completed_nodes": 4,
+        "failed_nodes": 0,
+        "success": true,
+        "preemption_triggered": false,
+        "preemption_latency_ms": 0.0
+      },
+      "chaos_injected": []
+    },
+    {
+      "episode_id": "bench-20260330-9B03AE",
+      "difficulty": "Medium",
+      "description": "[#42] Medium 资源冲突：3 个 Prompt 竞争 water_pump，注入 hardware_delay（延迟 3 倍）",
+      "baseline": {
+        "makespan_sec": 24.0850719940303,
+        "llm_calls": 3,
+        "completed_nodes": 3,
+        "failed_nodes": 0,
+        "success": true,
+        "guardrail_triggered": false
+      },
+      "dag": {
+        "makespan_sec": 12.04253599701515,
+        "llm_calls": 1,
+        "completed_nodes": 3,
+        "failed_nodes": 0,
+        "success": true,
+        "preemption_triggered": false,
+        "preemption_latency_ms": 0.0
+      },
+      "chaos_injected": []
+    },
+    {
+      "episode_id": "bench-20260330-C85F14",
+      "difficulty": "Hard",
+      "description": "[#43] Hard 极限并发：4 个 Prompt 竞争 robotic_arm，在 5.1s 触发 烟雾浓度超限（smoke_level=0.9），测试硬件抢占和灾难逃生",
+      "baseline": {
+        "makespan_sec": 27.88755215947296,
+        "llm_calls": 4,
+        "completed_nodes": 0,
+        "failed_nodes": 4,
+        "success": false,
+        "guardrail_triggered": true
+      },
+      "dag": {
+        "makespan_sec": 9.95984005695463,
+        "llm_calls": 1,
+        "completed_nodes": 4,
+        "failed_nodes": 0,
+        "success": true,
+        "preemption_triggered": false,
+        "preemption_latency_ms": 0.0
+      },
+      "chaos_injected": []
+    },
+    {
+      "episode_id": "bench-20260330-9EC3C9",
+      "difficulty": "Medium",
+      "description": "[#44] Medium 资源冲突：3 个 Prompt 竞争 heater，注入 hardware_delay（延迟 3 倍）",
+      "baseline": {
+        "makespan_sec": 19.574109990233083,
+        "llm_calls": 3,
+        "completed_nodes": 3,
+        "failed_nodes": 0,
+        "success": true,
+        "guardrail_triggered": false
+      },
+      "dag": {
+        "makespan_sec": 7.340291246337406,
+        "llm_calls": 1,
+        "completed_nodes": 3,
+        "failed_nodes": 0,
+        "success": true,
+        "preemption_triggered": false,
+        "preemption_latency_ms": 0.0
+      },
+      "chaos_injected": []
+    },
+    {
+      "episode_id": "bench-20260330-62A0B7",
+      "difficulty": "Easy",
+      "description": "[#45] Easy 并发实验：fluid + bio，无资源冲突",
+      "baseline": {
+        "makespan_sec": 7.0,
+        "llm_calls": 2,
+        "completed_nodes": 2,
+        "failed_nodes": 0,
+        "success": true,
+        "guardrail_triggered": false
+      },
+      "dag": {
+        "makespan_sec": 4.0,
+        "llm_calls": 1,
+        "completed_nodes": 2,
+        "failed_nodes": 0,
+        "success": true,
+        "preemption_triggered": false,
+        "preemption_latency_ms": 0.0
+      },
+      "chaos_injected": []
+    },
+    {
+      "episode_id": "bench-20260330-B59002",
+      "difficulty": "Hard",
+      "description": "[#46] Hard 极限并发：5 个 Prompt 竞争 co2_controller，在 7.4s 触发 烟雾浓度超限（smoke_level=0.9），测试硬件抢占和灾难逃生",
+      "baseline": {
+        "makespan_sec": 24.50104282195854,
+        "llm_calls": 5,
+        "completed_nodes": 0,
+        "failed_nodes": 5,
+        "success": false,
+        "guardrail_triggered": true
+      },
+      "dag": {
+        "makespan_sec": 9.800417128783415,
+        "llm_calls": 1,
+        "completed_nodes": 5,
+        "failed_nodes": 0,
+        "success": true,
+        "preemption_triggered": false,
+        "preemption_latency_ms": 0.0
+      },
+      "chaos_injected": []
+    },
+    {
+      "episode_id": "bench-20260330-FEBEB8",
+      "difficulty": "Hard",
+      "description": "[#47] Hard 极限并发：5 个 Prompt 竞争 water_pump，在 6.9s 触发 压力超限（pressure=150.0），测试硬件抢占和灾难逃生",
+      "baseline": {
+        "makespan_sec": 20.639235559589416,
+        "llm_calls": 5,
+        "completed_nodes": 0,
+        "failed_nodes": 5,
+        "success": false,
+        "guardrail_triggered": true
+      },
+      "dag": {
+        "makespan_sec": 10.319617779794708,
+        "llm_calls": 1,
+        "completed_nodes": 5,
+        "failed_nodes": 0,
+        "success": true,
+        "preemption_triggered": false,
+        "preemption_latency_ms": 0.0
+      },
+      "chaos_injected": []
+    },
+    {
+      "episode_id": "bench-20260330-3E2940",
+      "difficulty": "Medium",
+      "description": "[#48] Medium 资源冲突：3 个 Prompt 竞争 co2_controller，注入 hardware_delay（延迟 3 倍）",
+      "baseline": {
+        "makespan_sec": 16.52914352532894,
+        "llm_calls": 3,
+        "completed_nodes": 3,
+        "failed_nodes": 0,
+        "success": true,
+        "guardrail_triggered": false
+      },
+      "dag": {
+        "makespan_sec": 5.50971450844298,
+        "llm_calls": 1,
+        "completed_nodes": 3,
+        "failed_nodes": 0,
+        "success": true,
+        "preemption_triggered": false,
+        "preemption_latency_ms": 0.0
+      },
+      "chaos_injected": []
+    },
+    {
+      "episode_id": "bench-20260330-57CBCA",
+      "difficulty": "Medium",
+      "description": "[#49] Medium 资源冲突：3 个 Prompt 竞争 co2_controller，注入 hardware_delay（延迟 3 倍）",
+      "baseline": {
+        "makespan_sec": 19.028077596792347,
+        "llm_calls": 3,
+        "completed_nodes": 3,
+        "failed_nodes": 0,
+        "success": true,
+        "guardrail_triggered": false
+      },
+      "dag": {
+        "makespan_sec": 6.342692532264116,
+        "llm_calls": 1,
+        "completed_nodes": 3,
+        "failed_nodes": 0,
+        "success": true,
+        "preemption_triggered": false,
+        "preemption_latency_ms": 0.0
+      },
+      "chaos_injected": []
+    },
+    {
+      "episode_id": "bench-20260330-2B9E89",
+      "difficulty": "Medium",
+      "description": "[#50] Medium 资源冲突：3 个 Prompt 竞争 vacuum_pump，注入 hardware_delay（延迟 3 倍）",
+      "baseline": {
+        "makespan_sec": 20.830618095168646,
+        "llm_calls": 3,
+        "completed_nodes": 3,
+        "failed_nodes": 0,
+        "success": true,
+        "guardrail_triggered": false
+      },
+      "dag": {
+        "makespan_sec": 7.574770216424962,
+        "llm_calls": 1,
+        "completed_nodes": 3,
+        "failed_nodes": 0,
+        "success": true,
+        "preemption_triggered": false,
+        "preemption_latency_ms": 0.0
+      },
+      "chaos_injected": []
+    }
+  ]
+}
