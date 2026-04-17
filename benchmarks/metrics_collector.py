@@ -411,11 +411,114 @@ class MetricsCollector:
         self._completed_nodes: list[dict[str, Any]] = []
         self._expected_topology: dict[str, list[str]] = {}  # 预期的 DAG 边关系
 
+        # OoO 越级追踪
+        self._ooo_promotions: list[dict[str, Any]] = []
+
+        # 预注册任务列表（用于正确计算成功率）
+        self._expected_tasks: dict[str, dict[str, Any]] = {}
+        self._completed_task_ids: set[str] = set()
+        self._failed_task_ids: set[str] = set()
+
+        # 设备结果和报警追踪
+        self._device_results: list[dict[str, Any]] = []
+        self._alarm_events: list[dict[str, Any]] = []
+
         logger.info("[MetricsCollector] V8.0 指标收集器初始化: %s", experiment_name)
 
     # --------------------------------------------------------------------------- #
     #  生命周期方法                                                              #
     # --------------------------------------------------------------------------- #
+
+    def experiment_start(self) -> None:
+        """启动实验指标收集。"""
+        self._running = True
+        self._start_wall_clock = time.time()
+        self._ooo_promotions.clear()
+        self._completed_task_ids.clear()
+        self._failed_task_ids.clear()
+        logger.info("[MetricsCollector] 实验指标收集启动")
+
+    def experiment_end(self) -> None:
+        """停止实验指标收集。"""
+        self._running = False
+        self._end_wall_clock = time.time()
+        logger.info(
+            "[MetricsCollector] 实验指标收集停止 (持续: %.2fs)",
+            self._end_wall_clock - self._start_wall_clock,
+        )
+
+    def register_expected_tasks(self, task_defs: list[dict[str, Any]]) -> None:
+        """预注册所有预期任务（用于正确计算成功率）。"""
+        for td in task_defs:
+            self._expected_tasks[td["task_id"]] = td
+
+    def record_task_complete(self, task_id: str, device_results: list[Any]) -> None:
+        """记录任务完成。"""
+        self._completed_task_ids.add(task_id)
+
+    def record_task_fail(self, task_id: str) -> None:
+        """记录任务失败。"""
+        self._failed_task_ids.add(task_id)
+
+    def record_ooo_promotion(
+        self,
+        task_id: str,
+        reason: str,
+        elapsed_since_submit_ms: float,
+    ) -> None:
+        """记录一次 OoO 越级发射。"""
+        self._ooo_promotions.append({
+            "task_id": task_id,
+            "reason": reason,
+            "elapsed_since_submit_ms": elapsed_since_submit_ms,
+            "timestamp": time.time(),
+        })
+
+    def finalize(self) -> dict[str, Any]:
+        """V8.1: 生成最终指标报告（由 experiment_end 后调用）。
+
+        计算所有 benchmark 所需的指标。
+        """
+        if not self._expected_tasks:
+            # 无预注册任务时，尝试从已完成节点推断
+            total_tasks = len(self._completed_task_ids) + len(self._failed_task_ids)
+        else:
+            total_tasks = len(self._expected_tasks)
+
+        completed = len(self._completed_task_ids)
+        failed = len(self._failed_task_ids)
+
+        # 计算执行时长
+        wall_clock_elapsed = self._end_wall_clock - self._start_wall_clock
+        makespan_s = self.makespan.ooo_makespan_s if self.makespan.ooo_makespan_s > 0 else wall_clock_elapsed
+
+        # 成功率
+        success_rate = completed / total_tasks if total_tasks > 0 else 0.0
+
+        # 重叠率（placeholder，基于活跃节点时间估算）
+        overlap_ratio = 0.0
+
+        # 设备结果数量
+        device_count = len(getattr(self, '_device_results', []))
+
+        # 报警数量
+        alarm_count = len(getattr(self, '_alarm_events', []))
+
+        return {
+            "makespan_s": round(makespan_s, 3),
+            "success_rate": success_rate,
+            "overlap_ratio": overlap_ratio,
+            "cpu_busy_ratio": 0.0,
+            "ooo_promotion_count": len(self._ooo_promotions),
+            "conf_stall_count": 0,
+            "device_results_count": device_count,
+            "alarm_count": alarm_count,
+            "total_tasks": total_tasks,
+            "completed_tasks": completed,
+            "failed_tasks": failed,
+            "wall_clock_elapsed_s": round(wall_clock_elapsed, 3),
+            "ooo_promotions": self._ooo_promotions,
+        }
 
     def start(self) -> None:
         """启动指标收集。"""
@@ -558,6 +661,21 @@ class MetricsCollector:
             "[Metrics] Node Complete: %s (graph=%s, status=%s, elapsed=%.3fs)",
             node_id, graph_id, status, elapsed_s,
         )
+
+    def record_device_result(self, result: Any) -> None:
+        """记录设备调用结果（用于统计设备使用次数）。"""
+        if hasattr(result, 'to_dict'):
+            self._device_results.append(result.to_dict())
+        elif isinstance(result, dict):
+            self._device_results.append(result)
+
+    def record_alarm_trigger(self, alarm_id: str, condition: str) -> None:
+        """记录报警触发事件。"""
+        self._alarm_events.append({
+            "alarm_id": alarm_id,
+            "condition": condition,
+            "timestamp": time.time(),
+        })
 
     def on_dag_start(self, graph_id: str, node_count: int) -> None:
         """V8.0 回调：DAG 开始执行。"""

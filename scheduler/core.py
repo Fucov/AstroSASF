@@ -591,21 +591,29 @@ class DAGOrchestrator:
         return dag_graph.graph_id
 
     async def _classify_and_enqueue_nodes(self, dag_graph: DAGTaskGraph) -> None:
-        """将 DAG 节点分类并入队。"""
+        """将 DAG 节点分类并入队。
+
+        V8.2 协同调度设计：
+        - 无依赖节点（初始就绪）→ ReadyQueue（Worker 正常执行）
+        - 有依赖节点（依赖未满足）→ blocked_queue（OoO Scanner 越级）
+        - Worker 执行完成后 → _settle_completed_node → 下游节点加入 blocked_queue（Scanner 越级）
+        """
         ready_count = 0
         blocked_count = 0
 
         for node in dag_graph.nodes.values():
             if self._can_node_run(node, dag_graph):
+                # 无依赖节点 → ReadyQueue（Worker 执行路径）
                 await self._enqueue_ready_node(node)
                 ready_count += 1
             else:
+                # 有依赖节点 → blocked_queue（OoO Scanner 越级路径）
                 async with self._lock:
                     self._blocked_queue.append(node)
                 blocked_count += 1
 
         logger.info(
-            "[DAG调度器] 节点分类完成: %d 就绪, %d 阻塞",
+            "[DAG调度器] 节点分类完成: %d 就绪 (→ ReadyQueue), %d 阻塞 (→ blocked_queue)",
             ready_count, blocked_count,
         )
 
@@ -640,7 +648,7 @@ class DAGOrchestrator:
         completed_node: DAGNode,
         dag_graph: DAGTaskGraph,
     ) -> None:
-        """结算完成的节点，解除下游依赖并尝试越级发射。
+        """结算完成的节点，解除下游依赖并触发越级扫描。
 
         V8.1 失败传播机制：
         - 当某节点 FAILED 时，递归标记所有依赖该节点的下游节点为 FAILED
@@ -648,8 +656,10 @@ class DAGOrchestrator:
         - 与 Traditional DAG 的关键区别：OoO 在失败传播的同时继续执行其他节点
         - Traditional DAG 在失败传播后直接终止整个 DAG
 
-        消融实验支持：
-        - 若 ablated_dims 包含 "event_wakeup" 或 "ooo_scanner"，则禁用越级发射
+        V8.2 关键修复：
+        - 节点完成后，收集所有直接下游节点（依赖该节点）
+        - 检查下游节点的依赖是否全部满足，若是则加入 blocked_queue
+        - 这样 OoO scanner 能发现这些节点并越级执行
         """
         logger.info(
             "[DAG调度器] 结算节点 '%s' (状态: %s)",
@@ -657,120 +667,59 @@ class DAGOrchestrator:
         )
 
         # ── V8.1: 失败传播 ─────────────────────────────────────────────────
-        # 当某节点失败时，标记所有依赖它的下游节点为失败（依赖链断裂）
         if completed_node.status == NodeStatus.FAILED:
             await self._cascade_failures(completed_node, dag_graph)
 
-        skip_ooo_promotion = "event_wakeup" in self.ablated_dims or "ooo_scanner" in self.ablated_dims
+        skip_ooo = "event_wakeup" in self.ablated_dims or "ooo_scanner" in self.ablated_dims
 
-        # ── 阶段 1：在锁内收集候选节点 ───────────────────────────────
-        ready_candidates: list[DAGNode] = []
-        promoted_nodes: list[DAGNode] = []  # 需要并行越级执行的节点
-        still_blocked: list[DAGNode] = []
-
+        # ── V8.2: 收集依赖已满足的下游节点加入 blocked_queue ─────────────
+        # 关键：初始就绪的节点（无依赖）由 submit_dag 处理，
+        # 这里处理的是后续依赖变为满足的节点
         async with self._ooo_lock:
-            async with self._lock:
-                # 找出所有依赖已满足的阻塞节点
-                for blocked_node in self._blocked_queue:
-                    if blocked_node.graph_id != dag_graph.graph_id:
-                        still_blocked.append(blocked_node)
-                        continue
-                    # V8.1: 检查依赖是否满足（包括 FAILED 依赖也算不满足）
-                    deps_satisfied = all(
-                        dag_graph.nodes[dep_id].status == NodeStatus.COMPLETED
-                        for dep_id in blocked_node.dependencies
-                        if dep_id in dag_graph.nodes
-                    )
-                    if deps_satisfied:
-                        ready_candidates.append(blocked_node)
-                    else:
-                        still_blocked.append(blocked_node)
+            for node in dag_graph.nodes.values():
+                if node.status != NodeStatus.PENDING:
+                    continue
+                # 检查该节点是否依赖 completed_node
+                if completed_node.node_id not in node.dependencies:
+                    continue
+                # 检查所有依赖是否已满足
+                if not self._can_node_run(node, dag_graph):
+                    continue
+                # 检查是否已在 blocked_queue
+                if any(n.node_id == node.node_id for n in self._blocked_queue):
+                    continue
+                # 加入 blocked_queue（供 scanner 越级）
+                self._blocked_queue.append(node)
+                logger.debug(
+                    "[DAG调度器] 节点 '%s' 依赖已满足，加入 blocked_queue（待越级）",
+                    node.node_id,
+                )
 
-                self._blocked_queue = still_blocked
-
-                if skip_ooo_promotion:
-                    # 禁用越级：全部入 ReadyQueue
-                    for blocked_node in ready_candidates:
-                        blocked_node.status = NodeStatus.READY
-                        await self._ready_queue.put((blocked_node.get_ready_score(), blocked_node))
-                        self._issue_times[blocked_node.node_id] = time.monotonic()
-                    return
-
-                # ── 阶段 2：检查每个候选节点是否可以越级 ──────────────
-                for blocked_node in ready_candidates:
-                    can_promote, reason = await self._check_ooo_promotion(blocked_node, dag_graph)
-                    if not can_promote:
-                        blocked_node.status = NodeStatus.READY
-                        await self._ready_queue.put((blocked_node.get_ready_score(), blocked_node))
-                        self._issue_times[blocked_node.node_id] = time.monotonic()
-                        continue
-
-                    required_resources = self._extract_required_resources(blocked_node)
-                    if "orthogonality_check" not in self.ablated_dims:
-                        if not self._resource_table.check_orthogonality(set(required_resources)):
-                            blocked_node.status = NodeStatus.READY
-                            await self._ready_queue.put((blocked_node.get_ready_score(), blocked_node))
-                            self._issue_times[blocked_node.node_id] = time.monotonic()
-                            continue
-
-                    # 原子预约所有资源
-                    reservation_ok = True
-                    acquired: list[str] = []
-                    for res in sorted(required_resources):
-                        if await self._resource_table.acquire(res, blocked_node.node_id):
-                            acquired.append(res)
-                        else:
-                            reservation_ok = False
-                            for r in acquired:
-                                await self._resource_table.release(r)
-                            break
-
-                    if not reservation_ok:
-                        blocked_node.status = NodeStatus.READY
-                        await self._ready_queue.put((blocked_node.get_ready_score(), blocked_node))
-                        self._issue_times[blocked_node.node_id] = time.monotonic()
-                        continue
-
-                    # 可以越级！收集到 promoted_nodes
-                    self._blocked_queue = [n for n in self._blocked_queue if n.node_id != blocked_node.node_id]
-                    promoted_nodes.append(blocked_node)
-                    self._ooo_execution_count += 1
-                    self._ooo_promotion_events.append({
-                        "task_id": blocked_node.node_id,
-                        "reason": f"ooo_settle_promote: {reason}",
-                        "elapsed_since_submit_ms": (time.monotonic() - blocked_node.submit_time) * 1000,
-                        "timestamp": time.monotonic(),
-                    })
-                    logger.info(
-                        "[OoO-Settle] 越级收集: '%s' (skill=%s) | OoO累计: %d",
-                        blocked_node.node_id, blocked_node.skill_name, self._ooo_execution_count,
-                    )
-
-        # ── 阶段 3：释放锁后，批量并行越级执行（关键！）─────────────
-        if promoted_nodes:
-            await asyncio.gather(
-                *[self._ooo_direct_execute(node) for node in promoted_nodes],
-                return_exceptions=True,
-            )
-
-        # ── 阶段 4：越级执行后，继续链式越级 + 检查完成 ──────────────
-        if not skip_ooo_promotion:
-            await self._continue_ooo_chain(dag_graph, locks_held=False)
+        # ── 触发越级扫描 ───────────────────────────────────────────────
+        if not skip_ooo:
+            await self._continue_ooo_chain(dag_graph)
         await self._check_dag_completion(dag_graph)
 
-    async def _ooo_direct_execute(self, node: DAGNode, locks_held: bool = False) -> None:
+    async def _ooo_direct_execute(self, node: DAGNode, locks_held: bool = False) -> bool:
         """OoO 越级直接执行单个节点（不经过 ReadyQueue）。
 
-        V8.1: 如果设备调用失败，标记节点为 FAILED，但不传播失败。
-        OoO 的优势：即使某节点失败，也能通过越级调度继续执行其他节点。
+        V8.1 关键修复：
+        - device_busy: 释放资源，直接返回 False（不在此处处理）
+        - failed: 标记失败，清理资源，调用 _settle_completed_node 传播失败
+        - completed: 标记完成，清理资源，调用 _settle_completed_node 解除下游依赖
+
+        Returns:
+            True = 节点正常完成（含成功/失败），调用者不需要额外处理
+            False = 遇到 device_busy，调用者需要重新放回 blocked_queue
         """
         lab = self._labs.get(node.lab_id)
         if lab is None:
             await self._resource_table.release(node.node_id)
             node.status = NodeStatus.READY
-            return
+            return True
         node.mark_running()
         self._running_nodes[node.node_id] = node
+
         try:
             result = await lab.run_single_task(
                 task_id=node.node_id,
@@ -778,24 +727,38 @@ class DAGOrchestrator:
                 params=node.params,
                 required_devices=self._extract_required_devices(node),
                 task_priority=node.priority.value,
-                blocking=False,  # V8.0: 非阻塞越级，设备忙时跳过
+                blocking=False,  # 非阻塞越级，设备忙时返回 device_busy
             )
-            # V8.1: 检查设备调用结果
             result_status = result.get("status", "completed") if isinstance(result, dict) else "completed"
-            if result_status == "failed":
+
+            if result_status == "device_busy":
+                # 设备忙：节点状态保持 PENDING，资源需要由调用者释放
+                # 直接返回 False，让调用者（_do_ooo_chain_loop）重新放回 blocked_queue
+                node.status = NodeStatus.PENDING
+                self._running_nodes.pop(node.node_id, None)
+                # 注意：不释放资源！调用者会在循环中统一释放
+                logger.info(
+                    "[OoO-Direct] 越级跳过（设备忙）: '%s'",
+                    node.node_id,
+                )
+                return False
+
+            elif result_status == "failed":
                 node.mark_failed(f"OoO越级设备失败: {result.get('failed_devices', 'unknown')}")
-                # V8.1: 通过 lab 的 metrics 记录失败任务
                 lab = self._labs.get(node.lab_id)
                 if lab is not None and hasattr(lab, 'metrics'):
                     lab.metrics.record_task_fail(node.node_id)
                 logger.warning(
-                    "[OoO-Direct] 越级执行失败: '%s' (设备不可用，但不传播失败)",
+                    "[OoO-Direct] 越级执行失败: '%s' (设备不可用)",
                     node.node_id,
                 )
             else:
                 node.mark_completed(result)
+
         except Exception:
             node.mark_failed("OoO越级执行异常")
+
+        # 正常完成（含失败）：清理资源，结算节点
         self._running_nodes.pop(node.node_id, None)
         self._completed_nodes.append(node)
         await self._resource_table.release(node.node_id)
@@ -806,11 +769,11 @@ class DAGOrchestrator:
         dag_graph = self._active_graphs.get(node.graph_id)
         if dag_graph is not None:
             await self._settle_completed_node(node, dag_graph)
+        return True
 
     async def _continue_ooo_chain(
         self,
         dag_graph: DAGTaskGraph,
-        locks_held: bool = False,
     ) -> None:
         """V8.0: 继续 OoO 链式越级执行（循环而非递归）。
 
@@ -820,15 +783,14 @@ class DAGOrchestrator:
         核心改进（相比传统调度）：
         - 传统调度：节点完成 → 依赖满足的节点入 ReadyQueue → Worker 从队列取 → 有等待开销
         - OoO 越级：节点完成 → 立即尝试直接执行下游节点 → 零等待，真正并行
+
+        V8.2 锁设计：
+        - _ooo_lock: 仅在修改 _blocked_queue 时持有
+        - _resource_table: 所有操作内部加锁
+        - 不在循环外持有 _ooo_lock，避免死锁
         """
         max_promotions_per_chain = 16  # 每轮最多越级 16 个节点
-
-        if locks_held:
-            await self._do_ooo_chain_loop(dag_graph, max_promotions_per_chain)
-        else:
-            async with self._ooo_lock:
-                async with self._lock:
-                    await self._do_ooo_chain_loop(dag_graph, max_promotions_per_chain)
+        await self._do_ooo_chain_loop(dag_graph, max_promotions_per_chain)
 
     async def _do_ooo_chain_loop(
         self,
@@ -841,23 +803,21 @@ class DAGOrchestrator:
         - 用 asyncio.gather 并行越级执行多个节点（真正并行，非串行）
         - 每轮最多越级 max_promotions_per_chain 个节点
         - 依赖未满足的节点放回 blocked_queue，等下一轮
-        - 每轮越级后重新扫描，尝试更多越级机会
+        - device_busy 的节点重新放回 blocked_queue，break 退出当前链，
+          由后台 scanner 在下一轮重试（避免忙等）
         """
         promoted_this_chain = 0
 
         while promoted_this_chain < max_promotions_per_chain:
-            # 更新 DAG 节点状态：检查哪些依赖刚变为满足
-            for node in dag_graph.nodes.values():
-                if node.status == NodeStatus.PENDING:
-                    if self._can_node_run(node, dag_graph):
-                        node.status = NodeStatus.READY
-                        self._blocked_queue = [n for n in self._blocked_queue if n.node_id != node.node_id]
-
-            # 找出所有可越级的节点（依赖满足 + 资源空闲 + 联锁允许）
+            # 遍历 blocked_queue，对每个节点检查依赖是否满足
             ready_candidates: list[DAGNode] = []
-            for node in self._blocked_queue:
+            for node in list(self._blocked_queue):
                 if node.graph_id != dag_graph.graph_id:
                     continue
+                # 跳过已在执行中的节点
+                if node.status in (NodeStatus.RUNNING, NodeStatus.COMPLETED, NodeStatus.FAILED, NodeStatus.SKIPPED):
+                    continue
+                # 检查依赖是否满足（_check_ooo_promotion 会检查）
                 can_promote, _ = await self._check_ooo_promotion(node, dag_graph)
                 if can_promote:
                     required_resources = self._extract_required_resources(node)
@@ -895,14 +855,30 @@ class DAGOrchestrator:
                 break
 
             # === 真正并行越级执行（asyncio.gather）===
-            await asyncio.gather(
-                *[self._ooo_direct_execute(node) for node in ready_to_run],
-                return_exceptions=True,
-            )
+            futures = [self._ooo_direct_execute(node) for node in ready_to_run]
+            results = await asyncio.gather(*futures, return_exceptions=True)
 
-            promoted_this_chain += len(ready_to_run)
-            # 让出控制权
-            await asyncio.sleep(0)
+            # 记录越级事件
+            for node in ready_to_run:
+                self._ooo_execution_count += 1
+                self._ooo_promotion_events.append({
+                    "task_id": node.node_id,
+                    "reason": "ooo_chain_promote",
+                    "elapsed_since_submit_ms": (time.monotonic() - node.submit_time) * 1000,
+                    "timestamp": time.monotonic(),
+                })
+
+            # 检查是否有节点遇到 device_busy
+            busy_nodes = [n for n, r in zip(ready_to_run, results)
+                         if r is False or (isinstance(r, BaseException))]
+            promoted_this_chain += len(ready_to_run) - len(busy_nodes)
+            if busy_nodes:
+                # 释放 busy 节点的资源，重新放回 blocked_queue
+                for node in busy_nodes:
+                    await self._resource_table.release(node.node_id)
+                    self._blocked_queue.append(node)
+                # break 退出当前链，让出控制权；scanner 下一轮会重试
+                break
 
     async def _cascade_failures(
         self,
@@ -919,6 +895,13 @@ class DAGOrchestrator:
             failed_node: 失败的节点
             dag_graph: DAG 图
         """
+        # V8.1.1 关键修复：如果该节点已经被传播过，跳过（避免重复传播）
+        # 每次只传播"首次失败"触发的链，不重复处理已传播的节点
+        already_propagated = getattr(failed_node, '_failure_propagated', False)
+        if already_propagated:
+            return
+        failed_node._failure_propagated = True
+
         # 使用 BFS 队列追踪需要传播的节点
         queue: list[DAGNode] = [failed_node]
         all_failed_ids: set[str] = {failed_node.node_id}
@@ -1155,8 +1138,11 @@ class DAGOrchestrator:
 
     def _extract_required_devices(self, node: DAGNode) -> list[str]:
         """从节点提取所需设备列表（用于直接执行）。"""
-        from benchmarks.bench_suite import BenchmarkSuite
-        # 复用 BenchmarkSuite 的设备提取逻辑
+        # V10: 优先使用节点预定义的 required_devices（由 DAG 生成器设置）
+        if node.required_devices:
+            return list(node.required_devices)
+
+        # 回退到 skill-based 推断
         skill = node.skill_name.lower() if node.skill_name else ""
         lab = node.lab_id.lower() if node.lab_id else ""
 
@@ -1210,47 +1196,36 @@ class DAGOrchestrator:
         消融实验支持：
         - 若 ablated_dims 包含 "orthogonality_check"，则跳过资源正交性检查
         """
-        async with self._ooo_lock:
-            if not self._blocked_queue:
-                return 0
+        # 不获取锁！快速检查是否需要触发越级
+        if not self._blocked_queue:
+            return 0
 
-            # 快速检查：是否有节点依赖已满足且资源空闲
-            ready_found = False
-            for node in self._blocked_queue:
-                if node.status != NodeStatus.PENDING:
-                    continue
-                dag_graph = self._active_graphs.get(node.graph_id)
-                if dag_graph is None:
-                    continue
-                can_promote, _ = await self._check_ooo_promotion(node, dag_graph)
-                if can_promote:
-                    ready_found = True
-                    break
+        dag_graph = self._active_graphs.get(next(iter(self._active_graphs), None))
+        if dag_graph is None:
+            return 0
 
-            if not ready_found:
-                return 0
+        # 快速检查：是否有节点可能可以越级
+        # （这里不获取锁，只做轻量检查；实际越级在 _continue_ooo_chain 中进行）
+        has_candidate = False
+        for node in self._blocked_queue:
+            if node.status in (NodeStatus.PENDING, NodeStatus.READY):
+                has_candidate = True
+                break
+        if not has_candidate:
+            return 0
 
-            # 有候选节点，调用 _continue_ooo_chain 进行链式越级执行
-            dag_graph = self._active_graphs.get(next(iter(self._active_graphs), None))
-            if dag_graph is None:
-                return 0
+        # 调用链式越级（_continue_ooo_chain 自己会获取 _ooo_lock）
+        initial_blocked_count = len(self._blocked_queue)
+        await self._continue_ooo_chain(dag_graph)
+        promoted = initial_blocked_count - len(self._blocked_queue)
 
-            # 让出控制权
-            await asyncio.sleep(0)
+        if promoted > 0:
+            logger.info(
+                "[OoO-Scan] Scanner 触发链式越级：推进 %d 个节点 | OoO累计: %d",
+                promoted, self._ooo_execution_count,
+            )
 
-            # 调用链式越级执行（已集成到 _settle_completed_node，此处为兜底）
-            # 确保即使没有节点"完成"事件触发，Scanner 也能主动推进
-            initial_blocked_count = len(self._blocked_queue)
-            await self._continue_ooo_chain(dag_graph)
-            promoted = initial_blocked_count - len(self._blocked_queue)
-
-            if promoted > 0:
-                logger.info(
-                    "[OoO-Scan] Scanner 触发链式越级：推进 %d 个节点 | OoO累计: %d",
-                    promoted, self._ooo_execution_count,
-                )
-
-            return promoted
+        return promoted
 
     async def _check_ooo_promotion(
         self,
@@ -1738,52 +1713,8 @@ class DAGOrchestrator:
             return
 
         try:
-            # 提取节点所需的设备（与 bench_suite._extract_devices 保持一致）
-            skill_lower = node.skill_name.lower()
-            lab_lower = node.lab_id.lower() if node.lab_id else ""
-
-            if "plant" in lab_lower:
-                if "heater" in skill_lower or "temperature" in skill_lower:
-                    devices = ["heater_plant"]
-                elif "arm" in skill_lower or "robotic" in skill_lower:
-                    devices = ["arm_plant"]
-                elif "pump" in skill_lower or "inject" in skill_lower:
-                    devices = ["pump_plant"]
-                elif "vacuum" in skill_lower:
-                    devices = ["vacuum_mat"]
-                else:
-                    devices = ["co2_controller"]
-            elif "material" in lab_lower:
-                if "heater" in skill_lower or "temperature" in skill_lower:
-                    devices = ["heater_mat"]
-                elif "arm" in skill_lower or "robotic" in skill_lower:
-                    devices = ["arm_mat"]
-                elif "vacuum" in skill_lower:
-                    devices = ["vacuum_mat"]
-                else:
-                    devices = ["co2_controller"]
-            elif "fluid" in lab_lower:
-                if "pump" in skill_lower or "inject" in skill_lower:
-                    devices = ["pump_fluid"]
-                elif "valve" in skill_lower:
-                    devices = ["valve_fluid"]
-                else:
-                    devices = ["co2_controller"]
-            elif "bio" in lab_lower:
-                if "heater" in skill_lower or "temperature" in skill_lower:
-                    devices = ["heater_bio"]
-                elif "vacuum" in skill_lower:
-                    devices = ["vacuum_bio"]
-                elif "arm" in skill_lower or "robotic" in skill_lower:
-                    devices = ["arm_bio"]
-                elif "centrifuge" in skill_lower:
-                    devices = ["centrifuge_bio"]
-                elif "sensor" in skill_lower or "scan" in skill_lower:
-                    devices = ["scan_bio"]
-                else:
-                    devices = ["co2_controller"]
-            else:
-                devices = ["co2_controller"]
+            # 使用节点预定义的 required_devices（由 DAG 生成器设置）
+            devices = list(node.required_devices) if node.required_devices else []
 
             result = await env.run_single_task(
                 task_id=node.node_id,

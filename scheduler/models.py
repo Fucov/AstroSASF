@@ -86,6 +86,7 @@ class DAGNode:
     graph_id: str | None = None
     params: dict[str, Any] = field(default_factory=dict)
     dependencies: list[str] = field(default_factory=list)
+    required_devices: list[str] = field(default_factory=list)  # V10: 节点所需的设备列表
     status: NodeStatus = NodeStatus.PENDING
     priority: TaskPriority = TaskPriority.NORMAL
     description: str = ""

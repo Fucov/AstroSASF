@@ -181,9 +181,11 @@ class BenchmarkLabContext:
 
         self.metrics.record_task_complete(task_id, device_results)
 
-        # V8.1: 检查是否有设备调用失败
-        failed_results = [r for r in device_results if r.status != "ok"]
-        if failed_results:
+        # V8.1: 区分真正的失败和 device_busy（锁竞争）
+        # device_busy 不算失败，OoO 越级调度时会跳过或重试
+        # 只有 failure、scope_denied、unknown_device、timeout 等才算真正的失败
+        non_busy_failures = [r for r in device_results if r.status != "ok" and r.status != "device_busy"]
+        if non_busy_failures:
             self.metrics.record_task_fail(task_id)
             return {
                 "task_id": task_id,
@@ -191,8 +193,18 @@ class BenchmarkLabContext:
                 "device_results": [r.to_dict() for r in device_results],
                 "failed_devices": [
                     {"device_id": r.device_id, "status": r.status, "wait_reason": r.wait_reason}
-                    for r in failed_results
+                    for r in non_busy_failures
                 ],
+            }
+
+        # device_busy 不算失败
+        busy_count = sum(1 for r in device_results if r.status == "device_busy")
+        if busy_count > 0:
+            return {
+                "task_id": task_id,
+                "status": "device_busy",  # 特殊状态，OoO 会跳过
+                "device_results": [r.to_dict() for r in device_results],
+                "busy_devices": busy_count,
             }
 
         return {
@@ -289,9 +301,14 @@ class BenchmarkSuite:
                 unavailable_until = float(unavailable_until)
             else:
                 unavailable_until = None
+            # V10 修复：chaos trigger_time_sec 是模拟时间，需要按 physical_delay_scale 缩放
+            # 当 speed=0.1 时，模拟 0.5s = 墙上 5s，与物理延迟缩放一致
+            trigger_time = getattr(ce, "trigger_time_sec", 0)
+            if self._physical_delay_scale > 0:
+                trigger_time = trigger_time / self._physical_delay_scale
             chaos_events_obj.append(
                 ChaosEvent(
-                    trigger_time_sec=getattr(ce, "trigger_time_sec", 0),
+                    trigger_time_sec=trigger_time,
                     type=ChaosType(getattr(ce, "type", "hardware_delay")),
                     target_device=getattr(ce, "target_tool", None),
                     delay_multiplier=getattr(ce, "delay_multiplier", None),
@@ -480,6 +497,7 @@ class BenchmarkSuite:
                 skill_name=node_def.skill_name,
                 params=node_def.params,
                 dependencies=[],
+                required_devices=list(node_def.required_devices) if hasattr(node_def, 'required_devices') else [],
                 priority=node_priority,
                 description=f"{node_def.skill_name} [{node_def.task_id}]",
                 lab_id=cabin,
@@ -554,9 +572,9 @@ class BenchmarkSuite:
         levels = dag.get_execution_levels()
 
         for level_idx, level in enumerate(levels):
-            # ── 层间调度延迟（模拟调度器扫描 ReadyQueue + 决策时间）────────
+            # ── 层间调度延迟（模拟调度器扫描 ReadyQueue + 决策时间，10ms）────────
             if level_idx > 0:
-                await asyncio.sleep(0.10)  # 100ms 层间调度延迟
+                await asyncio.sleep(0.01)  # 10ms 层间调度延迟（比之前的 100ms 更合理）
 
             # 标记所有节点
             for n in level:
@@ -565,8 +583,8 @@ class BenchmarkSuite:
                 n.mark_running()
                 metrics.record_task_submit(n.node_id, n.lab_id, n.skill_name, n.priority.value)
 
-            # ── 节点启动开销（所有节点同时等待 20ms，模拟资源检查）────────
-            await asyncio.sleep(0.02)  # 20ms 节点启动开销
+            # ── 节点启动开销（模拟资源检查，5ms）───────────────
+            await asyncio.sleep(0.005)  # 5ms 节点启动开销
 
             level_tasks = [self._async_only_node_task(n, labs, metrics) for n in level if n.status == NodeStatus.RUNNING]
 
@@ -640,17 +658,30 @@ class BenchmarkSuite:
     ) -> None:
         """Async-only 辅助：执行单个节点并埋点。
 
-        V8.1: 如果设备调用失败，标记节点为 FAILED。
-        Traditional DAG 遇到关键设备失败时，整个 DAG 会阻塞在该设备上。
+        V8.1: 如果设备调用失败或超时，标记节点为 FAILED。
         """
         lab = labs.get(node.lab_id, list(labs.values())[0])
-        result = await lab.run_single_task(
-            task_id=node.node_id,
-            skill_name=node.skill_name,
-            params=node.params,
-            required_devices=self._extract_devices(node),
-            task_priority=node.priority.value,
-        )
+        try:
+            result = await asyncio.wait_for(
+                lab.run_single_task(
+                    task_id=node.node_id,
+                    skill_name=node.skill_name,
+                    params=node.params,
+                    required_devices=self._extract_devices(node),
+                    task_priority=node.priority.value,
+                ),
+                timeout=30.0,  # V11: 30秒超时，防止 chaos 导致的永久阻塞
+            )
+        except asyncio.TimeoutError:
+            # V11: 超时也视为失败（设备不可用）
+            node.mark_failed("设备调用超时（30s）")
+            metrics.record_task_fail(node.node_id)
+            logger.warning(
+                "[AsyncOnly] 节点 '%s' 设备调用超时（30s），标记为失败",
+                node.node_id,
+            )
+            return
+
         # V8.1: 检查设备调用是否成功
         result_status = result.get("status", "completed") if isinstance(result, dict) else "completed"
         if result_status == "failed":
